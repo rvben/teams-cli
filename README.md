@@ -108,3 +108,8 @@ Collection commands expose `--limit` and `--fields`; Graph-native collections us
 ## CLI Spec
 
 `teams schema` is offline, unauthenticated, and follows [CLI Spec v0.3](https://clispec.dev/): flat invocable command paths, declared effects and cardinality, bounded collections, stable error kinds and exit codes, stdout/stderr separation, and safe noninteractive behavior.
+
+## Releasing
+
+Vership owns versioning, changelog generation, release commits, and tags. See
+[the release runbook](docs/releases.md) for the verified workflow and recovery policy.
