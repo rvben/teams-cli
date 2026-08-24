@@ -29,12 +29,13 @@ A human-first and agent-first Microsoft Teams terminal client: a polished TUI an
 - Installed from PyPI, preferably with `pipx install teams-cli`, despite the implementation being Rust.
 - Invoked as `teams` alongside sibling tools such as `jira` and `confluence`.
 - Used interactively in a local terminal, non-interactively in shell pipelines, and by AI agents.
-- Authenticates a Microsoft 365 work or school account through a customer-owned Microsoft Entra public-client application.
+- Authenticates a Microsoft 365 work or school account through the maintained teams-cli Entra public-client application, with an explicit override for customer-owned registrations.
 - Opens the native or web Teams client for experiences that Microsoft Graph does not expose, such as normal user calls.
 
 ## Capabilities and Constraints
 
 - Browser-based delegated OAuth with PKCE is the preferred login; device-code flow is an explicit headless fallback.
+- Everyday commands use a user-consentable baseline; administrator-consented channel history is a deliberate login opt-in.
 - Refresh credentials must use OS-protected storage and must never be written as plaintext tokens.
 - Initial product surface covers onboarding, authentication diagnostics, identity, teams, channels, chats, messages, and the TUI foundation.
 - Commands offer human text and structured JSON output, with clean stdout/stderr separation.

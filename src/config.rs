@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
+/// The maintained, multitenant public-client registration shipped with teams-cli.
+pub const DEFAULT_CLIENT_ID: &str = "66ebad71-1604-48fc-a086-0d4caa24988b";
+pub const DEFAULT_TENANT: &str = "organizations";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub client_id: String,
@@ -13,7 +17,7 @@ pub struct Profile {
 }
 
 fn default_tenant() -> String {
-    "organizations".into()
+    DEFAULT_TENANT.into()
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

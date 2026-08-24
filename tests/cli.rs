@@ -106,13 +106,20 @@ fn no_args_never_prompts_when_piped() {
 }
 
 #[test]
-fn noninteractive_init_requires_client_id() {
-    Command::cargo_bin("teams")
+fn noninteractive_init_uses_the_maintained_client_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("teams")
         .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
         .args(["init", "--no-login"])
-        .assert()
-        .code(8)
-        .stderr(predicate::str::contains("--client-id is required"));
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["client_id"], "66ebad71-1604-48fc-a086-0d4caa24988b");
+    assert_eq!(result["tenant"], "organizations");
+    assert_eq!(result["channel_history_requested"], false);
+    assert!(temp.path().join("teams/config.toml").is_file());
 }
 
 #[test]
@@ -121,15 +128,37 @@ fn headless_browser_login_refuses_before_writing_config() {
     Command::cargo_bin("teams")
         .unwrap()
         .env("XDG_CONFIG_HOME", temp.path())
-        .args([
-            "init",
-            "--client-id",
-            "00000000-0000-0000-0000-000000000000",
-        ])
+        .arg("init")
         .assert()
         .code(8)
         .stderr(predicate::str::contains(
             "browser sign-in requires a terminal",
         ));
     assert!(!temp.path().join("teams/config.toml").exists());
+}
+
+#[test]
+fn schema_declares_default_app_and_privileged_scope() {
+    let output = Command::cargo_bin("teams")
+        .unwrap()
+        .arg("schema")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let schema: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        schema["extensions"]["default_client_id"],
+        "66ebad71-1604-48fc-a086-0d4caa24988b"
+    );
+    assert!(
+        schema["extensions"]["baseline_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|scope| scope != "ChannelMessage.Read.All")
+    );
+    assert_eq!(
+        schema["extensions"]["privileged_scopes"],
+        serde_json::json!(["ChannelMessage.Read.All"])
+    );
 }

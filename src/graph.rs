@@ -47,6 +47,12 @@ impl GraphClient {
             .await
     }
 
+    pub async fn teams_available(&self) -> Result<(), AppError> {
+        self.get_value(&format!("{GRAPH}/me/joinedTeams"))
+            .await
+            .map(|_| ())
+    }
+
     pub async fn channels(&self, team: &str, limit: u16, offset: usize) -> Result<Page, AppError> {
         self.get_offset_page(
             &format!(
@@ -242,13 +248,31 @@ impl GraphClient {
             .unwrap_or("Microsoft Graph rejected the request");
         match status.as_u16() {
             401 => Err(AppError::Auth(format!("{message}; run `teams auth login`"))),
-            403 => Err(AppError::Permission(format!(
-                "{message}; check delegated scopes and tenant consent with `teams doctor`"
-            ))),
+            403 => Err(permission_error(message)),
             404 => Err(AppError::NotFound(message.into())),
             _ => Err(AppError::Api(format!("{message} ({status})"))),
         }
     }
+}
+
+fn permission_error(message: &str) -> AppError {
+    let message = message.trim();
+    let lower = message.to_ascii_lowercase();
+    let hint = if lower.contains("hasn't been provisioned")
+        || lower.contains("has not been provisioned")
+        || lower.contains("valid office365 subscription")
+        || lower.contains("valid microsoft 365 subscription")
+    {
+        "sign in with a work or school account that has Microsoft Teams enabled"
+    } else {
+        "check delegated scopes and tenant consent with `teams doctor`"
+    };
+    let separator = if matches!(message.chars().last(), Some('.' | '!' | '?')) {
+        " "
+    } else {
+        "; "
+    };
+    AppError::Permission(format!("{message}{separator}{hint}"))
 }
 
 fn is_graph_url(raw: &str) -> bool {
@@ -304,5 +328,18 @@ mod tests {
         assert!(!super::is_graph_url(
             "http://graph.microsoft.com/v1.0/me/chats"
         ));
+    }
+
+    #[test]
+    fn unprovisioned_tenants_get_a_teams_specific_hint() {
+        let error = super::permission_error(
+            "Microsoft Teams hasn't been provisioned on the tenant. Ensure the tenant has a valid Office365 subscription.",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("account that has Microsoft Teams enabled")
+        );
+        assert!(!error.to_string().contains(".;"));
     }
 }

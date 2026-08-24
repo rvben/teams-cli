@@ -12,7 +12,9 @@ use crate::config::Profile;
 use crate::error::AppError;
 use crate::output::Output;
 
-pub const SCOPES: &str = "openid profile offline_access User.Read Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send ChannelMessage.Read.All";
+pub const BASE_SCOPES: &str = "openid profile offline_access User.Read Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send";
+pub const CHANNEL_HISTORY_SCOPE: &str = "ChannelMessage.Read.All";
+pub const CHANNEL_HISTORY_SCOPES: &str = "openid profile offline_access User.Read Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send ChannelMessage.Read.All";
 const SERVICE: &str = "teams-cli";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,28 @@ pub fn has_token(profile_name: &str) -> bool {
                     .map_err(|err| AppError::Unexpected(err.to_string()))
             })
             .is_ok()
+}
+
+pub fn granted_scopes(profile_name: &str) -> Option<Vec<String>> {
+    if std::env::var("TEAMS_ACCESS_TOKEN").is_ok() {
+        return None;
+    }
+    load(profile_name).ok().and_then(|token| {
+        token.scope.map(|scope| {
+            scope
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+    })
+}
+
+pub fn channel_history_granted(profile_name: &str) -> Option<bool> {
+    granted_scopes(profile_name).map(|scopes| {
+        scopes
+            .iter()
+            .any(|scope| scope.eq_ignore_ascii_case(CHANNEL_HISTORY_SCOPE))
+    })
 }
 
 fn store(profile_name: &str, token: &TokenBundle) -> Result<(), AppError> {
@@ -105,7 +129,7 @@ pub async fn access_token(profile_name: &str, profile: &Profile) -> Result<Strin
             ("client_id", profile.client_id.as_str()),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh),
-            ("scope", SCOPES),
+            ("scope", bundle.scope.as_deref().unwrap_or(BASE_SCOPES)),
         ])
         .send()
         .await
@@ -123,18 +147,32 @@ pub async fn login(
     profile_name: &str,
     profile: &Profile,
     device_code: bool,
+    channel_history: bool,
     out: &Output,
 ) -> Result<TokenBundle, AppError> {
+    let scopes = scopes(channel_history);
     let bundle = if device_code {
-        device_login(profile, out).await?
+        device_login(profile, scopes, out).await?
     } else {
-        browser_login(profile, out).await?
+        browser_login(profile, scopes, out).await?
     };
     store(profile_name, &bundle)?;
     Ok(bundle)
 }
 
-async fn browser_login(profile: &Profile, out: &Output) -> Result<TokenBundle, AppError> {
+fn scopes(channel_history: bool) -> &'static str {
+    if channel_history {
+        CHANNEL_HISTORY_SCOPES
+    } else {
+        BASE_SCOPES
+    }
+}
+
+async fn browser_login(
+    profile: &Profile,
+    scopes: &str,
+    out: &Output,
+) -> Result<TokenBundle, AppError> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let redirect = format!("http://localhost:{}", listener.local_addr()?.port());
     let mut verifier_bytes = [0u8; 32];
@@ -156,7 +194,7 @@ async fn browser_login(profile: &Profile, out: &Output) -> Result<TokenBundle, A
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", &redirect)
         .append_pair("response_mode", "query")
-        .append_pair("scope", SCOPES)
+        .append_pair("scope", scopes)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state);
@@ -217,7 +255,7 @@ async fn browser_login(profile: &Profile, out: &Output) -> Result<TokenBundle, A
             ("code", code.as_str()),
             ("redirect_uri", redirect.as_str()),
             ("code_verifier", verifier.as_str()),
-            ("scope", SCOPES),
+            ("scope", scopes),
         ])
         .send()
         .await
@@ -235,13 +273,17 @@ struct DeviceCode {
     message: Option<String>,
 }
 
-async fn device_login(profile: &Profile, out: &Output) -> Result<TokenBundle, AppError> {
+async fn device_login(
+    profile: &Profile,
+    scopes: &str,
+    out: &Output,
+) -> Result<TokenBundle, AppError> {
     let response = reqwest::Client::new()
         .post(format!(
             "https://login.microsoftonline.com/{}/oauth2/v2.0/devicecode",
             profile.tenant
         ))
-        .form(&[("client_id", profile.client_id.as_str()), ("scope", SCOPES)])
+        .form(&[("client_id", profile.client_id.as_str()), ("scope", scopes)])
         .send()
         .await
         .map_err(|e| AppError::Unexpected(format!("sign-in service is unreachable: {e}")))?;
@@ -327,4 +369,20 @@ async fn oauth_response_error(response: reqwest::Response) -> AppError {
             .and_then(|e| e.error_description.or(Some(e.error)))
             .unwrap_or_else(|| format!("Microsoft sign-in failed with {status}")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BASE_SCOPES, CHANNEL_HISTORY_SCOPE, scopes};
+
+    #[test]
+    fn default_login_is_least_privilege() {
+        assert!(!BASE_SCOPES.contains(CHANNEL_HISTORY_SCOPE));
+        assert_eq!(scopes(false), BASE_SCOPES);
+    }
+
+    #[test]
+    fn channel_history_is_explicitly_opted_in() {
+        assert!(scopes(true).contains(CHANNEL_HISTORY_SCOPE));
+    }
 }

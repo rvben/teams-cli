@@ -72,7 +72,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// Public-client application (client) ID
+    /// Override the maintained teams-cli public-client application ID
     #[arg(long, env = "TEAMS_CLIENT_ID")]
     pub client_id: Option<String>,
     /// Tenant ID/domain, or `organizations`
@@ -84,14 +84,21 @@ pub struct InitArgs {
     /// Use device-code sign-in instead of browser PKCE
     #[arg(long)]
     pub device_code: bool,
+    /// Request admin-consented access to read channel history
+    #[arg(long)]
+    pub channel_history: bool,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     /// Sign in with delegated OAuth
     Login {
+        /// Use device-code sign-in for headless and remote environments
         #[arg(long)]
         device_code: bool,
+        /// Request admin-consented access to read channel history
+        #[arg(long)]
+        channel_history: bool,
     },
     /// Remove locally stored credentials
     Logout,

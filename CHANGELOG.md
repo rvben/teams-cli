@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Bundled the maintained multitenant teams-cli Entra public-client registration for zero-ID onboarding.
+- Added explicit `--channel-history` consent and machine-readable authentication capability metadata.
+
+### Changed
+
+- Normal login and token refresh now use only the user-consentable delegated permission baseline.
+- Diagnostics now distinguish successful Microsoft identity access from an unlicensed or unprovisioned Teams tenant.
+
 ## [0.1.1] - 2026-08-24
 
 ### Fixed

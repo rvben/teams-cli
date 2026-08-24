@@ -41,27 +41,43 @@ Run `teams` in a terminal on first use, or start explicitly:
 teams init
 ```
 
-You need a Microsoft Entra public-client application:
+`teams-cli` includes a maintained multitenant Microsoft Entra public-client registration, so normal setup does not require creating an app or copying a client ID:
 
-1. In [Microsoft Entra app registrations](https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade), register an app for organizational accounts.
-2. Under **Authentication**, add the **Mobile and desktop applications** redirect URI `http://localhost` and enable public client flows.
-3. Under **API permissions**, add these delegated Microsoft Graph permissions (plus the standard OpenID scopes requested at sign-in):
+```console
+teams init
+```
+
+Browser PKCE is the human-friendly default. The browser talks directly to Microsoft, and the CLI never receives or stores your password. Normal sign-in requests these delegated scopes:
 
 ```text
 openid profile offline_access User.Read Team.ReadBasic.All
 Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send
-ChannelMessage.Send ChannelMessage.Read.All
+ChannelMessage.Send
 ```
 
-Reading channel messages requires the administrator-consented `ChannelMessage.Read.All` permission. If the tenant has not granted it, Microsoft may require an administrator during sign-in. The CLI surfaces missing consent as a stable `permission_denied` error instead of silently reaching for undocumented Teams APIs.
+Reading channel history is intentionally separate because `ChannelMessage.Read.All` requires administrator consent. Request it only when needed:
+
+```console
+teams auth login --channel-history
+```
+
+The CLI surfaces missing consent as a stable `permission_denied` error instead of silently reaching for undocumented Teams APIs. Tenant policy can still require an administrator to approve otherwise user-consentable permissions.
 
 Headless setup is explicit and never prompts:
 
 ```console
-teams init --client-id "$TEAMS_CLIENT_ID" --tenant organizations --no-login
+teams init --no-login
 teams auth login --device-code
 teams whoami --output json
 ```
+
+Organizations that prefer their own Entra registration can override the bundled application:
+
+```console
+teams init --client-id "$TEAMS_CLIENT_ID" --tenant organizations --no-login
+```
+
+The custom app must be a public client with `http://localhost` registered for browser login, public-client flows enabled for device-code login, and the baseline delegated permissions listed above.
 
 For short-lived automation, `TEAMS_ACCESS_TOKEN` overrides the stored credential. Refresh credentials are never written to the config file.
 
@@ -72,6 +88,8 @@ teams list
 teams channels list TEAM_ID
 teams chats list --limit 25
 teams messages list --chat CHAT_ID
+teams auth login --channel-history  # once, with administrator approval
+teams messages list --team TEAM_ID --channel CHANNEL_ID
 teams messages send --chat CHAT_ID --body "On it."
 printf 'Status update' | teams messages send --chat CHAT_ID --body -
 teams doctor
@@ -82,6 +100,7 @@ Collection commands expose `--limit` and `--fields`; Graph-native collections us
 ## Boundaries
 
 - Microsoft 365 work or school accounts only. The relevant Teams Graph endpoints do not support personal Microsoft accounts.
+- A work account can authenticate successfully before Microsoft Teams is licensed or provisioned; `teams doctor` distinguishes identity access from Teams availability.
 - Calling and screen sharing are not available as a delegated user CLI; Graph calling is built around bot/application scenarios.
 - No extracted desktop tokens, browser interception, or private Teams protocols.
 - Tenant policy and admin consent can restrict delegated capabilities.

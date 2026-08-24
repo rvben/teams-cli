@@ -11,6 +11,9 @@ fn array_field(name: &str, item_kind: &str) -> Value {
 fn nullable_field(name: &str, kind: &str) -> Value {
     json!({"name": name, "type": kind, "nullable": true})
 }
+fn nullable_array_field(name: &str, item_kind: &str) -> Value {
+    json!({"name": name, "type": "array", "items": {"type": item_kind}, "nullable": true})
+}
 fn arg(name: &str, kind: &str, description: &str) -> Value {
     json!({"name": name, "type": kind, "description": description})
 }
@@ -67,17 +70,29 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     field("profile", "string"),
                     field("config_path", "string"),
                     field("signed_in", "boolean"),
+                    field("client_id", "string"),
+                    field("tenant", "string"),
+                    field("channel_history_requested", "boolean"),
                 ],
             );
             value["args"] = json!([
-                arg("--client-id", "string", "Public-client application ID"),
+                arg(
+                    "--client-id",
+                    "string",
+                    "Override the maintained teams-cli public-client application ID"
+                ),
                 arg("--tenant", "string", "Tenant ID, domain, or organizations"),
                 arg(
                     "--no-login",
                     "boolean",
                     "Save configuration without signing in"
                 ),
-                arg("--device-code", "boolean", "Use device-code sign-in")
+                arg("--device-code", "boolean", "Use device-code sign-in"),
+                arg(
+                    "--channel-history",
+                    "boolean",
+                    "Request admin-consented channel-history access"
+                )
             ]);
             value
         },
@@ -90,9 +105,21 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     field("profile", "string"),
                     field("expires_at", "integer"),
                     nullable_field("scope", "string"),
+                    field("channel_history_requested", "boolean"),
                 ],
             );
-            value["args"] = json!([arg("--device-code", "boolean", "Use device-code sign-in")]);
+            value["args"] = json!([
+                arg(
+                    "--device-code",
+                    "boolean",
+                    "Use device-code sign-in for headless and remote environments"
+                ),
+                arg(
+                    "--channel-history",
+                    "boolean",
+                    "Request admin-consented channel-history access"
+                )
+            ]);
             value
         },
         single(
@@ -110,6 +137,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 field("configured", "boolean"),
                 field("signed_in", "boolean"),
                 field("config_path", "string"),
+                nullable_array_field("granted_scopes", "string"),
+                nullable_field("channel_history", "boolean"),
             ],
         ),
         single(
@@ -157,7 +186,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         {
             let mut value = paged(
                 "messages list",
-                "List messages from one chat or channel",
+                "List messages from one chat, or from a channel with optional admin-consented access",
                 vec![
                     field("id", "string"),
                     field("createdDateTime", "string"),
@@ -198,7 +227,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         json!({"name":"tui", "description":"Open the keyboard-first terminal interface", "effects":"read_only", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
         single(
             "doctor",
-            "Check configuration, credential storage, and Graph access",
+            "Check configuration, credential storage, Microsoft identity, and Teams provisioning",
             "read_only",
             vec![array_field("checks", "object"), field("healthy", "boolean")],
         ),
@@ -241,6 +270,13 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         ],
         "commands": commands,
         "errors": error::ALL.iter().map(|e| json!({"kind":e.kind,"exit_code":e.exit_code,"retryable":e.retryable,"description":e.description})).collect::<Vec<_>>(),
-        "extensions": {"authentication":"delegated_oauth", "api":"Microsoft Graph v1.0"}
+        "extensions": {
+            "authentication":"delegated_oauth",
+            "api":"Microsoft Graph v1.0",
+            "default_client_id": crate::config::DEFAULT_CLIENT_ID,
+            "login_modes":["browser_pkce","device_code"],
+            "baseline_scopes": crate::auth::BASE_SCOPES.split_whitespace().collect::<Vec<_>>(),
+            "privileged_scopes":[crate::auth::CHANNEL_HISTORY_SCOPE]
+        }
     })
 }

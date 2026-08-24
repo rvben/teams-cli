@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 
 use clap::{CommandFactory, Parser};
 use serde::Serialize;
@@ -59,6 +59,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                 tenant: "organizations".into(),
                 no_login: false,
                 device_code: false,
+                channel_history: false,
             })
         }
         None if io::stdin().is_terminal() && io::stdout().is_terminal() => Command::Tui(TuiArgs {
@@ -178,24 +179,13 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     if interactive && !out.json() {
         eprintln!("\n  teams\n  Microsoft Teams, without leaving your flow.\n");
-        eprintln!("  Before we sign in, create a Microsoft Entra public-client app.");
-        eprintln!(
-            "  1. Open https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"
-        );
-        eprintln!("  2. Register a multitenant app for organizational accounts.");
-        eprintln!("  3. Add Mobile and desktop redirect URI: http://localhost");
-        eprintln!(
-            "  4. Enable public client flows and grant the delegated permissions in README.md."
-        );
-        eprintln!(
-            "  Work or school accounts are supported; personal Microsoft accounts are not.\n"
-        );
+        eprintln!("  We’ll open Microsoft sign-in in your browser.");
+        eprintln!("  No password or client secret is shared with teams-cli.");
+        eprintln!("  Work or school accounts are supported; personal accounts are not.\n");
     }
-    let client_id = match args.client_id {
-        Some(value) => value,
-        None if interactive => prompt("Application (client) ID")?,
-        None => return Err(AppError::NonInteractive("--client-id is required without a terminal; example: `teams init --client-id <uuid> --no-login`".into())),
-    };
+    let client_id = args
+        .client_id
+        .unwrap_or_else(|| config::DEFAULT_CLIENT_ID.into());
     if client_id.trim().is_empty() {
         return Err(AppError::InvalidInput("client ID cannot be empty".into()));
     }
@@ -207,14 +197,21 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
     let path = config::save(
         profile_name,
         Profile {
-            client_id,
-            tenant: args.tenant,
+            client_id: client_id.clone(),
+            tenant: args.tenant.clone(),
         },
     )?;
     let mut signed_in = false;
     if !args.no_login {
         let (_, profile) = config::load(Some(profile_name))?;
-        auth::login(profile_name, &profile, args.device_code, &out).await?;
+        auth::login(
+            profile_name,
+            &profile,
+            args.device_code,
+            args.channel_history,
+            &out,
+        )
+        .await?;
         signed_in = true;
     }
     #[derive(Serialize)]
@@ -222,11 +219,17 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         profile: &'a str,
         config_path: String,
         signed_in: bool,
+        client_id: &'a str,
+        tenant: &'a str,
+        channel_history_requested: bool,
     }
     let result = InitResult {
         profile: profile_name,
         config_path: path.display().to_string(),
         signed_in,
+        client_id: &client_id,
+        tenant: &args.tenant,
+        channel_history_requested: args.channel_history,
     };
     out.value(&result, || {
         if signed_in {
@@ -243,7 +246,10 @@ async fn auth_command(
     out: Output,
 ) -> Result<(), AppError> {
     match command {
-        AuthCommand::Login { device_code } => {
+        AuthCommand::Login {
+            device_code,
+            channel_history,
+        } => {
             if !device_code && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
                 return Err(AppError::NonInteractive(
                     "browser sign-in requires a terminal; use `teams auth login --device-code` for headless sign-in"
@@ -251,8 +257,8 @@ async fn auth_command(
                 ));
             }
             let (name, profile) = config::load(profile_arg)?;
-            let token = auth::login(&name, &profile, device_code, &out).await?;
-            let value = serde_json::json!({"profile":name,"expires_at":token.expires_at,"scope":token.scope});
+            let token = auth::login(&name, &profile, device_code, channel_history, &out).await?;
+            let value = serde_json::json!({"profile":name,"expires_at":token.expires_at,"scope":token.scope,"channel_history_requested":channel_history});
             out.value(&value, || format!("Signed in profile '{name}'."))
         }
         AuthCommand::Logout => {
@@ -268,12 +274,15 @@ async fn auth_command(
                 .map(|(n, _)| n.as_str())
                 .unwrap_or(profile_arg.unwrap_or("default"));
             let signed_in = auth::has_token(name);
-            let value = serde_json::json!({"profile":name,"configured":configured.is_some(),"signed_in":signed_in,"config_path":config::path()});
+            let scopes = auth::granted_scopes(name);
+            let channel_history = auth::channel_history_granted(name);
+            let value = serde_json::json!({"profile":name,"configured":configured.is_some(),"signed_in":signed_in,"config_path":config::path(),"granted_scopes":scopes,"channel_history":channel_history});
             out.value(&value, || {
                 format!(
-                    "Profile: {name}\nConfigured: {}\nSigned in: {}\nConfig: {}",
+                    "Profile: {name}\nConfigured: {}\nSigned in: {}\nChannel history: {}\nConfig: {}",
                     yes_no(configured.is_some()),
                     yes_no(signed_in),
+                    optional_access(channel_history),
                     config::path().display()
                 )
             })
@@ -401,32 +410,71 @@ async fn doctor(profile_arg: Option<&str>, out: Output) -> Result<(), AppError> 
             "run `teams auth login`".into()
         },
     });
-    let mut graph_ok = false;
-    let detail = if configured.is_some() && signed_in {
+    let channel_history = auth::channel_history_granted(
+        configured
+            .as_ref()
+            .map(|(name, _)| name.as_str())
+            .unwrap_or("default"),
+    );
+    checks.push(Check {
+        name: "channel_history",
+        status: if channel_history == Some(true) {
+            "pass"
+        } else {
+            "optional"
+        },
+        detail: if channel_history == Some(true) {
+            "admin-consented channel reading is available".into()
+        } else {
+            "optional; run `teams auth login --channel-history` if an admin approves it".into()
+        },
+    });
+    let mut identity_ok = false;
+    let mut teams_ok = false;
+    let (identity_detail, teams_detail) = if configured.is_some() && signed_in {
         match client(profile_arg).await {
-            Ok(client) => match client.me().await {
-                Ok(value) => {
-                    graph_ok = true;
-                    format!(
-                        "signed in as {}",
-                        string_at(&value, "/userPrincipalName")
-                            .or_else(|| string_at(&value, "/displayName"))
-                            .unwrap_or("unknown user")
-                    )
-                }
-                Err(error) => error.to_string(),
-            },
-            Err(error) => error.to_string(),
+            Ok(client) => {
+                let identity_detail = match client.me().await {
+                    Ok(value) => {
+                        identity_ok = true;
+                        format!(
+                            "signed in as {}",
+                            string_at(&value, "/userPrincipalName")
+                                .or_else(|| string_at(&value, "/displayName"))
+                                .unwrap_or("unknown user")
+                        )
+                    }
+                    Err(error) => error.to_string(),
+                };
+                let teams_detail = match client.teams_available().await {
+                    Ok(_) => {
+                        teams_ok = true;
+                        "Microsoft Teams is available".into()
+                    }
+                    Err(error) => error.to_string(),
+                };
+                (identity_detail, teams_detail)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                (detail.clone(), detail)
+            }
         }
     } else {
-        "skipped until setup is complete".into()
+        let detail = "skipped until setup is complete".to_string();
+        (detail.clone(), detail)
     };
     checks.push(Check {
-        name: "microsoft_graph",
-        status: if graph_ok { "pass" } else { "fail" },
-        detail,
+        name: "microsoft_identity",
+        status: if identity_ok { "pass" } else { "fail" },
+        detail: identity_detail,
     });
-    let healthy = checks.iter().all(|check| check.status == "pass");
+    checks.push(Check {
+        name: "microsoft_teams",
+        status: if teams_ok { "pass" } else { "fail" },
+        detail: teams_detail,
+    });
+    let healthy = checks.iter().all(|check| check.status != "fail");
     let value = serde_json::json!({"checks":checks,"healthy":healthy});
     out.value(&value, || {
         checks
@@ -443,17 +491,9 @@ fn capabilities(out: Output) -> Result<(), AppError> {
         "unsupported":["personal Microsoft accounts","user calls and screen sharing","private Teams protocols","tenant administration"],
         "account_types":["Microsoft 365 work or school"],
         "api":"Microsoft Graph v1.0",
-        "notes":["Reading channel messages can require admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
+        "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
     out.value(&value, || "Supported\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nNot supported\n  Personal Microsoft accounts; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
-}
-
-fn prompt(label: &str) -> Result<String, AppError> {
-    eprint!("  {label}: ");
-    io::stderr().flush()?;
-    let mut value = String::new();
-    io::stdin().read_line(&mut value)?;
-    Ok(value.trim().into())
 }
 
 fn read_body(body: &str) -> Result<String, AppError> {
@@ -470,6 +510,13 @@ fn string_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
 }
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+fn optional_access(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "granted",
+        Some(false) => "not granted (optional)",
+        None => "unknown",
+    }
 }
 fn identity_text(value: &Value) -> String {
     format!(
