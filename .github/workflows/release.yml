@@ -1,0 +1,258 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Match tag to package version
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "v${version}" = "$GITHUB_REF_NAME"
+
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  binaries:
+    name: Binary (${{ matrix.target }})
+    needs: [version, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: teams
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: teams
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: teams
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: teams.exe
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist/package
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/package/
+          cp README.md LICENSE CHANGELOG.md dist/package/
+          tar -C dist/package -czf "dist/teams-cli-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" .
+          rm -rf dist/package
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  python-wheels:
+    name: Python wheel (${{ matrix.target }})
+    needs: [version, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: "2_28"
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: "2_28"
+          - os: macos-latest
+            target: universal2-apple-darwin
+            manylinux: auto
+          - os: windows-latest
+            target: x64
+            manylinux: auto
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --compatibility pypi --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  source-distributions:
+    name: Source distributions
+    needs: [version, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
+          command: sdist
+          args: --out dist
+      - run: cp target/package/*.crate dist/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: [binaries, python-wheels, source-distributions]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: source-distributions
+          path: dist
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --format json --override-filename teams-cli.cdx
+          cp teams-cli.cdx.json dist/
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum ./*.tar.gz ./*.crate ./*.json > SHA256SUMS
+      - name: Attest artifacts and SBOM
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+          sbom-path: dist/teams-cli.cdx.json
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+
+  crates-io:
+    name: Publish crates.io
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check whether this version is already published
+        id: crate
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl -fsSL "https://crates.io/api/v1/crates/teams-cli/${version}" > /dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Get temporary crates.io token
+        if: steps.crate.outputs.exists != 'true'
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - if: steps.crate.outputs.exists != 'true'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+      - if: steps.crate.outputs.exists == 'true'
+        run: echo "teams-cli ${GITHUB_REF_NAME#v} is already available on crates.io."
+
+  pypi:
+    name: Publish PyPI
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/teams-cli
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: source-distributions
+          path: source
+      - name: Collect Python distributions
+        run: find source -name '*.tar.gz' -exec cp {} dist/ \;
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  post-publish-smoke:
+    name: Verify public packages
+    needs: [crates-io, pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - name: Install and run the crates.io package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          root="${RUNNER_TEMP}/cargo-smoke"
+          for _ in 1 2 3 4 5 6; do
+            if cargo install --root "$root" teams-cli --version "$version" --locked; then
+              "$root/bin/teams" --version | grep -F "teams $version"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+      - name: Install and run the PyPI package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          environment="${RUNNER_TEMP}/pypi-smoke"
+          python -m venv "$environment"
+          for _ in 1 2 3 4 5 6; do
+            if "$environment/bin/pip" install --no-cache-dir "teams-cli==$version"; then
+              "$environment/bin/teams" --version | grep -F "teams $version"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
