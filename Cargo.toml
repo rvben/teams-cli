@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 crossterm = "0.29"
 dirs = "6"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 open = "5"
 rand = "0.9"
 ratatui = "0.30"
