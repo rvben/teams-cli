@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-24
+
 ### Added
 
 - Bundled the maintained multitenant teams-cli Entra public-client registration for zero-ID onboarding.
@@ -34,5 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Guided onboarding, diagnostics, completions, bounded collections, and deterministic TUI snapshots.
 - Distribution through crates.io, PyPI binary wheels, and signed GitHub release artifacts.
 
+[Unreleased]: https://github.com/rvben/teams-cli/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/rvben/teams-cli/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rvben/teams-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rvben/teams-cli/releases/tag/v0.1.0
