@@ -179,7 +179,11 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          if curl -fsSL "https://crates.io/api/v1/crates/teams-cli/${version}" > /dev/null; then
+          response="$(curl --fail --silent --show-error --location \
+            --user-agent "teams-cli-release-workflow" \
+            "https://crates.io/api/v1/crates/teams-cli")"
+          if jq --exit-status --arg version "$version" \
+            '.versions[] | select(.num == $version)' <<< "$response" > /dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
