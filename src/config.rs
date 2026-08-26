@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -65,12 +66,18 @@ pub fn save(profile_name: &str, profile: Profile) -> Result<PathBuf, AppError> {
         .ok_or_else(|| AppError::Unexpected("configuration path has no parent".into()))?;
     std::fs::create_dir_all(parent)?;
     let body = toml::to_string_pretty(&config).map_err(|e| AppError::Unexpected(e.to_string()))?;
-    std::fs::write(&path, body)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".config-")
+        .suffix(".toml.tmp")
+        .tempfile_in(parent)?;
+    temp.write_all(body.as_bytes())?;
+    temp.flush()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600))?;
     }
+    temp.persist(&path).map_err(|error| error.error)?;
     Ok(path)
 }
 
