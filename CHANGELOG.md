@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/rvben/teams-cli/compare/v0.1.3...v0.1.4) - 2026-08-26
+
+### Added
+
+- **packaging**: add package-named launcher ([35a14d3](https://github.com/rvben/teams-cli/commit/35a14d329c5ca5a24f0e47c81cf29f30bad8773c))
+
 ## [0.1.3](https://github.com/rvben/teams-cli/compare/v0.1.2...v0.1.3) - 2026-08-26
 
 ### Added
