@@ -83,11 +83,7 @@ pub fn save(profile_name: &str, profile: Profile) -> Result<PathBuf, AppError> {
 
 pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
     let config = read_file()?;
-    let name = requested
-        .map(str::to_owned)
-        .or_else(|| std::env::var("TEAMS_PROFILE").ok())
-        .or(config.active_profile)
-        .unwrap_or_else(|| "default".into());
+    let name = selected_profile_name_from(requested, config.active_profile.as_deref());
     let stored = config.profiles.get(&name);
     let client_id = std::env::var("TEAMS_CLIENT_ID")
         .ok()
@@ -116,6 +112,25 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
         read_only,
     };
     Ok((name, profile))
+}
+
+/// Resolve the profile a command would use without requiring that profile to
+/// be configured. Interactive recovery screens need the name even on first
+/// use, before there is a profile for [`load`] to return.
+pub fn selected_profile_name(requested: Option<&str>) -> Result<String, AppError> {
+    let config = read_file()?;
+    Ok(selected_profile_name_from(
+        requested,
+        config.active_profile.as_deref(),
+    ))
+}
+
+fn selected_profile_name_from(requested: Option<&str>, active: Option<&str>) -> String {
+    requested
+        .map(str::to_owned)
+        .or_else(|| std::env::var("TEAMS_PROFILE").ok())
+        .or_else(|| active.map(str::to_owned))
+        .unwrap_or_else(|| "default".into())
 }
 
 fn parse_bool(name: &str, value: &str) -> Result<bool, AppError> {

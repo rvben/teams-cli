@@ -393,6 +393,59 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
     if args.demo {
         return tui::run(tui::demo_data());
     }
+    let profile_name = config::selected_profile_name(profile_arg)?;
+    let mut reason_override = None;
+    loop {
+        match load_tui_data(profile_arg).await {
+            Ok(data) => return tui::run(data),
+            Err(error) if tui_auth_recoverable(&error) => {
+                let configured = config::configured_profile(profile_arg).is_some();
+                let reason = reason_override
+                    .take()
+                    .unwrap_or_else(|| tui_connection_reason(&error));
+                if tui::request_authentication(&profile_name, configured, &reason)?
+                    == tui::TuiExit::Quit
+                {
+                    return Ok(());
+                }
+
+                let auth_output = Output {
+                    format: OutputFormat::Text,
+                    quiet: false,
+                };
+                let result = if configured {
+                    let (_, profile) = config::load(profile_arg)?;
+                    auth::login(&profile_name, &profile, false, false, &auth_output)
+                        .await
+                        .map(|_| ())
+                } else {
+                    init(
+                        &profile_name,
+                        InitArgs {
+                            client_id: None,
+                            tenant: config::DEFAULT_TENANT.into(),
+                            no_login: false,
+                            device_code: false,
+                            channel_history: false,
+                            read_only: false,
+                        },
+                        auth_output,
+                    )
+                    .await
+                };
+                if let Err(error) = result {
+                    reason_override = Some(format!(
+                        "Sign-in did not complete: {} You can try again.",
+                        concise_error(&error)
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn load_tui_data(profile_arg: Option<&str>) -> Result<tui::TuiData, AppError> {
     let graph = client(profile_arg).await?;
     let me = graph.me().await?;
     let teams = graph.teams(50, 0).await?;
@@ -416,12 +469,69 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
             messages: vec![],
         });
     }
-    tui::run(tui::TuiData {
+    Ok(tui::TuiData {
         account: string_at(&me, "/displayName")
             .unwrap_or("Microsoft 365")
             .into(),
         conversations,
     })
+}
+
+fn tui_auth_recoverable(error: &AppError) -> bool {
+    matches!(error, AppError::Auth(_))
+        || matches!(error, AppError::InvalidInput(message) if message.contains("is not configured"))
+}
+
+fn tui_connection_reason(error: &AppError) -> String {
+    match error {
+        AppError::InvalidInput(message) if message.contains("is not configured") => {
+            "This profile has not been connected yet.".into()
+        }
+        AppError::Auth(message)
+            if message.contains("not signed in") || message.contains("unreadable") =>
+        {
+            "This profile does not have a usable Microsoft sign-in yet.".into()
+        }
+        AppError::Auth(message) if message.contains("expired") => {
+            "Your saved Microsoft session has expired.".into()
+        }
+        _ => "Microsoft rejected the current session.".into(),
+    }
+}
+
+fn concise_error(error: &AppError) -> String {
+    error.to_string().trim_end_matches('.').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_recovers_configuration_and_authentication_only() {
+        assert!(tui_auth_recoverable(&AppError::InvalidInput(
+            "profile 'work' is not configured; run `teams init`".into()
+        )));
+        assert!(tui_auth_recoverable(&AppError::Auth(
+            "session expired".into()
+        )));
+        assert!(!tui_auth_recoverable(&AppError::InvalidInput(
+            "invalid field selection".into()
+        )));
+        assert!(!tui_auth_recoverable(&AppError::RateLimit(None)));
+    }
+
+    #[test]
+    fn tui_connection_copy_is_actionable_without_shell_instructions() {
+        let reason = tui_connection_reason(&AppError::Auth(
+            "not signed in; run `teams auth login`".into(),
+        ));
+        assert_eq!(
+            reason,
+            "This profile does not have a usable Microsoft sign-in yet."
+        );
+        assert!(!reason.contains("teams auth login"));
+    }
 }
 
 #[derive(Serialize)]

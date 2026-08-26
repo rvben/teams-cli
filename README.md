@@ -57,6 +57,11 @@ Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send
 ChannelMessage.Send
 ```
 
+The TUI is also the recovery path: an unconfigured profile, missing credential,
+expired refresh session, or Microsoft `401` opens a focused connection screen.
+Press `Enter` or `a` to restore the normal terminal, complete Microsoft sign-in,
+and return directly to the inbox; `q` exits without changing anything.
+
 Reading channel history is intentionally separate because `ChannelMessage.Read.All` requires administrator consent. Request it only when needed:
 
 ```console
