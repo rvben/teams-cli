@@ -12,9 +12,11 @@ For humans, no arguments open guided onboarding on first use and the TUI afterwa
 pipx install teams-cli
 # or
 cargo install teams-cli --locked
+# or run from PyPI without installing
+uvx teams-cli --help
 ```
 
-The PyPI distribution is named `teams-cli`; the executable is `teams`, matching the `jira-cli` → `jira` and `confluence-cli` → `confluence` family.
+The PyPI distribution provides both `teams` and `teams-cli` as executable names.
 
 To work from source:
 

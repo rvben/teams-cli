@@ -16,6 +16,10 @@ categories = ["command-line-utilities"]
 name = "teams"
 path = "src/main.rs"
 
+[[bin]]
+name = "teams-cli"
+path = "src/teams_cli_alias.rs"
+
 [dependencies]
 base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
