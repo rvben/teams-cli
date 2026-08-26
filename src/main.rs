@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use teams_cli::auth;
 use teams_cli::cli::{
-    AuthCommand, ChannelsCommand, ChatsCommand, Cli, Command, InitArgs, MessagesCommand,
-    OffsetPageArgs, PageArgs, TuiArgs,
+    AuthCommand, ChannelsCommand, ChatsCommand, Cli, Command, ConfigCommand, InitArgs,
+    MessagesCommand, OffsetPageArgs, PageArgs, TuiArgs,
 };
 use teams_cli::config::{self, Profile};
 use teams_cli::error::AppError;
@@ -36,7 +36,7 @@ async fn main() {
         }
     };
     let out = Output {
-        format: if cli.json {
+        format: if cli.json && cli.output == OutputFormat::Auto {
             OutputFormat::Json
         } else {
             cli.output
@@ -60,6 +60,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                 no_login: false,
                 device_code: false,
                 channel_history: false,
+                read_only: false,
             })
         }
         None if io::stdin().is_terminal() && io::stdout().is_terminal() => Command::Tui(TuiArgs {
@@ -77,6 +78,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     match command {
         Command::Init(args) => init(profile_arg.unwrap_or("default"), args, out).await,
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
+        Command::Config { command } => config_command(profile_arg, command, out),
         Command::Whoami => {
             let client = client(profile_arg).await?;
             let value = client.me().await?;
@@ -137,7 +139,10 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                     "message body cannot be empty".into(),
                 ));
             }
-            let client = client(profile_arg).await?;
+            let (name, profile) = config::load(profile_arg)?;
+            profile.require_writable()?;
+            let token = auth::access_token(&name, &profile).await?;
+            let client = GraphClient::new(token);
             let value = client
                 .send(chat.as_deref(), team.as_deref(), channel.as_deref(), &body)
                 .await?;
@@ -199,6 +204,7 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         Profile {
             client_id: client_id.clone(),
             tenant: args.tenant.clone(),
+            read_only: args.read_only,
         },
     )?;
     let mut signed_in = false;
@@ -222,6 +228,7 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         client_id: &'a str,
         tenant: &'a str,
         channel_history_requested: bool,
+        read_only: bool,
     }
     let result = InitResult {
         profile: profile_name,
@@ -230,6 +237,7 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         client_id: &client_id,
         tenant: &args.tenant,
         channel_history_requested: args.channel_history,
+        read_only: args.read_only,
     };
     out.value(&result, || {
         if signed_in {
@@ -238,6 +246,38 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
             format!("Saved {}. Next: `teams auth login`", path.display())
         }
     })
+}
+
+fn config_command(
+    profile_arg: Option<&str>,
+    command: ConfigCommand,
+    out: Output,
+) -> Result<(), AppError> {
+    match command {
+        ConfigCommand::Path => out.value(&config::path().display().to_string(), || {
+            config::path().display().to_string()
+        }),
+        ConfigCommand::Show => {
+            let (name, profile) = config::load(profile_arg)?;
+            let value = serde_json::json!({
+                "profile": name,
+                "client_id": profile.client_id,
+                "tenant": profile.tenant,
+                "read_only": profile.read_only,
+                "config_path": config::path(),
+            });
+            out.value(&value, || {
+                format!(
+                    "Profile: {}\nTenant: {}\nClient ID: {}\nRead only: {}\nConfig: {}",
+                    value["profile"].as_str().unwrap_or_default(),
+                    value["tenant"].as_str().unwrap_or_default(),
+                    value["client_id"].as_str().unwrap_or_default(),
+                    yes_no(value["read_only"].as_bool().unwrap_or(false)),
+                    config::path().display(),
+                )
+            })
+        }
+    }
 }
 
 async fn auth_command(
@@ -276,12 +316,13 @@ async fn auth_command(
             let signed_in = auth::has_token(name);
             let scopes = auth::granted_scopes(name);
             let channel_history = auth::channel_history_granted(name);
-            let value = serde_json::json!({"profile":name,"configured":configured.is_some(),"signed_in":signed_in,"config_path":config::path(),"granted_scopes":scopes,"channel_history":channel_history});
+            let value = serde_json::json!({"profile":name,"configured":configured.is_some(),"signed_in":signed_in,"config_path":config::path(),"read_only":configured.as_ref().is_some_and(|(_, profile)| profile.read_only),"granted_scopes":scopes,"channel_history":channel_history});
             out.value(&value, || {
                 format!(
-                    "Profile: {name}\nConfigured: {}\nSigned in: {}\nChannel history: {}\nConfig: {}",
+                    "Profile: {name}\nConfigured: {}\nSigned in: {}\nRead only: {}\nChannel history: {}\nConfig: {}",
                     yes_no(configured.is_some()),
                     yes_no(signed_in),
+                    yes_no(value["read_only"].as_bool().unwrap_or(false)),
                     optional_access(channel_history),
                     config::path().display()
                 )
@@ -398,6 +439,17 @@ async fn doctor(profile_arg: Option<&str>, out: Output) -> Result<(), AppError> 
         status: if configured.is_some() { "pass" } else { "fail" },
         detail: config::path().display().to_string(),
     });
+    if let Some((_, profile)) = &configured {
+        checks.push(Check {
+            name: "write_safety",
+            status: "pass",
+            detail: if profile.read_only {
+                "read-only mode is enabled".into()
+            } else {
+                "remote writes are enabled".into()
+            },
+        });
+    }
     let signed_in = configured
         .as_ref()
         .is_some_and(|(name, _)| auth::has_token(name));

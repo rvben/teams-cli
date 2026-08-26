@@ -36,6 +36,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Inspect resolved, secret-free configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Show the signed-in Microsoft 365 identity
     Whoami,
     /// List teams joined by the signed-in user
@@ -87,6 +92,17 @@ pub struct InitArgs {
     /// Request admin-consented access to read channel history
     #[arg(long)]
     pub channel_history: bool,
+    /// Block remote write operations for this profile
+    #[arg(long, env = "TEAMS_READ_ONLY")]
+    pub read_only: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the resolved profile without credentials
+    Show,
+    /// Print the absolute configuration file path
+    Path,
 }
 
 #[derive(Debug, Subcommand)]

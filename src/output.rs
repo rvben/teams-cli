@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::error::AppError;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Auto,
     Text,
@@ -62,7 +62,7 @@ pub fn print_error(error: &AppError, structured: bool) {
                 "retryable": contract.retryable,
             }
         });
-        eprintln!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| r#"{"error":{"kind":"internal","message":"error serialization failed","retryable":false}}"#.into()));
+        eprintln!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| r#"{"error":{"kind":"unexpected_error","message":"error serialization failed","retryable":false}}"#.into()));
     }
 }
 

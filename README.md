@@ -92,10 +92,21 @@ teams auth login --channel-history  # once, with administrator approval
 teams messages list --team TEAM_ID --channel CHANNEL_ID
 teams messages send --chat CHAT_ID --body "On it."
 printf 'Status update' | teams messages send --chat CHAT_ID --body -
+teams config show
 teams doctor
 ```
 
 Collection commands expose `--limit` and `--fields`; Graph-native collections use `--cursor`, while joined teams and channels use `--offset` because those endpoints do not accept `$top`. With a terminal they render concise text; when stdout is piped they emit JSON envelopes with continuation metadata and `truncated`.
+
+Profiles can block every remote write while keeping reads, sign-in, diagnostics, and the TUI available:
+
+```console
+teams init --no-login --read-only
+# or for one invocation/environment
+TEAMS_READ_ONLY=true teams messages send --chat CHAT_ID --body "Blocked"
+```
+
+Like the other tools in the suite, the config file is selected with `--profile`, overridden by `TEAMS_*` environment variables, and inspectable without exposing credentials through `teams config show` and `teams config path`.
 
 ## Boundaries
 

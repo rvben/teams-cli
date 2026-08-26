@@ -8,6 +8,8 @@ pub enum AppError {
     #[error("{0}")]
     Auth(String),
     #[error("{0}")]
+    ReadOnly(String),
+    #[error("{0}")]
     Permission(String),
     #[error("{0}")]
     NotFound(String),
@@ -32,7 +34,7 @@ pub struct ErrorContract {
 }
 
 pub const INVALID_INPUT: ErrorContract = ErrorContract {
-    kind: "usage",
+    kind: "invalid_input",
     exit_code: 2,
     retryable: false,
     description: "Arguments or local configuration are invalid",
@@ -45,13 +47,13 @@ pub const AUTH: ErrorContract = ErrorContract {
 };
 pub const PERMISSION: ErrorContract = ErrorContract {
     kind: "permission_denied",
-    exit_code: 4,
+    exit_code: 5,
     retryable: false,
     description: "The tenant or granted scopes do not permit the operation",
 };
 pub const NOT_FOUND: ErrorContract = ErrorContract {
     kind: "not_found",
-    exit_code: 5,
+    exit_code: 4,
     retryable: false,
     description: "The requested Teams resource does not exist",
 };
@@ -63,26 +65,33 @@ pub const RATE_LIMIT: ErrorContract = ErrorContract {
 };
 pub const API: ErrorContract = ErrorContract {
     kind: "api_error",
-    exit_code: 7,
+    exit_code: 5,
     retryable: false,
     description: "Microsoft Graph returned an API error",
 };
 pub const NON_INTERACTIVE: ErrorContract = ErrorContract {
     kind: "tty_required",
-    exit_code: 8,
+    exit_code: 2,
     retryable: false,
     description: "An interactive command was invoked without a terminal",
 };
 pub const UNEXPECTED: ErrorContract = ErrorContract {
-    kind: "internal",
+    kind: "unexpected_error",
     exit_code: 1,
     retryable: false,
     description: "An unexpected local or transport error occurred",
+};
+pub const READ_ONLY: ErrorContract = ErrorContract {
+    kind: "read_only",
+    exit_code: 2,
+    retryable: false,
+    description: "The active profile blocks remote write operations",
 };
 
 pub const ALL: &[ErrorContract] = &[
     INVALID_INPUT,
     AUTH,
+    READ_ONLY,
     PERMISSION,
     NOT_FOUND,
     RATE_LIMIT,
@@ -96,6 +105,7 @@ impl AppError {
         match self {
             Self::InvalidInput(_) => INVALID_INPUT,
             Self::Auth(_) => AUTH,
+            Self::ReadOnly(_) => READ_ONLY,
             Self::Permission(_) => PERMISSION,
             Self::NotFound(_) => NOT_FOUND,
             Self::RateLimit(_) => RATE_LIMIT,

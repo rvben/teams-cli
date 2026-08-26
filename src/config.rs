@@ -14,6 +14,21 @@ pub struct Profile {
     pub client_id: String,
     #[serde(default = "default_tenant")]
     pub tenant: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl Profile {
+    pub fn require_writable(&self) -> Result<(), AppError> {
+        if self.read_only {
+            Err(AppError::ReadOnly(
+                "read-only mode is enabled (unset TEAMS_READ_ONLY or disable read_only in the active profile to allow writes)"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn default_tenant() -> String {
@@ -79,8 +94,31 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
         .ok()
         .or_else(|| stored.map(|profile| profile.tenant.clone()))
         .unwrap_or_else(default_tenant);
-    let profile = Profile { client_id, tenant };
+    let read_only = match std::env::var("TEAMS_READ_ONLY") {
+        Ok(value) => parse_bool("TEAMS_READ_ONLY", &value)?,
+        Err(std::env::VarError::NotPresent) => stored.is_some_and(|profile| profile.read_only),
+        Err(error) => {
+            return Err(AppError::InvalidInput(format!(
+                "cannot read TEAMS_READ_ONLY: {error}"
+            )));
+        }
+    };
+    let profile = Profile {
+        client_id,
+        tenant,
+        read_only,
+    };
     Ok((name, profile))
+}
+
+fn parse_bool(name: &str, value: &str) -> Result<bool, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(AppError::InvalidInput(format!(
+            "{name} must be true or false"
+        ))),
+    }
 }
 
 #[cfg(windows)]

@@ -73,6 +73,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     field("client_id", "string"),
                     field("tenant", "string"),
                     field("channel_history_requested", "boolean"),
+                    field("read_only", "boolean"),
                 ],
             );
             value["args"] = json!([
@@ -92,7 +93,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     "--channel-history",
                     "boolean",
                     "Request admin-consented channel-history access"
-                )
+                ),
+                arg("--read-only", "boolean", "Block remote write operations")
             ]);
             value
         },
@@ -137,9 +139,28 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 field("configured", "boolean"),
                 field("signed_in", "boolean"),
                 field("config_path", "string"),
+                field("read_only", "boolean"),
                 nullable_array_field("granted_scopes", "string"),
                 nullable_field("channel_history", "boolean"),
             ],
+        ),
+        single(
+            "config show",
+            "Print the resolved profile without credentials",
+            "read_only",
+            vec![
+                field("profile", "string"),
+                field("client_id", "string"),
+                field("tenant", "string"),
+                field("read_only", "boolean"),
+                field("config_path", "string"),
+            ],
+        ),
+        single(
+            "config path",
+            "Print the absolute configuration file path",
+            "read_only",
+            vec![],
         ),
         single(
             "whoami",
@@ -275,6 +296,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             "api":"Microsoft Graph v1.0",
             "default_client_id": crate::config::DEFAULT_CLIENT_ID,
             "login_modes":["browser_pkce","device_code"],
+            "read_only_env":"TEAMS_READ_ONLY",
             "baseline_scopes": crate::auth::BASE_SCOPES.split_whitespace().collect::<Vec<_>>(),
             "privileged_scopes":[crate::auth::CHANNEL_HISTORY_SCOPE]
         }

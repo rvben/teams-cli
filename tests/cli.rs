@@ -101,7 +101,7 @@ fn no_args_never_prompts_when_piped() {
     Command::cargo_bin("teams")
         .unwrap()
         .assert()
-        .code(8)
+        .code(2)
         .stderr(predicate::str::contains("\"kind\":\"tty_required\""));
 }
 
@@ -119,7 +119,52 @@ fn noninteractive_init_uses_the_maintained_client_id() {
     assert_eq!(result["client_id"], "66ebad71-1604-48fc-a086-0d4caa24988b");
     assert_eq!(result["tenant"], "organizations");
     assert_eq!(result["channel_history_requested"], false);
+    assert_eq!(result["read_only"], false);
     assert!(temp.path().join("teams/config.toml").is_file());
+}
+
+#[test]
+fn init_can_create_a_read_only_profile_and_config_show_resolves_it() {
+    let temp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .args(["init", "--no-login", "--read-only"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"read_only\": true"));
+}
+
+#[test]
+fn suite_exit_codes_and_error_kinds_are_stable() {
+    let schema: Value = serde_json::from_slice(
+        &Command::cargo_bin("teams")
+            .unwrap()
+            .arg("schema")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let errors = schema["errors"].as_array().unwrap();
+    let code = |kind: &str| {
+        errors.iter().find(|error| error["kind"] == kind).unwrap()["exit_code"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(code("invalid_input"), 2);
+    assert_eq!(code("auth"), 3);
+    assert_eq!(code("not_found"), 4);
+    assert_eq!(code("api_error"), 5);
+    assert_eq!(code("rate_limit"), 6);
+    assert_eq!(code("read_only"), 2);
 }
 
 #[test]
@@ -130,7 +175,7 @@ fn headless_browser_login_refuses_before_writing_config() {
         .env("XDG_CONFIG_HOME", temp.path())
         .arg("init")
         .assert()
-        .code(8)
+        .code(2)
         .stderr(predicate::str::contains(
             "browser sign-in requires a terminal",
         ));
