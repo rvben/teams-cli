@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/rvben/teams-cli/compare/v0.1.4...v0.1.5) - 2026-08-26
+
+### Added
+
+- **tui**: recover Microsoft sign-in in place ([8266887](https://github.com/rvben/teams-cli/commit/8266887feef3feb651fa4ae5348752be2703d36b))
+
 ## [0.1.4](https://github.com/rvben/teams-cli/compare/v0.1.3...v0.1.4) - 2026-08-26
 
 ### Added
