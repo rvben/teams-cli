@@ -20,6 +20,9 @@ pub struct Cli {
     /// Suppress progress and informational messages
     #[arg(long, global = true)]
     pub quiet: bool,
+    /// Skip confirmation prompts for destructive operations
+    #[arg(long, short = 'y', global = true)]
+    pub yes: bool,
     /// Alias for --output json
     #[arg(long, global = true, hide = true)]
     pub json: bool,
@@ -35,6 +38,11 @@ pub enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// List, select, or remove configuration profiles
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
     },
     /// Inspect resolved, secret-free configuration
     Config {
@@ -63,7 +71,11 @@ pub enum Command {
     /// Open the keyboard-first terminal interface
     Tui(TuiArgs),
     /// Check configuration, credential storage, and Graph access
-    Doctor,
+    Doctor {
+        /// Check local state without contacting Microsoft Graph
+        #[arg(long)]
+        offline: bool,
+    },
     /// Describe supported and deliberately unsupported capabilities
     Capabilities,
     /// Emit the offline CLI Spec v0.3 contract
@@ -118,8 +130,22 @@ pub enum AuthCommand {
     },
     /// Remove locally stored credentials
     Logout,
-    /// Show local authentication status without network access
-    Status,
+    /// Verify authentication and show the selected profile's status
+    Status {
+        /// Inspect local credential state without contacting Microsoft Graph
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommand {
+    /// List configured profiles and identify the active one
+    List,
+    /// Select the default profile for future commands
+    Use { name: String },
+    /// Remove a profile and its stored credential
+    Remove { name: String },
 }
 
 #[derive(Debug, Subcommand)]

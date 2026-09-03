@@ -143,6 +143,58 @@ fn init_can_create_a_read_only_profile_and_config_show_resolves_it() {
 }
 
 #[test]
+fn profile_lifecycle_and_offline_auth_status_are_local() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["work", "sandbox"] {
+        Command::cargo_bin("teams")
+            .unwrap()
+            .env("XDG_CONFIG_HOME", temp.path())
+            .args(["--profile", name, "init", "--no-login"])
+            .assert()
+            .success();
+    }
+
+    Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .args(["profile", "use", "work"])
+        .assert()
+        .success();
+
+    let list = Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .args(["--output", "json", "profile", "list"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let value: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(value["total"], 2);
+    assert!(
+        value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| { profile["name"] == "work" && profile["active"] == true })
+    );
+
+    Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .args(["auth", "status", "--offline"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"verified\": false"));
+
+    Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .args(["profile", "remove", "sandbox", "--yes"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn suite_exit_codes_and_error_kinds_are_stable() {
     let schema: Value = serde_json::from_slice(
         &Command::cargo_bin("teams")

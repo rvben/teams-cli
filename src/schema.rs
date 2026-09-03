@@ -130,20 +130,57 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             "idempotent",
             vec![field("profile", "string"), field("signed_in", "boolean")],
         ),
+        {
+            let mut value = single(
+                "auth status",
+                "Verify authentication and inspect credential state",
+                "read_only",
+                vec![
+                    field("profile", "string"),
+                    field("configured", "boolean"),
+                    field("signed_in", "boolean"),
+                    field("verified", "boolean"),
+                    nullable_field("identity", "object"),
+                    field("config_path", "string"),
+                    field("read_only", "boolean"),
+                    nullable_array_field("granted_scopes", "string"),
+                    nullable_field("channel_history", "boolean"),
+                ],
+            );
+            value["args"] = json!([arg(
+                "--offline",
+                "boolean",
+                "Inspect local credential state without contacting Microsoft Graph"
+            )]);
+            value
+        },
         single(
-            "auth status",
-            "Inspect local configuration and credential presence without network access",
+            "profile list",
+            "List configured profiles and identify the active one",
             "read_only",
-            vec![
-                field("profile", "string"),
-                field("configured", "boolean"),
-                field("signed_in", "boolean"),
-                field("config_path", "string"),
-                field("read_only", "boolean"),
-                nullable_array_field("granted_scopes", "string"),
-                nullable_field("channel_history", "boolean"),
-            ],
+            vec![array_field("items", "object"), field("total", "integer")],
         ),
+        {
+            let mut value = single(
+                "profile use",
+                "Select the default profile for future commands",
+                "idempotent",
+                vec![field("profile", "string"), field("active", "boolean")],
+            );
+            value["args"] = json!([required_arg("name", "string", "Profile name")]);
+            value
+        },
+        {
+            let mut value = single(
+                "profile remove",
+                "Remove a profile and its stored credential",
+                "idempotent",
+                vec![field("profile", "string"), field("removed", "boolean")],
+            );
+            value["args"] = json!([required_arg("name", "string", "Profile name")]);
+            value["confirmation_bypass_arg"] = json!("--yes");
+            value
+        },
         single(
             "config show",
             "Print the resolved profile without credentials",
@@ -246,12 +283,20 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             value
         },
         json!({"name":"tui", "description":"Open the keyboard-first terminal interface", "effects":"read_only", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
-        single(
-            "doctor",
-            "Check configuration, credential storage, Microsoft identity, and Teams provisioning",
-            "read_only",
-            vec![array_field("checks", "object"), field("healthy", "boolean")],
-        ),
+        {
+            let mut value = single(
+                "doctor",
+                "Check configuration, credential storage, Microsoft identity, and Teams provisioning",
+                "read_only",
+                vec![array_field("checks", "object"), field("healthy", "boolean")],
+            );
+            value["args"] = json!([arg(
+                "--offline",
+                "boolean",
+                "Check local state without contacting Microsoft Graph"
+            )]);
+            value
+        },
         single(
             "capabilities",
             "Describe supported and deliberately unsupported capabilities",
@@ -287,7 +332,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         "global_args": [
             {"name":"--output", "short":"-o", "type":"string", "enum":["auto","text","json"], "default":"auto", "description":"Output format"},
             {"name":"--profile", "type":"string", "description":"Configuration profile"},
-            {"name":"--quiet", "type":"boolean", "description":"Suppress informational stderr output"}
+            {"name":"--quiet", "type":"boolean", "description":"Suppress informational stderr output"},
+            {"name":"--yes", "short":"-y", "type":"boolean", "description":"Skip confirmation prompts for destructive operations"}
         ],
         "commands": commands,
         "errors": error::ALL.iter().map(|e| json!({"kind":e.kind,"exit_code":e.exit_code,"retryable":e.retryable,"description":e.description})).collect::<Vec<_>>(),

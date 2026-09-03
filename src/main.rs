@@ -7,7 +7,7 @@ use serde_json::Value;
 use teams_cli::auth;
 use teams_cli::cli::{
     AuthCommand, ChannelsCommand, ChatsCommand, Cli, Command, ConfigCommand, InitArgs,
-    MessagesCommand, OffsetPageArgs, PageArgs, TuiArgs,
+    MessagesCommand, OffsetPageArgs, PageArgs, ProfileCommand, TuiArgs,
 };
 use teams_cli::config::{self, Profile};
 use teams_cli::error::AppError;
@@ -51,6 +51,7 @@ async fn main() {
 
 async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     let profile_arg = cli.profile.as_deref();
+    let yes = cli.yes;
     let command = match cli.command {
         Some(command) => command,
         None if io::stdin().is_terminal() && io::stdout().is_terminal() && !config::exists() => {
@@ -78,6 +79,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     match command {
         Command::Init(args) => init(profile_arg.unwrap_or("default"), args, out).await,
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
+        Command::Profile { command } => profile_command(command, yes, out),
         Command::Config { command } => config_command(profile_arg, command, out),
         Command::Whoami => {
             let client = client(profile_arg).await?;
@@ -154,7 +156,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
             })
         }
         Command::Tui(args) => tui_command(profile_arg, args).await,
-        Command::Doctor => doctor(profile_arg, out).await,
+        Command::Doctor { offline } => doctor(profile_arg, offline, out).await,
         Command::Capabilities => capabilities(out),
         Command::Schema { command } => {
             let value = schema::generate(command.as_deref());
@@ -307,7 +309,7 @@ async fn auth_command(
             let value = serde_json::json!({"profile":name,"signed_in":false});
             out.value(&value, || format!("Signed out profile '{name}'."))
         }
-        AuthCommand::Status => {
+        AuthCommand::Status { offline } => {
             let configured = config::configured_profile(profile_arg);
             let name = configured
                 .as_ref()
@@ -316,7 +318,12 @@ async fn auth_command(
             let signed_in = auth::has_token(name);
             let scopes = auth::granted_scopes(name);
             let channel_history = auth::channel_history_granted(name);
-            let value = serde_json::json!({"profile":name,"configured":configured.is_some(),"signed_in":signed_in,"config_path":config::path(),"read_only":configured.as_ref().is_some_and(|(_, profile)| profile.read_only),"granted_scopes":scopes,"channel_history":channel_history});
+            let identity = if !offline && configured.is_some() && signed_in {
+                Some(client(Some(name)).await?.me().await?)
+            } else {
+                None
+            };
+            let value = serde_json::json!({"profile":name,"configured":configured.is_some(),"signed_in":signed_in,"verified":identity.is_some(),"identity":identity,"config_path":config::path(),"read_only":configured.as_ref().is_some_and(|(_, profile)| profile.read_only),"granted_scopes":scopes,"channel_history":channel_history});
             out.value(&value, || {
                 format!(
                     "Profile: {name}\nConfigured: {}\nSigned in: {}\nRead only: {}\nChannel history: {}\nConfig: {}",
@@ -327,6 +334,59 @@ async fn auth_command(
                     config::path().display()
                 )
             })
+        }
+    }
+}
+
+fn profile_command(command: ProfileCommand, yes: bool, out: Output) -> Result<(), AppError> {
+    match command {
+        ProfileCommand::List => {
+            let profiles = config::profile_summaries()?;
+            out.value(
+                &serde_json::json!({"items": profiles, "total": profiles.len()}),
+                || {
+                    if profiles.is_empty() {
+                        "No profiles configured. Run `teams init`.".into()
+                    } else {
+                        profiles
+                            .iter()
+                            .map(|profile| {
+                                format!(
+                                    "{} {}  {}",
+                                    if profile.active { "*" } else { " " },
+                                    profile.name,
+                                    profile.tenant
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                },
+            )
+        }
+        ProfileCommand::Use { name } => {
+            config::use_profile(&name)?;
+            out.value(
+                &serde_json::json!({"profile": name, "active": true}),
+                || format!("Active profile set to '{name}'."),
+            )
+        }
+        ProfileCommand::Remove { name } => {
+            if !yes {
+                return Err(AppError::InvalidInput(
+                    "profile removal requires --yes".into(),
+                ));
+            }
+            auth::logout(&name)?;
+            if !config::remove_profile(&name)? {
+                return Err(AppError::InvalidInput(format!(
+                    "profile '{name}' is not configured"
+                )));
+            }
+            out.value(
+                &serde_json::json!({"profile": name, "removed": true}),
+                || format!("Removed profile '{name}'."),
+            )
         }
     }
 }
@@ -541,7 +601,7 @@ struct Check {
     detail: String,
 }
 
-async fn doctor(profile_arg: Option<&str>, out: Output) -> Result<(), AppError> {
+async fn doctor(profile_arg: Option<&str>, offline: bool, out: Output) -> Result<(), AppError> {
     let mut checks = Vec::new();
     let configured = config::configured_profile(profile_arg);
     checks.push(Check {
@@ -593,7 +653,7 @@ async fn doctor(profile_arg: Option<&str>, out: Output) -> Result<(), AppError> 
     });
     let mut identity_ok = false;
     let mut teams_ok = false;
-    let (identity_detail, teams_detail) = if configured.is_some() && signed_in {
+    let (identity_detail, teams_detail) = if !offline && configured.is_some() && signed_in {
         match client(profile_arg).await {
             Ok(client) => {
                 let identity_detail = match client.me().await {
@@ -623,21 +683,38 @@ async fn doctor(profile_arg: Option<&str>, out: Output) -> Result<(), AppError> 
             }
         }
     } else {
-        let detail = "skipped until setup is complete".to_string();
+        let detail = if offline {
+            "network check skipped"
+        } else {
+            "skipped until setup is complete"
+        }
+        .to_string();
         (detail.clone(), detail)
     };
     checks.push(Check {
         name: "microsoft_identity",
-        status: if identity_ok { "pass" } else { "fail" },
+        status: if offline {
+            "skip"
+        } else if identity_ok {
+            "pass"
+        } else {
+            "fail"
+        },
         detail: identity_detail,
     });
     checks.push(Check {
         name: "microsoft_teams",
-        status: if teams_ok { "pass" } else { "fail" },
+        status: if offline {
+            "skip"
+        } else if teams_ok {
+            "pass"
+        } else {
+            "fail"
+        },
         detail: teams_detail,
     });
     let healthy = checks.iter().all(|check| check.status != "fail");
-    let value = serde_json::json!({"checks":checks,"healthy":healthy});
+    let value = serde_json::json!({"checks":checks,"healthy":healthy,"offline":offline});
     out.value(&value, || {
         checks
             .iter()

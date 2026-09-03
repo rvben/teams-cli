@@ -99,8 +99,14 @@ teams auth login --channel-history  # once, with administrator approval
 teams messages list --team TEAM_ID --channel CHANNEL_ID
 teams messages send --chat CHAT_ID --body "On it."
 printf 'Status update' | teams messages send --chat CHAT_ID --body -
+teams auth status
+teams auth status --offline
+teams profile list
+teams profile use work
+teams profile remove old --yes
 teams config show
-teams doctor
+teams config path
+teams doctor --offline
 ```
 
 Collection commands expose `--limit` and `--fields`; Graph-native collections use `--cursor`, while joined teams and channels use `--offset` because those endpoints do not accept `$top`. With a terminal they render concise text; when stdout is piped they emit JSON envelopes with continuation metadata and `truncated`.
