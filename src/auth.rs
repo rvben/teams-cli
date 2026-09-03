@@ -104,10 +104,27 @@ fn load(profile_name: &str) -> Result<TokenBundle, AppError> {
 pub fn logout(profile_name: &str) -> Result<(), AppError> {
     match entry(profile_name)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) if secret_service_is_unavailable(&e) => Ok(()),
         Err(e) => Err(AppError::Unexpected(format!(
             "could not remove stored credentials: {e}"
         ))),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn secret_service_is_unavailable(error: &keyring::Error) -> bool {
+    match error {
+        keyring::Error::PlatformFailure(source) => {
+            let message = source.to_string();
+            message.contains("org.freedesktop.secrets") && message.contains("not provided")
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn secret_service_is_unavailable(_error: &keyring::Error) -> bool {
+    false
 }
 
 pub async fn access_token(profile_name: &str, profile: &Profile) -> Result<String, AppError> {
@@ -384,5 +401,15 @@ mod tests {
     #[test]
     fn channel_history_is_explicitly_opted_in() {
         assert!(scopes(true).contains(CHANNEL_HISTORY_SCOPE));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_secret_service_is_treated_as_an_empty_store() {
+        let error = keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+            "The name org.freedesktop.secrets was not provided by any .service files",
+        )));
+
+        assert!(super::secret_service_is_unavailable(&error));
     }
 }
