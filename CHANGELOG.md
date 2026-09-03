@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/rvben/teams-cli/compare/v0.1.5...v0.1.6) - 2026-09-03
+
+### Added
+
+- **auth**: standardize authentication workflow ([bb0019f](https://github.com/rvben/teams-cli/commit/bb0019f0ceb86dbb963f3499348c58a95922081e))
+
+### Fixed
+
+- **auth**: tolerate missing Linux credential service ([7764383](https://github.com/rvben/teams-cli/commit/776438359f3c913d0514de921042d770c6a88bf0))
+
 ## [0.1.5](https://github.com/rvben/teams-cli/compare/v0.1.4...v0.1.5) - 2026-08-26
 
 ### Added
