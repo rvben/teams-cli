@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/rvben/teams-cli/compare/v0.1.6...v0.1.7) - 2026-09-27
+
+### Fixed
+
+- **deps**: update rustls to 0.23.45 for RUSTSEC-2026-0285 ([d2338ff](https://github.com/rvben/teams-cli/commit/d2338ff8abf676501931c5ba7225097bb154f39c))
+
 ## [0.1.6](https://github.com/rvben/teams-cli/compare/v0.1.5...v0.1.6) - 2026-09-03
 
 ### Added
