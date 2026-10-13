@@ -326,6 +326,9 @@ struct App {
     /// Set by `r` so its result is announced; quiet reloads say nothing.
     refreshing: bool,
     fetching_chats: bool,
+    /// When a newest-page read last succeeded, and whether a refresh has failed since.
+    synced_at: Option<Zoned>,
+    stale: bool,
     thread_polled: Instant,
     chats_polled: Instant,
 }
@@ -362,8 +365,23 @@ impl App {
             drafts: HashMap::new(),
             refreshing: false,
             fetching_chats: false,
+            synced_at: None,
+            stale: false,
             thread_polled: Instant::now(),
             chats_polled: Instant::now(),
+        }
+    }
+
+    /// Records the outcome of reading the newest chats or messages for the header.
+    fn synced(&mut self, ok: bool) {
+        if ok {
+            self.synced_at = Some(match self.source {
+                Source::Live { .. } => Zoned::now().with_time_zone(TimeZone::system()),
+                Source::Demo => self.now.clone(),
+            });
+            self.stale = false;
+        } else {
+            self.stale = true;
         }
     }
 
@@ -388,36 +406,78 @@ impl App {
         }
     }
 
-    fn location(&self) -> String {
-        let (profile, kind) = match &self.source {
-            Source::Live {
-                backend, profile, ..
-            } => (
-                profile.as_str(),
-                match backend.as_ref() {
+    fn profile(&self) -> &str {
+        match &self.source {
+            Source::Live { profile, .. } => profile,
+            Source::Demo => "demo",
+        }
+    }
+
+    /// The second header line as parts, most useful first; whole parts are dropped
+    /// from the end when the terminal is narrow.
+    fn context(&self) -> Vec<Vec<Span<'static>>> {
+        let theme = self.theme;
+        let mut parts = Vec::new();
+        if matches!(self.chats_load, Load::Ready) {
+            let more = if self.chat_cursor.is_some() { "+" } else { "" };
+            parts.push(vec![
+                Span::styled(format!("{}{more}", self.rows.len()), theme.figure()),
+                Span::styled(" chats", theme.muted()),
+            ]);
+            let unread = self.rows.iter().filter(|row| row.unread).count();
+            if unread > 0 {
+                parts.push(vec![
+                    Span::styled(unread.to_string(), theme.unread()),
+                    Span::styled(" unread", theme.unread_label()),
+                ]);
+            }
+        }
+        parts.push(vec![Span::styled(
+            match &self.source {
+                Source::Live { backend, .. } => match backend.as_ref() {
                     TeamsBackend::Graph(_) => "Microsoft Graph",
                     TeamsBackend::Desktop(_) => "Teams desktop cache",
                 },
-            ),
-            Source::Demo => ("demo", "sample data"),
+                Source::Demo => "sample data",
+            },
+            theme.muted(),
+        )]);
+        parts
+    }
+
+    /// How fresh the chats are, as a status dot: live, syncing, or since when a
+    /// refresh keeps failing. Sample data has nothing to be fresh about.
+    fn freshness(&self) -> Option<Vec<Span<'static>>> {
+        let theme = self.theme;
+        let dot = |style: Style, text: String| {
+            vec![
+                Span::styled("● ", style),
+                Span::styled(text, style.remove_modifier(Modifier::BOLD)),
+            ]
         };
-        let mut parts = vec![profile.to_string()];
-        if let Some(account) = &self.account {
-            parts.push(account.clone());
+        if self.busy() {
+            return Some(vec![Span::styled(
+                format!("{} syncing", self.spinner()),
+                theme.accent(),
+            )]);
         }
-        parts.push(kind.into());
-        if matches!(self.chats_load, Load::Ready) {
-            let unread = self.rows.iter().filter(|row| row.unread).count();
-            parts.push(format!(
-                "{}{} chats",
-                self.rows.len(),
-                if self.chat_cursor.is_some() { "+" } else { "" }
-            ));
-            if unread > 0 {
-                parts.push(format!("{unread} unread"));
-            }
+        if let Load::Failed { auth, .. } = self.chats_load {
+            let text = if auth {
+                "sign-in needed"
+            } else {
+                "not connected"
+            };
+            return Some(dot(theme.error(), text.into()));
         }
-        parts.join("  ·  ")
+        if matches!(self.source, Source::Demo) {
+            return None;
+        }
+        let at = self.synced_at.as_ref()?.strftime("%H:%M");
+        Some(if self.stale {
+            dot(theme.error(), format!("stale since {at}"))
+        } else {
+            dot(theme.success(), "live".into())
+        })
     }
 
     fn start(&mut self) {
@@ -553,10 +613,16 @@ impl App {
                         }
                         self.chats_load = Load::Ready;
                         self.rebuild(keep.as_deref());
+                        if !more {
+                            self.synced(true);
+                        }
                     }
                     Err(error) if more || matches!(self.chats_load, Load::Ready) => {
                         self.refreshing = false;
                         self.notice = Notice::new(Tone::Error, error.to_string());
+                        if !more {
+                            self.synced(false);
+                        }
                     }
                     Err(error) => {
                         self.notice = Notice::new(Tone::Error, "Could not read your chats.");
@@ -614,10 +680,14 @@ impl App {
                         }
                         if opened && !older {
                             self.prefetch_neighbours();
+                            self.synced(true);
                         }
                     }
                     Err(error) if older || matches!(thread.load, Load::Ready) => {
                         self.notice = Notice::new(Tone::Error, error.to_string());
+                        if opened && !older {
+                            self.synced(false);
+                        }
                     }
                     Err(error) => thread.load = Load::failed(&error),
                 }
@@ -1196,23 +1266,62 @@ impl App {
 
     fn draw_header(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let theme = self.theme;
-        let mut title = vec![
-            Span::styled(" TEAMS ", theme.brand()),
-            Span::styled("  CHATS", theme.title()),
-        ];
-        if self.busy() {
-            let status = format!("{} syncing ", self.spinner());
-            let used: usize = title.iter().map(|s| s.content.width()).sum();
-            let gap = usize::from(area.width).saturating_sub(used + status.width());
-            title.push(Span::raw(" ".repeat(gap)));
-            title.push(Span::styled(status, theme.accent()));
+        let width = usize::from(area.width);
+        let spans_width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+        let separator = || Span::styled("  ·  ", theme.rule());
+
+        // Right: the send mode always shows, with a one-column margin like the left.
+        let mut right = if self.can_send() {
+            vec![Span::styled("✎ can send", theme.badge_send())]
+        } else {
+            vec![Span::styled("read-only", theme.muted())]
+        };
+        right.push(Span::raw(" "));
+        let brand = Span::styled(" TEAMS ", theme.brand());
+        let fixed = brand.width() + 2 + spans_width(&right) + 2;
+        let profile_width = self.profile().width();
+        // Then freshness, as long as some of the profile name still fits beside it.
+        if let Some(mut freshness) = self.freshness() {
+            let needed = spans_width(&freshness) + 3;
+            if fixed + needed + profile_width.min(10) <= width {
+                freshness.push(Span::raw("   "));
+                freshness.extend(right);
+                right = freshness;
+            }
         }
-        let location = render::truncate(&self.location(), usize::from(area.width));
-        let header = Paragraph::new(vec![
-            Line::from(title),
-            Line::styled(location, theme.muted()),
-        ])
-        .block(
+        let used = brand.width() + 2 + spans_width(&right) + 2;
+        let mut left = vec![
+            brand,
+            Span::raw("  "),
+            Span::styled(
+                render::truncate(self.profile(), width.saturating_sub(used)),
+                theme.title(),
+            ),
+        ];
+        // Last, the signed-in account next to the profile when there is room.
+        if let Some(account) = &self.account
+            && used + profile_width + 5 + account.width() <= width
+        {
+            left.push(separator());
+            left.push(Span::styled(account.clone(), theme.muted()));
+        }
+        let gap = width.saturating_sub(spans_width(&left) + spans_width(&right));
+        let mut title = left;
+        title.push(Span::raw(" ".repeat(gap)));
+        title.extend(right);
+
+        let mut context = vec![Span::raw(" ")];
+        for (index, part) in self.context().into_iter().enumerate() {
+            let extra = if index == 0 { 0 } else { 5 };
+            if spans_width(&context) + extra + spans_width(&part) + 1 > width {
+                break;
+            }
+            if index > 0 {
+                context.push(separator());
+            }
+            context.extend(part);
+        }
+        let header = Paragraph::new(vec![Line::from(title), Line::from(context)]).block(
             Block::default()
                 .borders(Borders::BOTTOM)
                 .border_style(theme.rule()),
@@ -2015,6 +2124,21 @@ impl Theme {
         self.fg(Color::Rgb(110, 220, 170))
     }
 
+    /// Writing is possible on this profile: warm, so it is noticed without alarm.
+    fn badge_send(self) -> Style {
+        self.fg(Color::Rgb(246, 183, 82))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// A number worth scanning for in otherwise quiet text.
+    fn figure(self) -> Style {
+        self.body().add_modifier(Modifier::BOLD)
+    }
+
+    fn unread_label(self) -> Style {
+        self.fg(Color::Rgb(255, 128, 112))
+    }
+
     fn error(self) -> Style {
         self.fg(Color::Rgb(255, 126, 119))
             .add_modifier(Modifier::BOLD)
@@ -2659,6 +2783,114 @@ mod tests {
         assert!(app.compose.is_none());
         assert!(app.notice.text.contains("read-only"));
         assert!(!frame_text(&mut app).contains("c reply"));
+    }
+
+    fn header(app: &mut App, width: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        buffer_text(terminal.backend().buffer())
+            .lines()
+            .take(2)
+            .map(String::from)
+            .collect()
+    }
+
+    fn live_app(can_send: bool, profile: &str) -> App {
+        let now: Zoned = "2026-10-13T10:15:00+02:00[Europe/Amsterdam]"
+            .parse()
+            .unwrap();
+        let source = Source::Live {
+            backend: Arc::new(TeamsBackend::Graph(crate::graph::GraphClient::new(
+                "fixture".into(),
+            ))),
+            profile: profile.into(),
+            can_send,
+        };
+        App::new(source, Theme { color: false }, now)
+    }
+
+    #[test]
+    fn the_header_shows_the_profile_send_mode_freshness_and_counts() {
+        let mut app = demo_app();
+        let [title, context] = header(&mut app, 100).try_into().unwrap();
+        assert!(title.starts_with(" TEAMS   demo "));
+        assert!(
+            title.ends_with("  ✎ can send"),
+            "sample data has no freshness: {title}"
+        );
+        assert_eq!(context, " 6 chats  ·  2 unread  ·  sample data");
+
+        let mut app = live_app(false, "work");
+        let [title, context] = header(&mut app, 100).try_into().unwrap();
+        assert!(title.ends_with(" syncing   read-only"), "{title}");
+        assert_eq!(context.trim(), "Microsoft Graph");
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&app.now.clone())),
+        });
+        app.account = Some("Ari Chen".into());
+        let [title, _] = header(&mut app, 100).try_into().unwrap();
+        assert!(title.starts_with(" TEAMS   work  ·  Ari Chen "), "{title}");
+        assert!(title.ends_with(" ● live   read-only"), "{title}");
+    }
+
+    #[test]
+    fn narrow_headers_keep_the_send_mode_and_drop_the_rest_in_order() {
+        let mut app = live_app(true, "a-rather-long-profile-name-for-work");
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&app.now.clone())),
+        });
+        app.account = Some("Someone With A Long Display Name".into());
+        let [title, _] = header(&mut app, 110).try_into().unwrap();
+        assert!(title.contains("for-work  ·  Someone With"), "{title}");
+        let [title, _] = header(&mut app, 100).try_into().unwrap();
+        assert!(
+            !title.contains("Someone"),
+            "the account goes first: {title}"
+        );
+        assert!(title.contains("for-work "), "{title}");
+        let [title, context] = header(&mut app, 50).try_into().unwrap();
+        // The one-column right margin is trimmed from the frame text.
+        assert_eq!(title.chars().count(), 49, "{title}");
+        assert!(title.ends_with("● live   ✎ can send"), "{title}");
+        assert!(title.contains("a-rather-long-pro"), "{title}");
+        assert!(title.contains('…'), "the profile is shortened: {title}");
+        assert_eq!(context, " 6 chats  ·  2 unread  ·  Microsoft Graph");
+    }
+
+    #[test]
+    fn failed_refreshes_mark_the_chats_stale_until_one_succeeds() {
+        let mut app = live_app(false, "work");
+        let chats = || Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(
+                &"2026-10-13T10:15:00+02:00[Europe/Amsterdam]"
+                    .parse()
+                    .unwrap(),
+            )),
+        };
+        app.apply(chats());
+        let at = app
+            .synced_at
+            .clone()
+            .expect("a successful read is recorded");
+        assert!(!app.stale);
+        app.fetching_chats = true;
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Err(AppError::Api("unavailable".into())),
+        });
+        assert!(app.stale);
+        let [title, _] = header(&mut app, 100).try_into().unwrap();
+        assert!(
+            title.contains(&format!("stale since {}", at.strftime("%H:%M"))),
+            "{title}"
+        );
+        app.apply(chats());
+        assert!(!app.stale);
+        let [title, _] = header(&mut app, 100).try_into().unwrap();
+        assert!(title.contains("● live"), "{title}");
     }
 
     #[test]

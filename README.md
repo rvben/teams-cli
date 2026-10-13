@@ -64,8 +64,11 @@ left with unread markers, last-message previews and times, and the selected
 conversation on the right, grouped by day and sender. Reads run in the
 background and are cached per chat, so moving through the list never blocks, and
 chats refresh on their own without losing your place: on the desktop backend the open
-chat every 3 seconds and the list every 15, on Graph every 15 seconds and every minute. Narrow terminals show one pane at a time, and
-`NO_COLOR` is respected.
+chat every 3 seconds and the list every 15, on Graph every 15 seconds and every minute. The header always shows the profile and account,
+whether it can send (`✎ can send` or `read-only`), a status dot (`● live`, or
+`● stale since` the last good read while refreshes fail), and your chat and unread
+counts. Narrow terminals show one
+pane at a time, and `NO_COLOR` is respected.
 
 | Key | Action |
 | --- | --- |
