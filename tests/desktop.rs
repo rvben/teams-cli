@@ -37,6 +37,73 @@ fn init(temp: &tempfile::TempDir) {
 }
 
 #[test]
+fn account_type_selection_is_saved_and_requires_a_desktop_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    cli(&temp)
+        .args(["init", "--desktop-account", "personal", "--no-login"])
+        .assert()
+        .code(2);
+    for (choice, stored) in [
+        ("personal", "personal"),
+        ("work-school", "work_school"),
+        ("auto", "auto"),
+    ] {
+        cli(&temp)
+            .args([
+                "init",
+                "--backend",
+                "desktop",
+                "--desktop-account",
+                choice,
+                "--no-login",
+            ])
+            .assert()
+            .success();
+        let output = cli(&temp).args(["config", "show"]).output().unwrap();
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["desktop_account"], stored);
+        let config: toml::Value = toml::from_str(
+            &std::fs::read_to_string(temp.path().join("teams/config.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["profiles"]["default"]["desktop_account"].as_str(),
+            Some(stored)
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_refuses_a_foreign_listener_before_sending_any_http_request() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    cli(&temp)
+        .args([
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-port",
+            &port,
+            "--no-login",
+        ])
+        .assert()
+        .success();
+    let output = cli(&temp).args(["doctor"]).output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["connection"]["status"], "non_teams_listener_refused");
+    assert_eq!(report["connection"]["loopback_only"], true);
+    assert_eq!(report["connection"]["teams_owned"], false);
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn desktop_profile_lifecycle_and_offline_status_need_no_oauth_or_endpoint() {
     let temp = tempfile::tempdir().unwrap();
     let output = cli(&temp)

@@ -60,6 +60,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
             Command::Init(InitArgs {
                 backend: BackendKind::Graph,
                 desktop_port: None,
+                desktop_account: None,
                 client_id: None,
                 tenant: None,
                 no_login: false,
@@ -261,26 +262,31 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
             read_only,
             allow_send: args.allow_send,
             desktop_port: args.desktop_port.unwrap_or(config::DEFAULT_DESKTOP_PORT),
+            desktop_account: args.desktop_account.unwrap_or_default(),
         };
         let path = config::save(profile_name, profile.clone())?;
         let connection = if args.no_login {
             None
         } else {
-            Some(DesktopClient::new(profile.desktop_port)?.probe().await?)
+            Some(
+                DesktopClient::with_account(profile.desktop_port, profile.desktop_account)?
+                    .probe()
+                    .await?,
+            )
         };
         let setup = debugging_setup(connection.as_ref(), profile.desktop_port);
         let value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
             "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
-            "read_only":read_only,"desktop_port":profile.desktop_port,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
+            "read_only":read_only,"desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
             "session_verified":false,"connection":connection,"debugging_setup":setup});
         return out.value(&value, || {
             let advice = setup.as_ref().map(|s| format!("\n\n{}", s.text())).unwrap_or_default();
             format!("Saved desktop profile '{profile_name}'. Connection diagnostics only; sign-in and chat access are unverified.\nConfig: {}\nNext: `teams --profile {profile_name} doctor`{advice}", path.display())
         });
     }
-    if args.desktop_port.is_some() || args.allow_send {
+    if args.desktop_port.is_some() || args.desktop_account.is_some() || args.allow_send {
         return Err(AppError::InvalidInput(
-            "--desktop-port and --allow-send require --backend desktop".into(),
+            "--desktop-port, --desktop-account and --allow-send require --backend desktop".into(),
         ));
     }
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
@@ -289,7 +295,9 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         eprintln!("  We’ll open Microsoft sign-in in your browser.");
         eprintln!("  No password or client secret is shared with teams-cli.");
         eprintln!("  Graph supports work or school accounts.");
-        eprintln!("  For a personal account on Windows/WSL, use `teams init --backend desktop`.\n");
+        eprintln!(
+            "  For a personal account on macOS/Windows/WSL, use `teams init --backend desktop`.\n"
+        );
     }
     let client_id = args
         .client_id
@@ -316,6 +324,7 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
             read_only: args.read_only,
             allow_send: false,
             desktop_port: config::DEFAULT_DESKTOP_PORT,
+            desktop_account: Default::default(),
         },
     )?;
     let mut signed_in = false;
@@ -376,6 +385,7 @@ fn config_command(
                 "profile": name,
                 "backend": profile.backend,
                 "desktop_port": if profile.backend == BackendKind::Desktop { Some(profile.desktop_port) } else { None },
+                "desktop_account": if profile.backend == BackendKind::Desktop { Some(profile.desktop_account) } else { None },
                 "client_id": profile.client_id,
                 "tenant": profile.tenant,
                 "read_only": profile.read_only,
@@ -390,7 +400,7 @@ fn config_command(
                     value["client_id"].as_str().unwrap_or_default(),
                     yes_no(value["read_only"].as_bool().unwrap_or(false)),
                     config::path().display(),
-                    if profile.backend == BackendKind::Desktop { format!("\nDesktop port: {}", profile.desktop_port) } else { String::new() },
+                    if profile.backend == BackendKind::Desktop { format!("\nDesktop port: {}\nDesktop account: {}", profile.desktop_port, profile.desktop_account.as_str()) } else { String::new() },
                 )
             })
         }
@@ -412,12 +422,16 @@ async fn auth_command(
         let connection = if offline {
             None
         } else {
-            Some(DesktopClient::new(profile.desktop_port)?.probe().await?)
+            Some(
+                DesktopClient::with_account(profile.desktop_port, profile.desktop_account)?
+                    .probe()
+                    .await?,
+            )
         };
         let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"configured":true,
             "signed_in":null,"verified":false,"session_verified":false,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
             "identity":null,"authentication":"teams_desktop_session_unverified","offline":offline,
-            "config_path":config::path(),"read_only":profile.read_only,"desktop_port":profile.desktop_port,
+            "config_path":config::path(),"read_only":profile.read_only,"desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,
             "granted_scopes":null,"channel_history":null,"connection":connection});
         return out.value(&value, || format!("Profile: {name}\nBackend: desktop (experimental)\nEndpoint: {}\nSigned in: unknown\nSession verified: no\nRead only: {}",
             connection.as_ref().map(|c| c.status.detail()).unwrap_or("not checked (offline)"), yes_no(profile.read_only)));
@@ -643,6 +657,7 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
                 InitArgs {
                     backend: BackendKind::Graph,
                     desktop_port: None,
+                    desktop_account: None,
                     client_id: None,
                     tenant: None,
                     no_login: false,
@@ -917,7 +932,7 @@ async fn desktop_doctor(
             detail,
         });
     }
-    let desktop = DesktopClient::new(profile.desktop_port)?;
+    let desktop = DesktopClient::with_account(profile.desktop_port, profile.desktop_account)?;
     let connection = if !offline && prerequisites.is_ok() {
         match desktop.probe().await {
             Ok(metadata) => Some(metadata),
@@ -981,7 +996,7 @@ async fn desktop_doctor(
     let setup = debugging_setup(connection.as_ref(), profile.desktop_port);
     let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"healthy":healthy,"offline":offline,
         "endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),"session_verified":false,"signed_in":null,
-        "desktop_port":profile.desktop_port,"connection":connection,"debugging_setup":setup,"checks":checks});
+        "desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,"connection":connection,"debugging_setup":setup,"checks":checks});
     doctor_report(&value, &checks, setup.map(|s| s.text()), out)
 }
 
@@ -1038,12 +1053,12 @@ fn capabilities(out: Output) -> Result<(), AppError> {
     let value = serde_json::json!({
         "supported":["delegated work/school sign-in","identity","joined teams","channels","chats","chat messages","channel messages","send messages","TUI"],
         "unsupported":["personal Microsoft accounts through Graph","user calls and screen sharing","private Teams protocols","tenant administration"],
-        "account_types":["Microsoft 365 work or school","personal Microsoft accounts (desktop on Windows/WSL)"],
+        "account_types":["Microsoft 365 work or school","personal Microsoft accounts (desktop on macOS/Windows/WSL)"],
         "api":"Microsoft Graph v1.0",
         "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL, personal and work/school accounts also support chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI works on both.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. Personal and work/school accounts support chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI uses the same backend on all three platforms.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
 }
 
 /// Desktop sends act through the user's own Teams window, so each one is confirmed at the

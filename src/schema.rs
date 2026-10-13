@@ -229,6 +229,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     field("channel_history_requested", "boolean"),
                     field("read_only", "boolean"),
                     nullable_field("desktop_port", "integer"),
+                    nullable_field("desktop_account", "string"),
                     nullable_field("endpoint_available", "boolean"),
                     nullable_field("connection", "object"),
                     field("session_verified", "boolean"),
@@ -238,6 +239,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             value["args"] = json!([
                 {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics, chats and opt-in chat sending"},
                 {"name":"--desktop-port","type":"integer","description":"Existing loopback endpoint port (desktop only; default 9222)","x-minimum":1024,"x-maximum":65535},
+                {"name":"--desktop-account","type":"string","enum":["auto","personal","work-school"],"default":"auto","description":"Select the Teams account surface; multiple cached accounts within it remain unsupported"},
                 arg(
                     "--client-id",
                     "string",
@@ -365,6 +367,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 field("profile", "string"),
                 field("backend", "string"),
                 nullable_field("desktop_port", "integer"),
+                nullable_field("desktop_account", "string"),
                 field("client_id", "string"),
                 field("tenant", "string"),
                 field("read_only", "boolean"),
@@ -552,17 +555,17 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         match command["name"].as_str().unwrap_or_default() {
             "tui" => {
                 command["extensions"]["desktop"] = json!(
-                    "Windows/WSL only; chats and chat messages from the Teams client's local cache; sending needs a profile created with --allow-send"
+                    "macOS/Windows/WSL; chats and chat messages from the Teams client's local cache; sending needs a profile created with --allow-send"
                 )
             }
             "chats list" | "messages list" => {
                 command["extensions"]["desktop"] = json!(
-                    "Windows/WSL only; chats, not channels; read from the Teams client's local cache; pages carry source \"desktop_cache\""
+                    "macOS/Windows/WSL; chats, not channels; read from the Teams client's local cache; pages carry source \"desktop_cache\""
                 )
             }
             "messages send" => {
                 command["extensions"]["desktop"] = json!(
-                    "Windows/WSL only; plain-text chat messages through the running Teams window; needs a profile created with `init --allow-send`; prompts on a terminal and needs --yes otherwise; results carry source \"desktop\", clientMessageId and Teams' status"
+                    "macOS/Windows/WSL; plain-text chat messages through the running Teams window; needs a profile created with `init --allow-send`; prompts on a terminal and needs --yes otherwise; results carry source \"desktop\", clientMessageId and Teams' status"
                 )
             }
             _ => {}
@@ -620,8 +623,8 @@ pub fn backend_capabilities() -> Value {
     json!({
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
         "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl"],
-            "account_types":["Microsoft 365 work or school","personal Microsoft accounts"],"account_selection":"single_account_only",
-            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (windows, wsl)","chat messages (windows, wsl)","send plain-text chat messages (windows, wsl; opt-in)","TUI (windows, wsl)"],
+            "account_types":["Microsoft 365 work or school","personal Microsoft accounts"],"account_selection":"account_type_then_single_account_only",
+            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (macos, windows, wsl)","chat messages (macos, windows, wsl)","send plain-text chat messages (macos, windows, wsl; opt-in)","TUI (macos, windows, wsl)"],
             "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","automatic Teams launch or restart"],
             "requires":"existing Teams-owned loopback debugging endpoint; WSL requires Windows executable interop",
             "transport":{"macos":"native_loopback","windows":"windows_native","wsl":"windows_helper_stdio"},

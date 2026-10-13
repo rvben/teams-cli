@@ -4,31 +4,27 @@
 //!
 //! On Windows the CLI verifies the endpoint and reads in-process. Under WSL it drives the
 //! Windows build of itself as a long-lived helper (`teams.exe desktop-helper`).
-#[cfg(any(windows, test))]
+#[cfg(any(target_os = "macos", windows, test))]
 mod cdp;
 pub mod helper;
 #[cfg(not(windows))]
 pub mod install;
+#[cfg(any(target_os = "macos", test))]
+mod macos;
 #[cfg(any(windows, test))]
 mod owner;
-#[cfg(any(windows, test))]
+#[cfg(any(target_os = "macos", windows, test))]
 pub mod session;
 #[cfg(windows)]
 pub mod windows;
 
+use crate::config::DesktopAccount;
 use crate::{error::AppError, graph::Page};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(any(target_os = "macos", windows, test))]
 use std::time::Duration;
-#[cfg(target_os = "macos")]
-use std::{path::PathBuf, process::Stdio};
-#[cfg(target_os = "macos")]
-use tokio::process::Command;
-
-#[cfg(target_os = "macos")]
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(any(target_os = "macos", windows, test))]
 const MAX_METADATA: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
@@ -36,11 +32,11 @@ const MAX_READ: usize = 8 * 1024 * 1024;
 pub const MAX_BODY: usize = 28_000;
 
 pub fn messaging_unsupported() -> AppError {
-    AppError::Unsupported("the experimental desktop backend reads chats and chat messages and sends plain-text chat messages only (Windows/WSL); teams, channels and identity need a Graph profile".into())
+    AppError::Unsupported("the experimental desktop backend reads chats and chat messages and sends plain-text chat messages only (macOS/Windows/WSL); teams, channels and identity need a Graph profile".into())
 }
 
 fn account_selection_error() -> AppError {
-    AppError::Desktop("Multiple Teams accounts are available on this endpoint; desktop account selection is not supported yet".into())
+    AppError::Desktop("Multiple Teams accounts are available; use `init --backend desktop --desktop-account personal` or `--desktop-account work-school` to select a surface. Multiple cached accounts within that surface are still unsupported".into())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,11 +118,14 @@ impl ConnectionMetadata {
 
 pub struct DesktopClient {
     port: u16,
+    account: DesktopAccount,
     /// The verified page connection, reused across reads.
     #[cfg(windows)]
     session: tokio::sync::Mutex<session::Session<windows::WindowsSystem>>,
+    #[cfg(target_os = "macos")]
+    session: tokio::sync::Mutex<session::Session<macos::MacSystem>>,
     /// The Windows helper under WSL, started on first use.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     helper: tokio::sync::Mutex<helper::HelperClient>,
 }
 
@@ -134,12 +133,17 @@ impl std::fmt::Debug for DesktopClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DesktopClient")
             .field("port", &self.port)
+            .field("account", &self.account)
             .finish_non_exhaustive()
     }
 }
 
 impl DesktopClient {
     pub fn new(port: u16) -> Result<Self, AppError> {
+        Self::with_account(port, DesktopAccount::Auto)
+    }
+
+    pub fn with_account(port: u16, account: DesktopAccount) -> Result<Self, AppError> {
         if port < 1024 {
             return Err(AppError::InvalidInput(
                 "desktop port must be between 1024 and 65535".into(),
@@ -147,24 +151,21 @@ impl DesktopClient {
         }
         Ok(Self {
             port,
+            account,
             #[cfg(windows)]
             session: tokio::sync::Mutex::new(session::Session::new(windows::WindowsSystem)),
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            session: tokio::sync::Mutex::new(session::Session::new(macos::MacSystem)),
+            #[cfg(not(any(windows, target_os = "macos")))]
             helper: Default::default(),
         })
     }
 
     pub async fn probe(&self) -> Result<ConnectionMetadata, AppError> {
-        let transport = platform()?;
-        if transport == "macos_loopback" {
-            #[cfg(target_os = "macos")]
-            return tokio::time::timeout(PROCESS_TIMEOUT, self.probe_macos())
-                .await
-                .map_err(|_| AppError::Desktop("desktop metadata inspection timed out".into()))?;
-        }
-        #[cfg(windows)]
+        platform()?;
+        #[cfg(any(windows, target_os = "macos"))]
         return self.session.lock().await.probe(self.port).await;
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let metadata = self
                 .helper
@@ -196,15 +197,12 @@ impl DesktopClient {
         limit: u16,
         cursor: Option<&str>,
     ) -> Result<Page, AppError> {
-        let request = read_request(self.port, chat, limit, cursor)?;
-        if platform()? == "macos_loopback" {
-            return Err(AppError::Unsupported(
-                "desktop chat reading is available on Windows and WSL only".into(),
-            ));
-        }
-        #[cfg(windows)]
+        let mut request = read_request(self.port, chat, limit, cursor)?;
+        request["account_type"] = json!(self.account);
+        platform()?;
+        #[cfg(any(windows, target_os = "macos"))]
         let reply = self.session.lock().await.read(&request).await?;
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let reply = self
             .helper
             .lock()
@@ -217,11 +215,12 @@ impl DesktopClient {
     /// Sends one plain-text chat message as the signed-in Teams user. Never retried: a lost
     /// answer is reported as unconfirmed, because Teams may already have the message.
     pub async fn send(&self, chat: &str, body: &str) -> Result<Value, AppError> {
-        let request = send_request(self.port, chat, body)?;
-        desktop_messaging()?;
-        #[cfg(windows)]
+        let mut request = send_request(self.port, chat, body)?;
+        request["account_type"] = json!(self.account);
+        platform()?;
+        #[cfg(any(windows, target_os = "macos"))]
         let reply = self.session.lock().await.send(&request).await?;
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let reply = self
             .helper
             .lock()
@@ -233,30 +232,26 @@ impl DesktopClient {
 
     /// Whether the Teams window that sends messages is reachable; sends nothing.
     pub async fn send_check(&self) -> Result<(), AppError> {
-        desktop_messaging()?;
-        #[cfg(windows)]
-        let reply = self.session.lock().await.send_check(self.port).await?;
-        #[cfg(not(windows))]
+        platform()?;
+        #[cfg(any(windows, target_os = "macos"))]
+        let reply = self
+            .session
+            .lock()
+            .await
+            .send_check(self.port, self.account)
+            .await?;
+        #[cfg(not(any(windows, target_os = "macos")))]
         let reply = self
             .helper
             .lock()
             .await
-            .call(json!({"op": "send_check", "port": self.port}))
+            .call(json!({"op": "send_check", "port": self.port, "account_type": self.account}))
             .await?;
         match reply["error"].as_str() {
             None if reply["ok"] == true => Ok(()),
             code => Err(send_error(code.unwrap_or_default())),
         }
     }
-}
-
-fn desktop_messaging() -> Result<(), AppError> {
-    if platform()? == "macos_loopback" {
-        return Err(AppError::Unsupported(
-            "desktop chat sending is available on Windows and WSL only".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn valid_id(id: &str) -> bool {
@@ -513,12 +508,11 @@ pub fn platform() -> Result<&'static str, AppError> {
     }
 }
 
-/// Commands that open and close Teams' debugging port on Windows, for people to run
-/// themselves: the CLI never changes Teams' settings or restarts Teams. Both set the
-/// user variable WebView2 reads at start, then restart Teams so it takes effect.
+/// Commands for people to run themselves: the CLI never restarts Teams. macOS uses
+/// process-only environment; Windows/WSL set and clear the user's WebView2 variable.
 #[derive(Debug, Serialize)]
 pub struct DebuggingSetup {
-    /// `wsl` for a WSL shell, `powershell` for Windows PowerShell.
+    /// `zsh` on macOS, `wsl` for a WSL shell, `powershell` on Windows.
     pub shell: &'static str,
     pub open: String,
     pub close: String,
@@ -529,12 +523,25 @@ impl DebuggingSetup {
         let shell = match platform().ok()? {
             "wsl_windows_helper" => "wsl",
             "windows_native" => "powershell",
+            "macos_loopback" => "zsh",
             _ => return None,
         };
         Some(Self::for_shell(shell, port))
     }
 
     fn for_shell(shell: &'static str, port: u16) -> Self {
+        if shell == "zsh" {
+            let quit = r#"/usr/bin/osascript -e 'tell application id "com.microsoft.teams2" to quit' && /bin/sleep 2"#;
+            return Self {
+                shell,
+                open: format!(
+                    r#"{quit} && /usr/bin/open -b com.microsoft.teams2 --env 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port={port} --remote-debugging-address=127.0.0.1'"#
+                ),
+                close: format!(
+                    r#"{quit} && /usr/bin/open -b com.microsoft.teams2 --env WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="#
+                ),
+            };
+        }
         // Only double quotes inside, so the WSL form can wrap it in single quotes.
         let command = |value: &str| {
             let code = format!(
@@ -555,6 +562,7 @@ impl DebuggingSetup {
     pub fn text(&self) -> String {
         let shell = match self.shell {
             "wsl" => "this WSL shell",
+            "zsh" => "Terminal (zsh or bash)",
             _ => "PowerShell",
         };
         format!(
@@ -622,152 +630,6 @@ pub fn local_prerequisites() -> Result<&'static str, AppError> {
         ));
     }
     Ok(transport)
-}
-
-#[cfg(target_os = "macos")]
-async fn run_process(mut command: Command) -> Result<std::process::Output, AppError> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let child = command
-        .spawn()
-        .map_err(|_| AppError::Desktop("could not start the local metadata helper".into()))?;
-    tokio::time::timeout(PROCESS_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| AppError::Desktop("metadata helper timed out".into()))?
-        .map_err(|_| AppError::Desktop("could not read the metadata helper result".into()))
-}
-
-#[cfg(target_os = "macos")]
-impl DesktopClient {
-    async fn probe_macos(&self) -> Result<ConnectionMetadata, AppError> {
-        local_prerequisites()?;
-        let mut command = Command::new("/usr/sbin/lsof");
-        command.args([
-            "-nP",
-            &format!("-iTCP:{}", self.port),
-            "-sTCP:LISTEN",
-            "-Fpn",
-        ]);
-        let output = run_process(command).await?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let listeners = parse_listeners(&text)?;
-        let mut metadata = ConnectionMetadata::empty(self.port);
-        if listeners.is_empty() {
-            if output.status.code() != Some(1) {
-                return Err(AppError::Desktop("listener inspection failed".into()));
-            }
-            return Ok(metadata);
-        }
-        if !output.status.success() {
-            return Err(AppError::Desktop("listener inspection failed".into()));
-        }
-        metadata.loopback_only = Some(
-            listeners
-                .iter()
-                .all(|(_, address)| loopback_address(address, self.port)),
-        );
-        if metadata.loopback_only != Some(true) {
-            metadata.status = ProbeStatus::UnsafeListenerRefused;
-            return Ok(metadata);
-        }
-        let mut uid_command = Command::new("/usr/bin/id");
-        uid_command.arg("-u");
-        let uid_output = run_process(uid_command).await?;
-        let uid = String::from_utf8_lossy(&uid_output.stdout)
-            .trim()
-            .parse::<u32>()
-            .map_err(|_| AppError::Desktop("could not verify the desktop process owner".into()))?;
-        let mut owned = true;
-        for (pid, _) in listeners {
-            if !teams_owner(pid, uid).await? {
-                owned = false;
-                break;
-            }
-        }
-        metadata.teams_owned = Some(owned);
-        if !owned {
-            metadata.status = ProbeStatus::NonTeamsListenerRefused;
-            return Ok(metadata);
-        }
-        fill_metadata(&mut metadata).await;
-        Ok(metadata)
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_listeners(text: &str) -> Result<Vec<(u32, String)>, AppError> {
-    let mut pid = None;
-    let mut listeners = vec![];
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix('p') {
-            pid = Some(
-                value
-                    .parse()
-                    .map_err(|_| AppError::Desktop("invalid listener metadata".into()))?,
-            );
-        } else if let Some(address) = line.strip_prefix('n') {
-            listeners.push((
-                pid.ok_or_else(|| AppError::Desktop("listener ownership missing".into()))?,
-                address.into(),
-            ));
-        }
-    }
-    Ok(listeners)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn loopback_address(address: &str, port: u16) -> bool {
-    address == format!("127.0.0.1:{port}") || address == format!("[::1]:{port}")
-}
-
-#[cfg(target_os = "macos")]
-async fn teams_owner(mut pid: u32, uid: u32) -> Result<bool, AppError> {
-    let mut expected = vec![PathBuf::from(
-        "/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams",
-    )];
-    if let Some(home) = dirs::home_dir() {
-        expected.push(home.join("Applications/Microsoft Teams.app/Contents/MacOS/MSTeams"));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..32 {
-        if pid == 0 || !seen.insert(pid) {
-            break;
-        }
-        let mut command = Command::new("/bin/ps");
-        command.args(["-p", &pid.to_string(), "-o", "uid=,ppid=,comm="]);
-        let output = run_process(command).await?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        // ps pads columns with several spaces; executable paths can contain spaces.
-        let process_uid = text
-            .split_whitespace()
-            .next()
-            .and_then(|v| v.parse::<u32>().ok());
-        if process_uid != Some(uid) {
-            return Ok(false);
-        }
-        let rest = text
-            .trim()
-            .split_once(char::is_whitespace)
-            .map(|(_, rest)| rest.trim_start())
-            .unwrap_or("");
-        let Some((parent, executable)) = rest.split_once(char::is_whitespace) else {
-            return Ok(false);
-        };
-        let path = PathBuf::from(executable.trim_start());
-        if expected.iter().any(|e| e == &path && e.is_file()) {
-            return Ok(process_uid == Some(uid));
-        }
-        pid = parent
-            .parse()
-            .map_err(|_| AppError::Desktop("invalid process ancestry metadata".into()))?;
-    }
-    Ok(false)
 }
 
 /// Reads endpoint metadata into `metadata` for an already-verified listener and returns
@@ -884,6 +746,7 @@ fn sanitize_target(target: &Value) -> TargetMetadata {
 
 #[cfg(test)]
 mod tests {
+    use super::macos::{loopback_address, parse_listeners};
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -921,6 +784,14 @@ mod tests {
         assert!(native.text().contains("in PowerShell"));
         assert!(wsl.text().contains("in this WSL shell"));
         assert!(wsl.text().contains("any program running as you"));
+        let mac = DebuggingSetup::for_shell("zsh", 9333);
+        assert!(mac.open.contains("--env 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333 --remote-debugging-address=127.0.0.1'"));
+        assert!(
+            mac.close
+                .ends_with("--env WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=")
+        );
+        assert!(mac.text().contains("Terminal (zsh or bash)"));
+        assert!(!mac.open.contains("launchctl"));
     }
 
     /// Helpers and CLIs of different versions talk to each other whenever their protocol
@@ -930,7 +801,7 @@ mod tests {
     /// the new one; otherwise just update the expectations.
     #[test]
     fn the_protocol_is_pinned() {
-        assert_eq!(helper::PROTOCOL, 2);
+        assert_eq!(helper::PROTOCOL, 3);
         let cursor = encode_cursor(&json!({"t": 1, "id": "m1"})).unwrap();
         assert_eq!(
             read_request(9222, Some(NOTES), 20, Some(&cursor)).unwrap(),
@@ -1131,10 +1002,10 @@ mod tests {
             reply(json!({"error": "account_ambiguous"})),
         ] {
             assert!(
-                matches!(read_page(&ambiguous), Err(AppError::Desktop(m)) if m.contains("account selection"))
+                matches!(read_page(&ambiguous), Err(AppError::Desktop(m)) if m.contains("--desktop-account"))
             );
             assert!(
-                matches!(sent_message(&ambiguous, CHAT), Err(AppError::Desktop(m)) if m.contains("account selection"))
+                matches!(sent_message(&ambiguous, CHAT), Err(AppError::Desktop(m)) if m.contains("--desktop-account"))
             );
         }
         assert!(matches!(read_page(&layout), Err(AppError::Desktop(m)) if m.contains("layout")));

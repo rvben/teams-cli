@@ -22,6 +22,12 @@ pub trait System: Send + Sync {
     fn trusted_teams(&self, pid: u32) -> bool;
 }
 
+impl<S: System> super::session::Verifier for S {
+    async fn verify(&self, port: u16) -> Result<(ConnectionMetadata, Vec<Value>), AppError> {
+        verify(self, port).await
+    }
+}
+
 /// Verifies the listener on `port` and, only if it is safe, reads endpoint metadata.
 /// The raw targets are returned for page selection and never leave the process.
 pub async fn verify(

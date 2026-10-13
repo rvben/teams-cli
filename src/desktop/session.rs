@@ -1,13 +1,8 @@
 //! A verified page connection kept for the life of the process, so only the first read
 //! pays for verification and the socket handshake. Sends never reuse it: each one verifies
 //! afresh and evaluates exactly once.
-use super::{
-    ConnectionMetadata, ProbeStatus,
-    cdp::Cdp,
-    chat_id,
-    owner::{System, verify},
-    valid_body, valid_id,
-};
+use super::{ConnectionMetadata, ProbeStatus, cdp::Cdp, chat_id, valid_body, valid_id};
+use crate::config::DesktopAccount;
 use crate::error::AppError;
 use serde_json::{Value, json};
 
@@ -15,12 +10,21 @@ const READ_SCRIPT: &str = include_str!("../desktop.js");
 const SEND_SCRIPT: &str = include_str!("../desktop_send.js");
 const CACHE_SCRIPT: &str = include_str!("../desktop_cache.js");
 
-pub struct Session<S> {
-    system: S,
-    page: Option<(u16, Cdp, bool)>,
+/// Platform-specific verification before any session access. Raw target URLs remain
+/// internal; only sanitized connection metadata can be returned to the caller.
+pub trait Verifier: Send + Sync {
+    fn verify(
+        &self,
+        port: u16,
+    ) -> impl std::future::Future<Output = Result<(ConnectionMetadata, Vec<Value>), AppError>> + Send;
 }
 
-impl<S: System> Session<S> {
+pub struct Session<S> {
+    system: S,
+    page: Option<(u16, Cdp, bool, DesktopAccount)>,
+}
+
+impl<S: Verifier> Session<S> {
     pub fn new(system: S) -> Self {
         Self { system, page: None }
     }
@@ -28,27 +32,30 @@ impl<S: System> Session<S> {
     /// Always verifies afresh; never touches the page.
     pub async fn probe(&self, port: u16) -> Result<ConnectionMetadata, AppError> {
         valid_port(port)?;
-        Ok(verify(&self.system, port).await?.0)
+        Ok(self.system.verify(port).await?.0)
     }
 
     /// Answers a read request with `{"error": code}` or `{"result": <evaluate result>}`.
     pub async fn read(&mut self, request: &Value) -> Result<Value, AppError> {
         let (port, params) = read_params(request)?;
-        if let Some((connected, page, personal)) = &mut self.page
+        let account = DesktopAccount::from_request(&request["account_type"])?;
+        if let Some((connected, page, personal, scope)) = &mut self.page
             && *connected == port
+            && *scope == account
             && let Ok(result) = page.evaluate(&read_expression(&params, *personal)).await
+            && !origin_changed(&result)
         {
             return Ok(json!({"result": result}));
         }
         // No page yet, another port, or a failed socket: verify again before any read.
         self.page = None;
-        let Ok((metadata, targets)) = verify(&self.system, port).await else {
+        let Ok((metadata, targets)) = self.system.verify(port).await else {
             return Ok(refusal(ProbeStatus::MetadataProbeFailed));
         };
         if metadata.status != ProbeStatus::MetadataOk {
             return Ok(refusal(metadata.status));
         }
-        let candidates = match unambiguous_pages(&targets) {
+        let candidates = match selected_pages(&targets, account) {
             Ok(pages) => pages,
             Err(refused) => return Ok(refused),
         };
@@ -63,7 +70,10 @@ impl<S: System> Session<S> {
             .await
         {
             Ok(result) => {
-                self.page = Some((port, page, target.personal));
+                if origin_changed(&result) {
+                    return Ok(json!({"error": "no_target"}));
+                }
+                self.page = Some((port, page, target.personal, account));
                 Ok(json!({"result": result}))
             }
             Err(_) => Ok(json!({"error": "read_failed"})),
@@ -71,9 +81,9 @@ impl<S: System> Session<S> {
     }
 
     /// Whether a send could start: `{"ok": true}` or `{"error": code}`. Sends nothing.
-    pub async fn send_check(&self, port: u16) -> Result<Value, AppError> {
+    pub async fn send_check(&self, port: u16, account: DesktopAccount) -> Result<Value, AppError> {
         valid_port(port)?;
-        Ok(match self.main_page(port).await {
+        Ok(match self.main_page(port, account).await {
             Ok(_) => json!({"ok": true}),
             Err(refused) => refused,
         })
@@ -83,14 +93,16 @@ impl<S: System> Session<S> {
     /// send script exactly once. A lost answer is `unconfirmed`, never retried.
     pub async fn send(&self, request: &Value) -> Result<Value, AppError> {
         let (port, params) = send_params(request)?;
-        let mut page = match self.main_page(port).await {
+        let account = DesktopAccount::from_request(&request["account_type"])?;
+        let (mut page, personal) = match self.main_page(port, account).await {
             Ok(page) => page,
             Err(refused) => return Ok(refused),
         };
         Ok(
             match page
-                .evaluate(&format!(
-                    "({SEND_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)"
+                .evaluate(&scoped_expression(
+                    &format!("({SEND_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)"),
+                    personal,
                 ))
                 .await
             {
@@ -101,14 +113,14 @@ impl<S: System> Session<S> {
     }
 
     /// A fresh connection to the Teams window that hosts the send client, or a refusal.
-    async fn main_page(&self, port: u16) -> Result<Cdp, Value> {
-        let Ok((metadata, targets)) = verify(&self.system, port).await else {
+    async fn main_page(&self, port: u16, account: DesktopAccount) -> Result<(Cdp, bool), Value> {
+        let Ok((metadata, targets)) = self.system.verify(port).await else {
             return Err(refusal(ProbeStatus::MetadataProbeFailed));
         };
         if metadata.status != ProbeStatus::MetadataOk {
             return Err(refusal(metadata.status));
         }
-        let candidates = unambiguous_pages(&targets)?;
+        let candidates = selected_pages(&targets, account)?;
         if candidates.is_empty() {
             return Err(json!({"error": "no_target"}));
         }
@@ -118,11 +130,11 @@ impl<S: System> Session<S> {
                 continue;
             };
             let main = page
-                .evaluate(&probe)
+                .evaluate(&scoped_expression(&probe, target.personal))
                 .await
                 .is_ok_and(|result| result["result"]["value"].as_str() == Some(r#"{"main":true}"#));
             if main {
-                return Ok(page);
+                return Ok((page, target.personal));
             }
         }
         Err(json!({"error": "layout"}))
@@ -132,7 +144,30 @@ impl<S: System> Session<S> {
 fn read_expression(params: &Value, personal: bool) -> String {
     let mut params = params.clone();
     params["personal"] = json!(personal);
-    format!("({READ_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)")
+    scoped_expression(
+        &format!("({READ_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)"),
+        personal,
+    )
+}
+
+/// A page can navigate after discovery or between reused reads. Check its current
+/// origin in the same evaluation before touching cache data or the send client.
+fn scoped_expression(expression: &str, personal: bool) -> String {
+    let origins = if personal {
+        json!(["https://teams.live.com"])
+    } else {
+        json!([
+            "https://teams.microsoft.com",
+            "https://teams.cloud.microsoft"
+        ])
+    };
+    format!(
+        "({origins}.includes(globalThis.location?.origin)?({expression}):JSON.stringify({{error:'no_target'}}))"
+    )
+}
+
+fn origin_changed(result: &Value) -> bool {
+    result["result"]["value"].as_str() == Some(r#"{"error":"no_target"}"#)
 }
 
 /// Revalidates a send request and builds the page parameters; they reach the page only as
@@ -248,8 +283,15 @@ fn teams_pages(targets: &[Value]) -> Vec<TeamsPage<'_>> {
         .collect()
 }
 
-fn unambiguous_pages(targets: &[Value]) -> Result<Vec<TeamsPage<'_>>, Value> {
-    let pages = teams_pages(targets);
+fn selected_pages(targets: &[Value], account: DesktopAccount) -> Result<Vec<TeamsPage<'_>>, Value> {
+    let pages: Vec<_> = teams_pages(targets)
+        .into_iter()
+        .filter(|page| match account {
+            DesktopAccount::Auto => true,
+            DesktopAccount::Personal => page.personal,
+            DesktopAccount::WorkSchool => !page.personal,
+        })
+        .collect();
     if pages.iter().any(|page| page.personal) && pages.iter().any(|page| !page.personal) {
         return Err(json!({"error": "account_ambiguous"}));
     }
@@ -266,6 +308,68 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn current_origin_guard_blocks_other_surfaces_and_lookalikes_before_evaluation() {
+        for (personal, origin, allowed) in [
+            (true, "https://teams.live.com", true),
+            (true, "https://teams.microsoft.com", false),
+            (true, "https://teams.live.com.evil.example", false),
+            (false, "https://teams.microsoft.com", true),
+            (false, "https://teams.cloud.microsoft", true),
+            (false, "https://teams.live.com", false),
+            (false, "http://teams.microsoft.com", false),
+        ] {
+            let expression =
+                scoped_expression("(++globalThis.calls,JSON.stringify({ran:true}))", personal);
+            let output = std::process::Command::new("node").args([
+                "-e",
+                "const vm=require('node:vm');const context={location:{origin:process.argv[1]},calls:0};const value=vm.runInNewContext(process.argv[2],context);console.log(JSON.stringify({value:JSON.parse(value),calls:context.calls}));",
+                origin, &expression,
+            ]).output().expect("Node.js is required for desktop script tests");
+            assert!(output.status.success());
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["calls"], if allowed { 1 } else { 0 });
+            assert_eq!(
+                result["value"],
+                if allowed {
+                    json!({"ran":true})
+                } else {
+                    json!({"error":"no_target"})
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn navigated_cached_pages_are_dropped_and_verified_again_before_reading() {
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let counter = evaluations.clone();
+        let port = devtools_server(
+            json!([{"type":"page","url":"https://teams.live.com/v2/","id":"ABCDEF12"}]),
+            move |request| {
+                let value = if counter.fetch_add(1, Ordering::SeqCst) == 1 {
+                    r#"{"error":"no_target"}"#
+                } else {
+                    "{}"
+                };
+                Some(
+                    json!({"id":request["id"],"result":{"result":{"type":"string","value":value}}})
+                        .to_string(),
+                )
+            },
+        )
+        .await;
+        let mut session = Session::new(FakeSystem::teams());
+        let request = read_request(port, None, 1, None).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                session.read(&request).await.unwrap()["result"]["result"]["value"],
+                "{}"
+            );
+        }
+        assert_eq!(evaluations.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn read_params_are_revalidated() {
@@ -398,9 +502,97 @@ mod tests {
                 .unwrap(),
             refused
         );
-        assert_eq!(session.send_check(port).await.unwrap(), refused);
+        assert_eq!(
+            session
+                .send_check(port, DesktopAccount::Auto)
+                .await
+                .unwrap(),
+            refused
+        );
         assert_eq!(session.send(&send_request(port)).await.unwrap(), refused);
         assert_eq!(evaluations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_account_selection_filters_pages_and_revalidates_cached_read_scope() {
+        let targets = json!([
+            {"type":"page","url":"https://teams.microsoft.com/v2/","id":"AAAAAAAA"},
+            {"type":"page","url":"https://teams.live.com/v2/","id":"BBBBBBBB"},
+        ]);
+        let selected =
+            selected_pages(targets.as_array().unwrap(), DesktopAccount::Personal).unwrap();
+        assert_eq!(
+            selected,
+            [TeamsPage {
+                id: "BBBBBBBB",
+                personal: true
+            }]
+        );
+        assert_eq!(
+            selected_pages(targets.as_array().unwrap(), DesktopAccount::WorkSchool).unwrap(),
+            [TeamsPage {
+                id: "AAAAAAAA",
+                personal: false
+            }]
+        );
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let counter = evaluations.clone();
+        let port = devtools_server(targets, move |request| {
+            let expression = request["params"]["expression"].as_str().unwrap();
+            if expression.contains("\"query\":\"chats\"") {
+                let personal = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                assert!(expression.contains(if personal {
+                    "\"personal\":true"
+                } else {
+                    "\"personal\":false"
+                }));
+            }
+            let value = if expression.contains("\"probe\":true") {
+                "{\"main\":true}"
+            } else {
+                "{}"
+            };
+            Some(
+                json!({"id":request["id"],"result":{"result":{"type":"string","value":value}}})
+                    .to_string(),
+            )
+        })
+        .await;
+        let mut session = Session::new(FakeSystem::teams());
+        for account in [DesktopAccount::Personal, DesktopAccount::WorkSchool] {
+            let mut request = read_request(port, None, 1, None).unwrap();
+            request["account_type"] = json!(account);
+            assert!(
+                session
+                    .read(&request)
+                    .await
+                    .unwrap()
+                    .get("result")
+                    .is_some()
+            );
+            assert_eq!(
+                session.send_check(port, account).await.unwrap(),
+                json!({"ok":true})
+            );
+            let mut send = send_request(port);
+            send["account_type"] = json!(account);
+            assert!(session.send(&send).await.unwrap().get("result").is_some());
+        }
+        assert_eq!(evaluations.load(Ordering::SeqCst), 2);
+        let mut invalid = read_request(port, None, 1, None).unwrap();
+        invalid["account_type"] = json!("all");
+        assert!(session.read(&invalid).await.is_err());
+        let mut invalid = send_request(port);
+        invalid["account_type"] = json!(true);
+        assert!(session.send(&invalid).await.is_err());
+        assert_eq!(evaluations.load(Ordering::SeqCst), 2);
+        // A work/school-only endpoint cannot fall back when personal was selected.
+        let work = [json!({"type":"page","url":"https://teams.microsoft.com/v2/","id":"AAAAAAAA"})];
+        assert!(
+            selected_pages(&work, DesktopAccount::Personal)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -517,7 +709,13 @@ mod tests {
             let sends = Arc::new(AtomicUsize::new(0));
             let port = teams_window(sends.clone(), true, origin).await;
             let session = Session::new(FakeSystem::teams());
-            assert_eq!(session.send_check(port).await.unwrap(), json!({"ok": true}));
+            assert_eq!(
+                session
+                    .send_check(port, DesktopAccount::Auto)
+                    .await
+                    .unwrap(),
+                json!({"ok": true})
+            );
             sends.store(0, Ordering::SeqCst);
             let reply = session.send(&send_request(port)).await.unwrap();
             assert_eq!(
@@ -557,7 +755,10 @@ mod tests {
         let empty = devtools_server(json!([]), |_| None).await;
         let session = Session::new(FakeSystem::teams());
         assert_eq!(
-            session.send_check(empty).await.unwrap(),
+            session
+                .send_check(empty, DesktopAccount::Auto)
+                .await
+                .unwrap(),
             json!({"error": "no_target"})
         );
         let none = devtools_server(

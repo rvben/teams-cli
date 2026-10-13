@@ -20,8 +20,9 @@ impl TeamsBackend {
             BackendKind::Graph => Ok(Self::Graph(GraphClient::new(
                 auth::access_token(&name, &selected).await?,
             ))),
-            BackendKind::Desktop => Ok(Self::Desktop(Box::new(DesktopClient::new(
+            BackendKind::Desktop => Ok(Self::Desktop(Box::new(DesktopClient::with_account(
                 selected.desktop_port,
+                selected.desktop_account,
             )?))),
         }
     }

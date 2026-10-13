@@ -28,6 +28,40 @@ impl BackendKind {
     }
 }
 
+/// Selects an account surface, never a cached account within that surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopAccount {
+    #[default]
+    Auto,
+    Personal,
+    #[value(name = "work-school")]
+    WorkSchool,
+}
+
+impl DesktopAccount {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Personal => "personal",
+            Self::WorkSchool => "work_school",
+        }
+    }
+
+    #[cfg(any(target_os = "macos", windows, test))]
+    pub(crate) fn from_request(value: &serde_json::Value) -> Result<Self, AppError> {
+        match value.as_str() {
+            None if value.is_null() => Ok(Self::Auto),
+            Some("auto") => Ok(Self::Auto),
+            Some("personal") => Ok(Self::Personal),
+            Some("work_school") => Ok(Self::WorkSchool),
+            _ => Err(AppError::InvalidInput(
+                "invalid desktop account type".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default)]
@@ -43,6 +77,8 @@ pub struct Profile {
     pub allow_send: bool,
     #[serde(default = "default_desktop_port")]
     pub desktop_port: u16,
+    #[serde(default)]
+    pub desktop_account: DesktopAccount,
 }
 
 impl Profile {
@@ -196,6 +232,7 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
         read_only,
         allow_send: backend == BackendKind::Desktop && !read_only,
         desktop_port,
+        desktop_account: stored.map(|p| p.desktop_account).unwrap_or_default(),
     };
     Ok((name, profile))
 }

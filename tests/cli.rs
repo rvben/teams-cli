@@ -26,7 +26,7 @@ fn capabilities_scope_personal_accounts_to_the_desktop_backend() {
         );
         assert_eq!(
             backends["desktop"]["account_selection"],
-            "single_account_only"
+            "account_type_then_single_account_only"
         );
         assert_eq!(
             backends["graph"]["account_types"],

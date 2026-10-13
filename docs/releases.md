@@ -26,11 +26,13 @@ Cargo and Python package versions are kept synchronized as one release unit.
 ## Alpha and beta releases
 
 Use a prerelease while desktop support relies on experimental Teams internals.
-The `0.1.10-alpha.1` candidate includes desktop chat reads, plain-text sends on Windows/WSL,
-and a Windows helper that speaks protocol 2. Personal Microsoft accounts use the
+The `0.1.10-alpha.1` candidate includes desktop chat reads, plain-text sends on macOS/Windows/WSL,
+and a Windows helper that speaks protocol 3. Personal Microsoft accounts use the
 desktop backend; Graph remains limited to work/school accounts. Validate personal
 reads and sends through both the native Windows CLI and the WSL CLI before publishing
-a candidate containing personal support. Missing cached profiles should leave names
+a candidate containing personal support. Also validate the native macOS CLI against
+a Teams-owned endpoint, including read-only refusal, cache pagination, a single
+confirmed send/readback, and normal relaunch with the debugging port closed. Missing cached profiles should leave names
 or viewer identity unknown without breaking reads.
 GitHub marks tags containing a prerelease suffix as prereleases and leaves them out of the latest stable release selection. Maturin
 normalizes the Python distribution version to PEP 440 (`0.1.10a1` for that example);

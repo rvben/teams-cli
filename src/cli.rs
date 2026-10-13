@@ -99,6 +99,9 @@ pub struct InitArgs {
     /// Existing loopback debugging port for a desktop profile
     #[arg(long, value_parser = clap::value_parser!(u16).range(1024..))]
     pub desktop_port: Option<u16>,
+    /// Select the personal or work/school Teams surface; auto refuses mixed surfaces
+    #[arg(long, value_enum)]
+    pub desktop_account: Option<crate::config::DesktopAccount>,
     /// Override the maintained teams-cli public-client application ID
     #[arg(long)]
     pub client_id: Option<String>,

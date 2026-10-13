@@ -3,12 +3,13 @@
 //! The protocol number is the whole contract: a helper is accepted when it speaks this
 //! CLI's protocol, whatever its version or build, which are only reported. Bump it when
 //! either side would misread the other (`desktop::tests::the_protocol_is_pinned`).
-//! `hello` and its `version` and `protocol` fields never change. Protocol 2 adds sending.
+//! `hello` and its `version` and `protocol` fields never change. Protocol 2 adds sending;
+//! protocol 3 adds explicit account-type selection to reads, sends and send checks.
 use crate::error::AppError;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The commit this binary was built from (see `build.rs`), reported in `hello` for
 /// diagnosis and never compared; empty when unknown.
@@ -51,7 +52,7 @@ async fn write_line(writer: &mut (impl AsyncWrite + Unpin), value: &Value) -> Re
 
 /// The helper side: answers requests in order until the input closes.
 #[cfg(any(windows, test))]
-pub async fn serve<S: super::owner::System>(
+pub async fn serve<S: super::session::Verifier>(
     mut reader: impl AsyncBufRead + Unpin,
     mut writer: impl AsyncWrite + Unpin,
     session: &mut super::session::Session<S>,
@@ -68,7 +69,13 @@ pub async fn serve<S: super::owner::System>(
             Some("send") => session.send(&request["request"]).await,
             Some("send_check") => {
                 match request["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
-                    Some(port) => session.send_check(port).await,
+                    Some(port) => {
+                        match crate::config::DesktopAccount::from_request(&request["account_type"])
+                        {
+                            Ok(account) => session.send_check(port, account).await,
+                            Err(error) => Err(error),
+                        }
+                    }
                     None => Err(AppError::InvalidInput("invalid desktop port".into())),
                 }
             }
@@ -419,6 +426,14 @@ mod tests {
         assert_eq!(check["ok"]["error"], "no_listener");
         let unknown = call(json!({"id": 6, "op": "launch"})).await;
         assert!(unknown["error"].is_string());
+        let invalid_account =
+            call(json!({"id": 7, "op": "send_check", "port": 9222, "account_type": "all"})).await;
+        assert!(
+            invalid_account["error"]
+                .as_str()
+                .unwrap()
+                .contains("account type")
+        );
         // Both halves share the stream; the server sees end of input once both are gone.
         drop((client_read, client_write));
         task.await.unwrap().unwrap();

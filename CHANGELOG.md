@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- macOS desktop chat reads, plain-text sends, and process-only debugging setup commands, sharing the Windows/WSL session backend.
+- Explicit desktop account-type selection with `init --desktop-account personal|work-school`, supported by helper protocol 3; mixed surfaces are refused by default.
 - Personal Teams desktop chat reads and plain-text sends on Windows and WSL, including personal/Skype profile names and signed-in user identity.
 
 ### Fixed

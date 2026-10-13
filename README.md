@@ -166,7 +166,7 @@ Like the other tools in the suite, the config file is selected with `--profile`,
 
 Use a desktop profile to inspect an existing Teams debugging endpoint on macOS,
 Windows, or WSL, and to read chats (and, if you opt in, send chat messages) on
-Windows or WSL with a signed-in personal Microsoft account or a work/school account:
+all three platforms with a signed-in personal Microsoft account or a work/school account:
 
 ```console
 teams init --profile local --backend desktop --read-only --no-login
@@ -175,16 +175,18 @@ teams --profile local doctor
 teams --profile local auth status
 # Match a separately enabled endpoint on another port:
 teams init --profile local --backend desktop --desktop-port 19222 --no-login
-# Windows/WSL: read chats and chat messages
+# If Teams exposes personal and work/school pages, choose the intended surface:
+teams init --profile local --backend desktop --desktop-port 19222 --desktop-account personal --no-login
+# macOS/Windows/WSL: read chats and chat messages
 teams --profile local chats list --limit 20
 teams --profile local messages list --chat '19:...@thread.v2'
-# Windows/WSL: opt in to sending plain-text chat messages
-teams init --profile local --backend desktop --desktop-port 19222 --allow-send --no-login
+# macOS/Windows/WSL: opt in to sending plain-text chat messages
+teams init --profile local --backend desktop --desktop-port 19222 --desktop-account personal --allow-send --no-login
 teams --profile local messages send --chat '19:...@thread.v2' --body 'On my way'
 ```
 
-On Windows and WSL, `chats list` and `messages list --chat` read from the running
-Teams client's local cache: the helper evaluates one fixed, read-only script in the
+On macOS, Windows and WSL, `chats list` and `messages list --chat` read from the running
+Teams client's local cache: the backend evaluates one fixed, read-only script in the
 Teams page and returns projected fields (ids, topics, members, last-message previews,
 read state, timestamps, senders, bodies), never tokens or raw records. Member and sender
 names come from the matching account's cached profiles. The signed-in user's identity
@@ -195,7 +197,7 @@ and add `"source": "desktop_cache"`. The cache only holds what Teams has synced,
 older history in a chat you never scrolled back through can be missing. Use the chat
 ids returned by `chats list`; personal chats are accessed through the desktop backend.
 The chat with yourself is listed too, with the id `48:notes`, so
-you can try sending there first. On macOS these commands return `unsupported`.
+you can try sending there first.
 
 Desktop profiles are read-only unless created with `init --allow-send`;
 `TEAMS_READ_ONLY=true` still blocks sending, but `TEAMS_READ_ONLY=false` cannot unlock a
@@ -218,6 +220,16 @@ through the same path as `messages send`. Existing profiles without a backend fi
 continue to use Graph; Graph remains the default for `init`.
 
 The endpoint must already be enabled through an explicit Teams debugging launch.
+On macOS, quit Teams completely, then run:
+
+```sh
+open -b com.microsoft.teams2 --env 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1'
+```
+
+This sets the environment for that launch only. Quit Teams and launch it normally
+to close the port. `doctor` and `init` print opening and closing commands for the
+profile's port when no endpoint is found.
+
 On Windows, set the user environment variable
 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`, quit Teams
 fully and start it again; remove the variable and restart Teams to close the port.
@@ -234,8 +246,8 @@ debugging. `init --no-login` saves configuration without probing; ordinary deskt
 initialization probes the existing endpoint. A normal Teams launch usually has no
 endpoint, which `doctor` reports as `no_listener`.
 
-macOS checks listener binding and installed Teams process ancestry before reading
-loopback metadata. On Windows, `teams.exe` checks the listener itself through the
+macOS checks listener binding and installed Teams process ancestry before accessing
+loopback metadata or the Teams page. On Windows, `teams.exe` checks the listener itself through the
 Windows APIs: every listener on the port must be loopback-only and descend from an
 `ms-teams.exe` that belongs to the installed MSTeams package and runs as the invoking
 Windows user. Under WSL, the Linux CLI starts the Windows build as a helper
@@ -247,15 +259,19 @@ the first Teams-origin page over the same verified loopback port and keep that
 connection open; if it drops, the listener is verified again before the next read.
 Related cache databases are selected for the same account. If a window exposes
 several conversation-account caches, reads and sends refuse with a desktop error;
-selecting among those accounts is not supported yet. An endpoint exposing both
-personal and work/school Teams pages is also refused rather than choosing an account.
+selecting among those accounts is not supported yet. `--desktop-account auto` is
+the default and refuses an endpoint exposing both personal and work/school pages.
+Set `--desktop-account personal` or `--desktop-account work-school` when creating
+the profile to select that surface explicitly. The choice applies to reads, sends
+and `doctor`'s send check, and never falls back to the other surface. Multiple
+cached accounts within the selected surface remain unsupported.
 
 On first use under WSL, the helper is downloaded from the matching GitHub release,
 checked against the release's `SHA256SUMS`, and cached in
 `~/.cache/teams-cli/windows-helper/<version>/`. `doctor --offline` reports whether
 it is installed without downloading it. Online probes install a compatible release
 helper when needed. Set `TEAMS_DESKTOP_HELPER` to use another
-`teams.exe`, or run `make windows-helper` (needs
+`teams.exe` speaking protocol 3 (including account selection), or run `make windows-helper` (needs
 [cargo-xwin](https://github.com/rust-cross/cargo-xwin)) to build one for a
 development checkout. If the download is blocked, fetch the
 `x86_64-pc-windows-msvc` archive from the release page, unpack `teams.exe` and point
