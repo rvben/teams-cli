@@ -22,7 +22,7 @@ Make everyday Microsoft Teams work—finding conversations, reading context, sen
 
 ## Positioning
 
-A human-first and agent-first Microsoft Teams terminal client: a polished TUI and exceptional onboarding share one typed command model with CLI Spec v0.3 introspection, bounded structured output, stable errors, and explicit effects. Neither audience is a compatibility layer over the other. It uses supported Microsoft Graph APIs rather than extracted desktop tokens or undocumented Teams protocols.
+A human-first and agent-first Microsoft Teams terminal client: a polished TUI and exceptional onboarding share one typed command model with CLI Spec v0.3 introspection, bounded structured output, stable errors, and explicit effects. Neither audience is a compatibility layer over the other. Its default backend uses supported Microsoft Graph APIs. An experimental desktop backend reads chats from the running Teams client's own local cache over its loopback debugging endpoint: read-only, without extracting tokens or calling Teams services directly.
 
 ## Operating Context
 
@@ -42,7 +42,7 @@ A human-first and agent-first Microsoft Teams terminal client: a polished TUI an
 - The command contract follows CLI Spec v0.3, including offline schema introspection, declared effects, bounded output, and stable error kinds and exit codes.
 - Microsoft Graph permissions and tenant policy can limit features; the product must explain these failures in task language.
 - Personal Microsoft accounts are not supported by the relevant Teams Graph APIs.
-- Calling, screen sharing, and private Teams protocols are outside the supported core.
+- Calling, screen sharing, and private Teams service protocols are outside the supported core; the desktop backend stays experimental and read-only.
 - The exact long-term scope beyond everyday messaging and navigation remains open.
 
 ## Brand Commitments

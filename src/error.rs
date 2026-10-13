@@ -104,7 +104,7 @@ pub const DESKTOP: ErrorContract = ErrorContract {
     kind: "desktop_error",
     exit_code: 5,
     retryable: false,
-    description: "Desktop connection diagnostics could not complete",
+    description: "The desktop backend could not complete the request",
 };
 
 pub const UNHEALTHY: ErrorContract = ErrorContract {

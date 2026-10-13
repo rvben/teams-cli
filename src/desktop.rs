@@ -1,18 +1,22 @@
-//! Existing-endpoint diagnostics only. Never launches Teams or evaluates app code.
-use crate::error::AppError;
+//! Existing-endpoint diagnostics and read-only chat access through the Teams client's own
+//! cache. Never launches Teams; evaluates only the fixed read script embedded in the helper.
+use crate::{error::AppError, graph::Page};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "macos", test))]
-use serde_json::Value;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 const SCRIPT: &str = include_str!("desktop.ps1");
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_METADATA: usize = 1024 * 1024;
+const MAX_READ: usize = 8 * 1024 * 1024;
 
 pub fn messaging_unsupported() -> AppError {
-    AppError::Unsupported("the experimental desktop backend supports connection diagnostics only; chat, message, identity and live TUI access are not implemented. Use `teams doctor` or a Graph profile".into())
+    AppError::Unsupported("the experimental desktop backend reads chats and chat messages only (Windows/WSL); teams, channels, identity, sending and the live TUI need a Graph profile".into())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,7 +122,42 @@ impl DesktopClient {
     }
 
     async fn probe_windows(&self) -> Result<ConnectionMetadata, AppError> {
-        use base64::{Engine, engine::general_purpose::STANDARD};
+        let text = self
+            .run_helper(json!({"operation":"probe","port":self.port}), MAX_METADATA)
+            .await?;
+        serde_json::from_str(&text)
+            .map_err(|_| AppError::Desktop("Windows helper returned invalid metadata".into()))
+    }
+
+    pub async fn chats(&self, limit: u16, cursor: Option<&str>) -> Result<Page, AppError> {
+        self.read(None, limit, cursor).await
+    }
+
+    pub async fn messages(
+        &self,
+        chat: &str,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<Page, AppError> {
+        self.read(Some(chat), limit, cursor).await
+    }
+
+    async fn read(
+        &self,
+        chat: Option<&str>,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<Page, AppError> {
+        let request = read_request(self.port, chat, limit, cursor)?;
+        if platform()? == "macos_loopback" {
+            return Err(AppError::Unsupported(
+                "desktop chat reading is available on Windows and WSL only".into(),
+            ));
+        }
+        read_page(&self.run_helper(request, MAX_READ).await?)
+    }
+
+    async fn run_helper(&self, request: Value, limit: usize) -> Result<String, AppError> {
         let executable = powershell()?;
         let encoded = STANDARD.encode(
             SCRIPT
@@ -134,23 +173,133 @@ impl DesktopClient {
             "-EncodedCommand",
             &encoded,
         ]);
-        let output = run_process(
-            command,
-            Some(serde_json::to_vec(&json!({"operation":"probe","port":self.port})).unwrap()),
-        )
-        .await?;
+        let output = run_process(command, Some(serde_json::to_vec(&request).unwrap())).await?;
         if !output.status.success() {
-            return Err(AppError::Desktop("Windows metadata helper failed; check PowerShell availability and policy. No Teams lifecycle or policy settings were changed".into()));
+            return Err(AppError::Desktop("Windows desktop helper failed; check PowerShell availability and policy. No Teams lifecycle or policy settings were changed".into()));
         }
-        if output.stdout.len() > MAX_METADATA {
+        if output.stdout.len() > limit {
             return Err(AppError::Desktop(
-                "Windows helper response exceeds the metadata limit".into(),
+                "Windows helper response exceeds the size limit".into(),
             ));
         }
-        let text = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str(text.trim_start_matches('\u{feff}').trim())
-            .map_err(|_| AppError::Desktop("Windows helper returned invalid metadata".into()))
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .trim_start_matches('\u{feff}')
+            .trim()
+            .into())
     }
+}
+
+fn valid_id(id: &str) -> bool {
+    (1..=256).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.:@-".contains(&b))
+}
+
+fn read_request(
+    port: u16,
+    chat: Option<&str>,
+    limit: u16,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
+    if let Some(chat) = chat
+        && !(chat.starts_with("19:") && valid_id(chat))
+    {
+        return Err(AppError::InvalidInput(
+            "desktop chat ids look like `19:...@thread.v2` or `19:...@unq.gbl.spaces`".into(),
+        ));
+    }
+    let after = cursor.map(decode_cursor).transpose()?;
+    Ok(json!({
+        "operation": "read",
+        "port": port,
+        "query": if chat.is_some() { "messages" } else { "chats" },
+        "chat_id": chat,
+        "limit": limit,
+        "after": after,
+    }))
+}
+
+/// Cursors are opaque to callers: base64 of the last item's sort key.
+fn encode_cursor(next: &Value) -> Result<String, AppError> {
+    let t = next.get("t").and_then(Value::as_i64);
+    let id = next.get("id").and_then(Value::as_str);
+    match (t, id) {
+        (Some(t), Some(id)) if valid_id(id) => {
+            Ok(URL_SAFE_NO_PAD.encode(json!({"t":t,"id":id}).to_string()))
+        }
+        _ => Err(AppError::Desktop(
+            "Teams cache returned an invalid page position".into(),
+        )),
+    }
+}
+
+fn decode_cursor(cursor: &str) -> Result<Value, AppError> {
+    let invalid = || AppError::InvalidInput("invalid desktop cursor".into());
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .map_err(|_| invalid())?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let t = value.get("t").and_then(Value::as_i64).ok_or_else(invalid)?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if t < 0 || !valid_id(id) {
+        return Err(invalid());
+    }
+    Ok(json!({"t":t,"id":id}))
+}
+
+/// Maps the helper's output: a refusal code, or the raw `Runtime.evaluate` reply.
+fn read_page(text: &str) -> Result<Page, AppError> {
+    let invalid = || AppError::Desktop("Windows helper returned an invalid chat response".into());
+    let reply: Value = serde_json::from_str(text).map_err(|_| invalid())?;
+    if let Some(code) = reply.get("error").and_then(Value::as_str) {
+        let status = serde_json::from_value::<ProbeStatus>(json!(code)).ok();
+        return Err(AppError::Desktop(match (status, code) {
+            (Some(status), _) => status.detail().into(),
+            (None, "no_target") => {
+                "No Teams window is available on the debugging endpoint; open Teams and sign in"
+                    .into()
+            }
+            _ => "The Teams page could not be read over the debugging endpoint; run `teams doctor`"
+                .into(),
+        }));
+    }
+    let result = &reply["result"];
+    if let Some(details) = result.get("exceptionDetails") {
+        let layout = details["exception"]["description"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("Error: layout"));
+        return Err(AppError::Desktop(if layout {
+            "The Teams cache layout was not recognised; this Teams version is not supported yet"
+                .into()
+        } else {
+            "The Teams page could not read its local cache; run `teams doctor`".into()
+        }));
+    }
+    let value: Value = result["result"]["value"]
+        .as_str()
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or_else(invalid)?;
+    if value["error"] == "not_found" {
+        return Err(AppError::NotFound(
+            "chat not found in the Teams desktop cache".into(),
+        ));
+    }
+    let items = value["items"].as_array().ok_or_else(invalid)?.clone();
+    let next_cursor = match &value["next"] {
+        Value::Null => None,
+        next => Some(encode_cursor(next)?),
+    };
+    Ok(Page {
+        items,
+        truncated: next_cursor.is_some(),
+        next_cursor,
+        next_offset: None,
+        source: Some("desktop_cache"),
+    })
 }
 
 pub fn platform() -> Result<&'static str, AppError> {
@@ -476,6 +625,70 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    #[test]
+    fn read_requests_validate_chat_ids_and_cursors() {
+        let request = read_request(9222, None, 5, None).unwrap();
+        assert_eq!(request["query"], "chats");
+        assert!(request["after"].is_null());
+        let cursor = encode_cursor(&json!({"t": 42, "id": "19:a@thread.v2"})).unwrap();
+        let request = read_request(9222, Some("19:a@thread.v2"), 5, Some(&cursor)).unwrap();
+        assert_eq!(request["query"], "messages");
+        assert_eq!(request["chat_id"], "19:a@thread.v2");
+        assert_eq!(request["after"], json!({"t": 42, "id": "19:a@thread.v2"}));
+        for chat in ["fixture", "19:a b", "19:a'); x", ""] {
+            assert!(matches!(
+                read_request(9222, Some(chat), 5, None),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+        let negative = URL_SAFE_NO_PAD.encode(r#"{"t":-1,"id":"x"}"#);
+        for cursor in ["%%%", "e30", negative.as_str()] {
+            assert!(matches!(
+                read_request(9222, None, 5, Some(cursor)),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+    }
+
+    fn reply(value: Value) -> String {
+        json!({"id":1,"result":{"result":{"type":"string","value":value.to_string()}}}).to_string()
+    }
+
+    #[test]
+    fn read_pages_map_cache_results_and_failures() {
+        let page = read_page(&reply(json!({
+            "items": [{"id": "19:a@thread.v2", "topic": null}],
+            "next": {"t": 7, "id": "19:a@thread.v2"}
+        })))
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.truncated);
+        assert_eq!(page.source, Some("desktop_cache"));
+        assert_eq!(
+            decode_cursor(page.next_cursor.as_deref().unwrap()).unwrap(),
+            json!({"t": 7, "id": "19:a@thread.v2"})
+        );
+        let last = read_page(&reply(json!({"items": [], "next": null}))).unwrap();
+        assert!(!last.truncated && last.next_cursor.is_none());
+        assert!(matches!(
+            read_page(&reply(json!({"error": "not_found"}))),
+            Err(AppError::NotFound(_))
+        ));
+        let layout = json!({"id":1,"result":{"exceptionDetails":{"exception":{"description":"Error: layout\n    at x"}}}});
+        assert!(
+            matches!(read_page(&layout.to_string()), Err(AppError::Desktop(m)) if m.contains("layout"))
+        );
+        for text in [
+            r#"{"error":"no_target"}"#,
+            r#"{"error":"non_teams_listener_refused"}"#,
+            r#"{"error":"read_failed"}"#,
+            "not json",
+            &reply(json!({"items": [], "next": {"t": 1, "id": "bad id"}})),
+        ] {
+            assert!(matches!(read_page(text), Err(AppError::Desktop(_))));
+        }
+    }
 
     #[test]
     fn native_script_fits_windows_command_line() {

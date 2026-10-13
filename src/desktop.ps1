@@ -5,11 +5,24 @@ try {
     $requestData = [Console]::In.ReadToEnd()
     if ($requestData.Length -gt 4096) { throw 'Invalid request' }
     $inputData = $requestData | ConvertFrom-Json
-    if ($inputData.operation -ne 'probe' -or ($inputData.port -isnot [int] -and $inputData.port -isnot [long]) -or
+    $Read = $inputData.operation -eq 'read'
+    if (($inputData.operation -ne 'probe' -and -not $Read) -or ($inputData.port -isnot [int] -and $inputData.port -isnot [long]) -or
         $inputData.port -lt 1024 -or $inputData.port -gt 65535) { throw 'Invalid request' }
     $Port = [int]$inputData.port
+    if ($Read) {
+        # Parameters reach the page only as a JSON literal built here.
+        $id = '^[A-Za-z0-9_.:@-]{1,256}$'
+        $after = $inputData.after
+        if ($inputData.query -notin @('chats','messages') -or $inputData.limit -isnot [int] -or
+            $inputData.limit -lt 1 -or $inputData.limit -gt 200 -or
+            ($inputData.query -eq 'messages' -and -not ([string]$inputData.chat_id).StartsWith('19:')) -or
+            ($inputData.query -eq 'messages' -and [string]$inputData.chat_id -cnotmatch $id) -or
+            ($null -ne $after -and [string]$after.id -cnotmatch $id)) { throw 'Invalid request' }
+        $params = [ordered]@{ query = [string]$inputData.query; chat = [string]$inputData.chat_id; limit = [int]$inputData.limit; after = $null }
+        if ($null -ne $after) { $params.after = [ordered]@{ t = [long]$after.t; id = [string]$after.id } }
+    }
 } catch {
-    [Console]::Out.WriteLine('{"error":{"kind":"invalid_input","message":"Expected a probe request with a port between 1024 and 65535"}}')
+    [Console]::Out.WriteLine('{"error":{"kind":"invalid_input","message":"Expected a probe or read request with a port between 1024 and 65535"}}')
     exit 1
 }
 
@@ -118,4 +131,49 @@ try {
         }
     }
 } catch { $result.status = 'metadata_probe_failed' }
-$result | ConvertTo-Json -Depth 8 -Compress
+if (-not $Read) { $result | ConvertTo-Json -Depth 8 -Compress; exit }
+if ($result.status -ne 'metadata_ok') { '{"error":"' + $result.status + '"}'; exit }
+# Projects the page's own IndexedDB cache; raw records never leave the page.
+$readScript = @'
+async p=>{const all=await indexedDB.databases(),req=q=>new Promise((r,j)=>{q.onsuccess=()=>r(q.result);q.onerror=()=>j(q.error)}),
+open=k=>{const d=all.find(x=>x.name.includes(':'+k+':'));if(!d)throw Error('layout');return req(indexedDB.open(d.name))},
+iso=t=>t?new Date(t).toISOString():null,
+page=rows=>{rows.sort((a,b)=>b.t-a.t||(a.id<b.id?-1:a.id>b.id?1:0));const c=p.after;if(c)rows=rows.filter(r=>r.t<c.t||r.t==c.t&&r.id>c.id);
+const items=rows.slice(0,p.limit),last=items[items.length-1];return{items:items.map(r=>r.v),next:rows.length>p.limit?{t:last.t,id:last.id}:null}};
+const cdb=await open('conversation-manager'),cs=cdb.transaction('conversations').objectStore('conversations');
+try{if(p.query=='chats')return page((await req(cs.getAll())).filter(c=>c.type=='Chat'||c.type=='Meeting').map(c=>({t:c.lastMessageTimeUtc||0,id:c.id,v:{id:c.id,
+topic:c.threadProperties&&c.threadProperties.topic||null,chatType:c.type=='Meeting'?'meeting':/@unq\.gbl\.spaces$/.test(c.id)?'oneOnOne':'group',lastUpdatedDateTime:iso(c.lastMessageTimeUtc)}})));
+if(!await req(cs.get(p.chat)))return{error:'not_found'}}finally{cdb.close()}
+const rdb=await open('replychain-manager'),rows=[],seen={};
+try{for(const rc of await req(rdb.transaction('replychains').objectStore('replychains').getAll(IDBKeyRange.bound([p.chat],[p.chat,[]]))))
+for(const m of Object.values(rc.messageMap||{})){const mt=m.messageType||'';if(/^(ThreadActivity|Event|Control)\//.test(mt)||seen[m.id])continue;seen[m.id]=1;
+rows.push({t:m.originalArrivalTime||0,id:m.id,v:{id:m.id,createdDateTime:iso(m.originalArrivalTime),from:{user:{id:(m.creator||'').replace(/^8:orgid:/,''),displayName:m.imDisplayName||null}},
+body:{contentType:/^RichText/.test(mt)?'html':'text',content:m.content||''},deleted:!!m.deletionInfo}})}}finally{rdb.close()}
+return page(rows)}
+'@
+$page = @($targets | Where-Object {
+    $_.type -eq 'page' -and $_.url -match '^https://teams\.(microsoft\.com|cloud\.microsoft)/' -and $_.id -match '^[A-Fa-f0-9]{8,64}$'
+})[0]
+if (-not $page) { '{"error":"no_target"}'; exit }
+$socket = New-Object Net.WebSockets.ClientWebSocket
+$cancel = New-Object Threading.CancellationTokenSource 30000
+try {
+    # The socket URL is rebuilt from the verified port, never taken from the endpoint.
+    $socket.ConnectAsync([Uri]"ws://127.0.0.1:$Port/devtools/page/$($page.id)", $cancel.Token).Wait()
+    $expression = '(' + $readScript + ')(' + ($params | ConvertTo-Json -Depth 4 -Compress) + ').then(JSON.stringify)'
+    $message = [Text.Encoding]::UTF8.GetBytes((@{ id = 1; method = 'Runtime.evaluate'; params = @{
+        expression = $expression; awaitPromise = $true; returnByValue = $true } } | ConvertTo-Json -Depth 4 -Compress))
+    $socket.SendAsync((New-Object ArraySegment[byte] -ArgumentList (,$message)), 'Text', $true, $cancel.Token).Wait()
+    $buffer = New-Object byte[] 65536
+    $reply = New-Object IO.MemoryStream
+    do {
+        $reply.SetLength(0)
+        do {
+            $received = $socket.ReceiveAsync((New-Object ArraySegment[byte] -ArgumentList (,$buffer)), $cancel.Token).Result
+            $reply.Write($buffer, 0, $received.Count)
+            if ($reply.Length -gt 8MB) { throw 'Reply too large' }
+        } until ($received.EndOfMessage)
+        $text = [Text.Encoding]::UTF8.GetString($reply.ToArray())
+    } until ($text.StartsWith('{"id":1,'))
+    $text
+} catch { '{"error":"read_failed"}' } finally { $socket.Dispose(); $cancel.Dispose() }

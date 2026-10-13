@@ -80,7 +80,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
             ));
         }
     };
-    if requires_messaging(&command)
+    if desktop_unsupported(&command)
         && config::selected_backend(profile_arg)? == BackendKind::Desktop
     {
         return Err(desktop::messaging_unsupported());
@@ -199,14 +199,16 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     }
 }
 
-fn requires_messaging(command: &Command) -> bool {
+/// Commands the desktop backend refuses before any helper or prompt runs.
+fn desktop_unsupported(command: &Command) -> bool {
     matches!(
         command,
         Command::Whoami
             | Command::List(_)
             | Command::Channels { .. }
-            | Command::Chats { .. }
-            | Command::Messages { .. }
+            | Command::Messages {
+                command: MessagesCommand::Send { .. } | MessagesCommand::List { chat: None, .. }
+            }
     ) || matches!(command, Command::Tui(args) if !args.demo && !args.snapshot)
 }
 
@@ -886,7 +888,9 @@ async fn desktop_doctor(
     checks.push(Check {
         name: "session_access",
         status: "unverified",
-        detail: "sign-in, chat and message access have not been implemented or verified".into(),
+        detail:
+            "sign-in is not verified; doctor does not read chats (try `teams chats list --limit 1`)"
+                .into(),
     });
     let healthy = is_healthy(&checks);
     let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"healthy":healthy,"offline":offline,
@@ -933,7 +937,7 @@ fn capabilities(out: Output) -> Result<(), AppError> {
         "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Existing endpoint diagnostics only. Sign-in and chat access are unverified.\n\nNot supported\n  Desktop messaging; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL also chats and chat messages, read-only from the running Teams client's local cache.\n\nNot supported\n  Desktop teams, channels, sending and live TUI; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
 }
 
 fn read_body(body: &str) -> Result<String, AppError> {

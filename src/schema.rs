@@ -82,7 +82,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 ],
             );
             value["args"] = json!([
-                {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics only"},
+                {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics and read-only chats"},
                 {"name":"--desktop-port","type":"integer","description":"Existing loopback endpoint port (desktop only; default 9222)","minimum":1024,"maximum":65535},
                 arg(
                     "--client-id",
@@ -299,7 +299,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         {
             let mut value = single(
                 "doctor",
-                "Check configuration and the selected backend's access (desktop is metadata only)",
+                "Check configuration and the selected backend's access (desktop checks endpoint metadata)",
                 "read_only",
                 vec![
                     field("backend", "string"),
@@ -342,12 +342,20 @@ pub fn generate(command_filter: Option<&str>) -> Value {
     ];
     for command in &mut commands {
         command["extensions"] = json!({"backends": match command["name"].as_str().unwrap_or_default() {
-            "auth login" | "auth logout" | "whoami" | "list" | "channels list" | "chats list" | "messages list" | "messages send" => vec!["graph"],
+            "auth login" | "auth logout" | "whoami" | "list" | "channels list" | "messages send" => vec!["graph"],
             _ => vec!["graph", "desktop"],
         }});
-        if command["name"] == "tui" {
-            command["extensions"]["desktop"] =
-                json!("demo/snapshot only; live desktop data is unsupported");
+        match command["name"].as_str().unwrap_or_default() {
+            "tui" => {
+                command["extensions"]["desktop"] =
+                    json!("demo/snapshot only; live desktop data is unsupported")
+            }
+            "chats list" | "messages list" => {
+                command["extensions"]["desktop"] = json!(
+                    "Windows/WSL only; chats, not channels; read from the Teams client's local cache; pages carry source \"desktop_cache\""
+                )
+            }
+            _ => {}
         }
     }
     if let Some(filter) = command_filter {
@@ -385,10 +393,10 @@ pub fn backend_capabilities() -> Value {
     json!({
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
         "desktop":{"experimental":true,"read_only":true,"platforms":["macos","windows","wsl"],
-            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status"],
-            "unsupported":["chat and message access","identity","live TUI","send messages","subscriptions","automatic Teams launch or restart"],
+            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (windows, wsl)","chat messages (windows, wsl)"],
+            "unsupported":["teams and channels","identity","live TUI","send messages","subscriptions","automatic Teams launch or restart"],
             "requires":"existing Teams-owned loopback debugging endpoint; Windows/WSL require powershell.exe",
             "transport":{"macos":"native_loopback","windows":"windows_helper","wsl":"windows_helper_stdio"},
-            "session_verified":false,"default_port":crate::config::DEFAULT_DESKTOP_PORT}
+            "chat_source":"desktop_cache","session_verified":false,"default_port":crate::config::DEFAULT_DESKTOP_PORT}
     })
 }

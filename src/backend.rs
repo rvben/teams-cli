@@ -1,4 +1,4 @@
-//! Shared operations for CLI, TUI and other frontends. Desktop data access is gated.
+//! Shared operations for CLI, TUI and other frontends. Desktop data access is limited to chats.
 use crate::{
     auth,
     config::{self, BackendKind},
@@ -44,7 +44,10 @@ impl TeamsBackend {
         self.graph()?.channels(team, limit, offset).await
     }
     pub async fn chats(&self, limit: u16, cursor: Option<&str>) -> Result<Page, AppError> {
-        self.graph()?.chats(limit, cursor).await
+        match self {
+            Self::Graph(client) => client.chats(limit, cursor).await,
+            Self::Desktop(client) => client.chats(limit, cursor).await,
+        }
     }
     pub async fn messages(
         &self,
@@ -54,9 +57,13 @@ impl TeamsBackend {
         limit: u16,
         cursor: Option<&str>,
     ) -> Result<Page, AppError> {
-        self.graph()?
-            .messages(chat, team, channel, limit, cursor)
-            .await
+        match (self, chat, team, channel) {
+            (Self::Graph(client), ..) => client.messages(chat, team, channel, limit, cursor).await,
+            (Self::Desktop(client), Some(chat), None, None) => {
+                client.messages(chat, limit, cursor).await
+            }
+            (Self::Desktop(_), ..) => Err(desktop::messaging_unsupported()),
+        }
     }
     pub async fn send(
         &self,

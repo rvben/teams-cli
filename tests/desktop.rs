@@ -90,11 +90,17 @@ fn desktop_commands_reject_before_oauth_or_tui_prompts() {
     let temp = tempfile::tempdir().unwrap();
     init(&temp);
     for args in [
-        vec!["chats", "list"],
         vec!["list"],
         vec!["whoami"],
         vec!["channels", "list", "fixture"],
-        vec!["messages", "list", "--chat", "fixture"],
+        vec![
+            "messages",
+            "list",
+            "--team",
+            "fixture",
+            "--channel",
+            "fixture",
+        ],
         vec!["auth", "login", "--device-code"],
         vec!["auth", "logout"],
         vec!["tui"],
@@ -113,6 +119,22 @@ fn desktop_commands_reject_before_oauth_or_tui_prompts() {
         .args(["tui", "--demo", "--snapshot"])
         .assert()
         .success();
+}
+
+#[test]
+fn desktop_chat_reads_validate_input_before_contacting_teams() {
+    let temp = tempfile::tempdir().unwrap();
+    init(&temp);
+    for args in [
+        vec!["messages", "list", "--chat", "fixture"],
+        vec!["chats", "list", "--cursor", "not-a-cursor"],
+    ] {
+        let output = cli(&temp).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(value["error"]["kind"], "invalid_input");
+        assert!(output.stdout.is_empty());
+    }
 }
 
 #[test]
@@ -215,6 +237,17 @@ fn backend_options_and_schema_describe_only_implemented_capabilities() {
             .find(|c| c["name"] == "messages send")
             .unwrap()["extensions"]["backends"],
         serde_json::json!(["graph"])
+    );
+    for name in ["chats list", "messages list"] {
+        let command = commands.iter().find(|c| c["name"] == name).unwrap();
+        assert_eq!(
+            command["extensions"]["backends"],
+            serde_json::json!(["graph", "desktop"])
+        );
+    }
+    assert_eq!(
+        schema["extensions"]["backends"]["desktop"]["chat_source"],
+        "desktop_cache"
     );
     assert!(
         schema["errors"]

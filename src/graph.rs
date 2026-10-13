@@ -13,6 +13,9 @@ pub struct Page {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
     pub truncated: bool,
+    /// Set when items come from a local cache rather than the live service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +170,7 @@ impl GraphClient {
             next_cursor: page.next_link,
             next_offset: None,
             truncated,
+            source: None,
         })
     }
 
@@ -217,6 +221,7 @@ impl GraphClient {
             next_cursor: None,
             next_offset: truncated.then_some(consumed),
             truncated,
+            source: None,
         })
     }
 
