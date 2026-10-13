@@ -140,8 +140,9 @@ teams --profile local messages list --chat '19:...@thread.v2'
 
 On Windows and WSL, `chats list` and `messages list --chat` read from the running
 Teams client's local cache: the helper evaluates one fixed, read-only script in the
-Teams page and returns projected fields (ids, topics, timestamps, senders, bodies),
-never tokens or raw records. Pages use the same shape and opaque `--cursor` as Graph
+Teams page and returns projected fields (ids, topics, members, last-message previews,
+read state, timestamps, senders, bodies), never tokens or raw records. Member and sender
+names come from Teams' cached profiles, so 1:1 chats show the other person's name. Pages use the same shape and opaque `--cursor` as Graph
 and add `"source": "desktop_cache"`. The cache only holds what Teams has synced, so
 older history in a chat you never scrolled back through can be missing. Chat ids are
 the same as Graph's. On macOS these commands return `unsupported`.

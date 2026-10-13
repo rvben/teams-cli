@@ -160,7 +160,7 @@ impl DesktopClient {
     async fn run_helper(&self, request: Value, limit: usize) -> Result<String, AppError> {
         let executable = powershell()?;
         let encoded = STANDARD.encode(
-            SCRIPT
+            helper_script()
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
@@ -187,6 +187,16 @@ impl DesktopClient {
             .trim()
             .into())
     }
+}
+
+/// Comments and indentation are dropped to stay within the Windows command-line limit.
+fn helper_script() -> String {
+    SCRIPT
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn valid_id(id: &str) -> bool {
@@ -299,6 +309,10 @@ fn read_page(text: &str) -> Result<Page, AppError> {
         next_cursor,
         next_offset: None,
         source: Some("desktop_cache"),
+        viewer: value["me"]
+            .as_str()
+            .filter(|me| valid_id(me))
+            .map(String::from),
     })
 }
 
@@ -658,19 +672,22 @@ mod tests {
     #[test]
     fn read_pages_map_cache_results_and_failures() {
         let page = read_page(&reply(json!({
+            "me": "0f0e-guid",
             "items": [{"id": "19:a@thread.v2", "topic": null}],
             "next": {"t": 7, "id": "19:a@thread.v2"}
         })))
         .unwrap();
         assert_eq!(page.items.len(), 1);
+        assert_eq!(page.viewer.as_deref(), Some("0f0e-guid"));
+        assert!(serde_json::to_value(&page).unwrap().get("viewer").is_none());
         assert!(page.truncated);
         assert_eq!(page.source, Some("desktop_cache"));
         assert_eq!(
             decode_cursor(page.next_cursor.as_deref().unwrap()).unwrap(),
             json!({"t": 7, "id": "19:a@thread.v2"})
         );
-        let last = read_page(&reply(json!({"items": [], "next": null}))).unwrap();
-        assert!(!last.truncated && last.next_cursor.is_none());
+        let last = read_page(&reply(json!({"me": "a b", "items": [], "next": null}))).unwrap();
+        assert!(!last.truncated && last.next_cursor.is_none() && last.viewer.is_none());
         assert!(matches!(
             read_page(&reply(json!({"error": "not_found"}))),
             Err(AppError::NotFound(_))
@@ -692,7 +709,12 @@ mod tests {
 
     #[test]
     fn native_script_fits_windows_command_line() {
-        let encoded = SCRIPT.encode_utf16().count().saturating_mul(2).div_ceil(3) * 4;
+        let encoded = helper_script()
+            .encode_utf16()
+            .count()
+            .saturating_mul(2)
+            .div_ceil(3)
+            * 4;
         assert!(encoded < 32000);
     }
 

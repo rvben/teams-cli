@@ -16,6 +16,9 @@ pub struct Page {
     /// Set when items come from a local cache rather than the live service.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
+    /// The signed-in user's id when the backend knows it, so text output can say "You".
+    #[serde(skip)]
+    pub viewer: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +174,7 @@ impl GraphClient {
             next_offset: None,
             truncated,
             source: None,
+            viewer: None,
         })
     }
 
@@ -222,6 +226,7 @@ impl GraphClient {
             next_offset: truncated.then_some(consumed),
             truncated,
             source: None,
+            viewer: None,
         })
     }
 
