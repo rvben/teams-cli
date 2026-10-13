@@ -25,9 +25,11 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use serde_json::{Value, json};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::backend::TeamsBackend;
+use crate::config;
+use crate::desktop::MAX_BODY;
 use crate::error::AppError;
 use crate::graph::Page;
 use crate::render::{self, ChatRow, Entry, View};
@@ -42,6 +44,13 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const SPLIT_WIDTH: u16 = 80;
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 14;
+/// How often a live session quietly reloads; the desktop cache is local, Graph is not.
+/// How often a live session re-reads the open chat and the chat list. Desktop reads come
+/// from the local cache, so they can be frequent; Graph is kept within its rate limits.
+const DESKTOP_POLL: (Duration, Duration) = (Duration::from_secs(3), Duration::from_secs(15));
+const GRAPH_POLL: (Duration, Duration) = (Duration::from_secs(15), Duration::from_secs(60));
+/// Rows the composer grows to before its draft scrolls.
+const COMPOSE_ROWS: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiExit {
@@ -54,6 +63,8 @@ pub enum Source {
     Live {
         backend: Arc<TeamsBackend>,
         profile: String,
+        /// Whether the profile allowed writes at launch; checked again before every send.
+        can_send: bool,
     },
     Demo,
 }
@@ -168,6 +179,10 @@ enum Outcome {
         result: Result<Page, AppError>,
     },
     Me(Result<Value, AppError>),
+    Sent {
+        chat: String,
+        result: Result<Value, AppError>,
+    },
 }
 
 enum Load {
@@ -190,6 +205,8 @@ struct Thread {
     cursor: Option<String>,
     load: Load,
     loading_older: bool,
+    /// A newest-page read is in flight, so polls do not stack up.
+    fetching: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -202,6 +219,29 @@ enum Focus {
 enum Overlay {
     Help,
     Filter,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Stage {
+    Editing,
+    /// Enter was pressed; only `y` sends.
+    Confirming,
+    Sending,
+}
+
+/// A draft for one chat; `cursor` is a byte offset into `text`.
+struct Compose {
+    chat: String,
+    text: String,
+    cursor: usize,
+    stage: Stage,
+}
+
+impl Compose {
+    fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,6 +290,14 @@ struct App {
     overlay: Option<Overlay>,
     notice: Notice,
     frame: usize,
+    compose: Option<Compose>,
+    /// Closed, unsent drafts per chat; kept in memory only.
+    drafts: HashMap<String, String>,
+    /// Set by `r` so its result is announced; quiet reloads say nothing.
+    refreshing: bool,
+    fetching_chats: bool,
+    thread_polled: Instant,
+    chats_polled: Instant,
 }
 
 impl App {
@@ -277,6 +325,12 @@ impl App {
             overlay: None,
             notice: Notice::new(Tone::Quiet, "Reading your chats…"),
             frame: 0,
+            compose: None,
+            drafts: HashMap::new(),
+            refreshing: false,
+            fetching_chats: false,
+            thread_polled: Instant::now(),
+            chats_polled: Instant::now(),
         }
     }
 
@@ -294,9 +348,18 @@ impl App {
         }
     }
 
+    fn can_send(&self) -> bool {
+        match &self.source {
+            Source::Live { can_send, .. } => *can_send,
+            Source::Demo => true,
+        }
+    }
+
     fn location(&self) -> String {
         let (profile, kind) = match &self.source {
-            Source::Live { backend, profile } => (
+            Source::Live {
+                backend, profile, ..
+            } => (
                 profile.as_str(),
                 match backend.as_ref() {
                     TeamsBackend::Graph(_) => "Microsoft Graph",
@@ -347,6 +410,7 @@ impl App {
             if !matches!(self.chats_load, Load::Ready) {
                 self.chats_load = Load::Loading;
             }
+            self.fetching_chats = true;
             None
         };
         match self.backend() {
@@ -377,6 +441,7 @@ impl App {
                 if !matches!(thread.load, Load::Ready) {
                     thread.load = Load::Loading;
                 }
+                thread.fetching = true;
                 None
             }
             None => {
@@ -387,6 +452,7 @@ impl App {
                         cursor: None,
                         load: Load::Loading,
                         loading_older: false,
+                        fetching: true,
                     },
                 );
                 None
@@ -422,6 +488,8 @@ impl App {
             Outcome::Chats { more, result } => {
                 if more {
                     self.loading_more = false;
+                } else {
+                    self.fetching_chats = false;
                 }
                 match result {
                     Ok(page) => {
@@ -429,28 +497,32 @@ impl App {
                             self.viewer = page.viewer;
                         }
                         let keep = self.selected_row().map(|row| row.id.clone());
+                        let cursor = page.next_cursor.filter(|_| page.truncated);
                         if more {
                             let known: HashSet<String> =
                                 self.rows.iter().map(|row| row.id.clone()).collect();
                             self.chats.extend(page.items.into_iter().filter(|chat| {
                                 !chat["id"].as_str().is_some_and(|id| known.contains(id))
                             }));
+                            self.chat_cursor = cursor;
                         } else {
-                            if matches!(self.chats_load, Load::Ready) {
-                                self.notice = Notice::new(Tone::Success, "Up to date.");
-                            } else {
+                            if !matches!(self.chats_load, Load::Ready) {
                                 self.notice = Notice::new(
                                     Tone::Quiet,
                                     "Enter opens a chat  ·  / filters  ·  ? shows every key",
                                 );
+                            } else if std::mem::take(&mut self.refreshing) {
+                                self.notice = Notice::new(Tone::Success, "Up to date.");
                             }
-                            self.chats = page.items;
+                            let old = std::mem::take(&mut self.chats);
+                            (self.chats, self.chat_cursor) =
+                                merge_newest(page.items, cursor, old, self.chat_cursor.take());
                         }
-                        self.chat_cursor = page.next_cursor.filter(|_| page.truncated);
                         self.chats_load = Load::Ready;
                         self.rebuild(keep.as_deref());
                     }
                     Err(error) if more || matches!(self.chats_load, Load::Ready) => {
+                        self.refreshing = false;
                         self.notice = Notice::new(Tone::Error, error.to_string());
                     }
                     Err(error) => {
@@ -470,6 +542,8 @@ impl App {
                 };
                 if older {
                     thread.loading_older = false;
+                } else {
+                    thread.fetching = false;
                 }
                 match result {
                     Ok(page) => {
@@ -493,10 +567,13 @@ impl App {
                                     if added == 1 { "" } else { "s" }
                                 ),
                             );
+                            thread.cursor = page.next_cursor.filter(|_| page.truncated);
                         } else {
-                            thread.items = page.items;
+                            let cursor = page.next_cursor.filter(|_| page.truncated);
+                            let old = std::mem::take(&mut thread.items);
+                            (thread.items, thread.cursor) =
+                                merge_newest(page.items, cursor, old, thread.cursor.take());
                         }
-                        thread.cursor = page.next_cursor.filter(|_| page.truncated);
                         thread.load = Load::Ready;
                         if self.viewer.is_none() && page.viewer.is_some() {
                             self.viewer = page.viewer;
@@ -521,14 +598,36 @@ impl App {
             }
             // The header simply stays without a name; chats still load.
             Outcome::Me(Err(_)) => {}
+            Outcome::Sent { chat, result } => {
+                let compose = self.compose.as_mut().filter(|c| c.chat == chat);
+                match result {
+                    Ok(_) => {
+                        if compose.is_some() {
+                            self.compose = None;
+                        }
+                        self.drafts.remove(&chat);
+                        self.notice = Notice::new(Tone::Success, "Sent.");
+                    }
+                    Err(error) => {
+                        if let Some(compose) = compose {
+                            compose.stage = Stage::Editing;
+                        }
+                        self.notice = Notice::new(Tone::Error, error.to_string());
+                    }
+                }
+                // Even a failed send may have reached Teams, so show what the chat holds now.
+                if self.backend().is_some() {
+                    self.load_chats(false);
+                    self.load_messages(chat, false);
+                }
+            }
         }
     }
 
     /// Recomputes rows and the filtered ledger, keeping the selected chat.
     fn rebuild(&mut self, keep: Option<&str>) {
-        let keep = keep
-            .map(String::from)
-            .or_else(|| self.selected_row().map(|row| row.id.clone()));
+        let before = self.selected_row().map(|row| row.id.clone());
+        let keep = keep.map(String::from).or_else(|| before.clone());
         let view = self.view();
         self.rows = self
             .chats
@@ -550,11 +649,12 @@ impl App {
         let position = keep
             .and_then(|id| self.visible.iter().position(|&i| self.rows[i].id == id))
             .or_else(|| (!self.visible.is_empty()).then_some(0));
-        if position != self.list.selected() {
+        self.list.select(position);
+        // A reload can move the open chat in the ledger; only a different chat starts afresh.
+        if self.selected_row().map(|row| row.id.clone()) != before {
             self.selected_at = Some(Instant::now());
             self.scroll = 0;
         }
-        self.list.select(position);
     }
 
     fn selected_row(&self) -> Option<&ChatRow> {
@@ -621,6 +721,31 @@ impl App {
         {
             self.open_selected();
         }
+        if let Some(backend) = self.backend() {
+            let (thread_every, chats_every) = match backend.as_ref() {
+                TeamsBackend::Desktop(_) => DESKTOP_POLL,
+                TeamsBackend::Graph(_) => GRAPH_POLL,
+            };
+            if self.chats_polled.elapsed() >= chats_every
+                && matches!(self.chats_load, Load::Ready)
+                && !self.loading_more
+                && !self.fetching_chats
+            {
+                self.chats_polled = Instant::now();
+                self.now = Zoned::now().with_time_zone(TimeZone::system());
+                self.load_chats(false);
+            }
+            if self.thread_polled.elapsed() >= thread_every {
+                self.thread_polled = Instant::now();
+                if let Some(id) = self.selected_row().map(|row| row.id.clone())
+                    && self.threads.get(&id).is_some_and(|t| {
+                        matches!(t.load, Load::Ready) && !t.fetching && !t.loading_older
+                    })
+                {
+                    self.load_messages(id, false);
+                }
+            }
+        }
     }
 
     /// Background prefetches stay quiet; only the open chat shows activity.
@@ -645,13 +770,151 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        self.notice = Notice::new(Tone::Quiet, "Refreshing…");
+        self.refreshing = true;
+        self.reload();
+    }
+
+    /// Reloads the ledger and the open chat, keeping older pages, selection and scroll.
+    fn reload(&mut self) {
+        self.thread_polled = Instant::now();
+        self.chats_polled = Instant::now();
         if matches!(self.source, Source::Live { .. }) {
             self.now = Zoned::now().with_time_zone(TimeZone::system());
         }
-        self.notice = Notice::new(Tone::Quiet, "Refreshing…");
         self.load_chats(false);
-        if let Some(id) = self.selected_row().map(|row| row.id.clone()) {
+        if let Some(id) = self.selected_row().map(|row| row.id.clone())
+            && self.threads.get(&id).is_none_or(|t| !t.loading_older)
+        {
             self.load_messages(id, false);
+        }
+    }
+
+    fn open_compose(&mut self) {
+        let Some(chat) = self.selected_row().map(|row| row.id.clone()) else {
+            return;
+        };
+        if !self.can_send() {
+            self.notice = Notice::new(
+                Tone::Error,
+                "This profile is read-only; sending needs a profile created with `teams init --backend desktop --allow-send`.",
+            );
+            return;
+        }
+        let text = self.drafts.remove(&chat).unwrap_or_default();
+        self.focus = Focus::Thread;
+        self.compose = Some(Compose {
+            chat,
+            cursor: text.len(),
+            text,
+            stage: Stage::Editing,
+        });
+    }
+
+    /// Every key but ctrl-c belongs to the composer while it is open.
+    fn compose_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        match compose.stage {
+            Stage::Sending => {}
+            Stage::Confirming => {
+                if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                    self.send();
+                } else {
+                    compose.stage = Stage::Editing;
+                    self.notice = Notice::new(Tone::Quiet, "Not sent; keep editing.");
+                }
+            }
+            Stage::Editing => match key.code {
+                KeyCode::Esc => {
+                    let compose = self.compose.take().expect("composer is open");
+                    if !compose.text.trim().is_empty() {
+                        self.drafts.insert(compose.chat, compose.text);
+                        self.notice = Notice::new(Tone::Quiet, "Draft kept; c continues it.");
+                    }
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => compose.insert('\n'),
+                KeyCode::Char('j') if control => compose.insert('\n'),
+                KeyCode::Enter => {
+                    let length = compose.text.chars().count();
+                    if compose.text.trim().is_empty() {
+                        self.notice = Notice::new(Tone::Quiet, "Write something first.");
+                    } else if length > MAX_BODY {
+                        self.notice = Notice::new(
+                            Tone::Error,
+                            format!("Too long to send: {length} of at most {MAX_BODY} characters."),
+                        );
+                    } else {
+                        compose.stage = Stage::Confirming;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(c) = compose.text[..compose.cursor].chars().next_back() {
+                        compose.cursor -= c.len_utf8();
+                        compose.text.remove(compose.cursor);
+                    }
+                }
+                KeyCode::Delete if compose.cursor < compose.text.len() => {
+                    compose.text.remove(compose.cursor);
+                }
+                KeyCode::Left => {
+                    if let Some(c) = compose.text[..compose.cursor].chars().next_back() {
+                        compose.cursor -= c.len_utf8();
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(c) = compose.text[compose.cursor..].chars().next() {
+                        compose.cursor += c.len_utf8();
+                    }
+                }
+                KeyCode::Home => compose.cursor = 0,
+                KeyCode::End => compose.cursor = compose.text.len(),
+                KeyCode::Char(c) if !control && c != '\0' => compose.insert(c),
+                _ => {}
+            },
+        }
+    }
+
+    fn send(&mut self) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        compose.stage = Stage::Sending;
+        let (chat, text) = (compose.chat.clone(), compose.text.clone());
+        self.notice = Notice::new(Tone::Quiet, "Sending…");
+        match &self.source {
+            Source::Live {
+                backend, profile, ..
+            } => {
+                let (backend, profile) = (backend.clone(), profile.clone());
+                let sender = self.outcomes.0.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        config::load(Some(&profile))?.1.require_writable()?;
+                        backend.send(Some(&chat), None, None, &text).await
+                    }
+                    .await;
+                    let _ = sender.send(Outcome::Sent { chat, result });
+                });
+            }
+            Source::Demo => {
+                let message = json!({
+                    "id": format!("{chat}/sent{}", self.frame),
+                    "messageType": "message",
+                    "createdDateTime": self.now.timestamp().to_string(),
+                    "from": {"user": demo_person("me")},
+                    "body": {"contentType": "text", "content": text},
+                });
+                if let Some(thread) = self.threads.get_mut(&chat) {
+                    thread.items.insert(0, message.clone());
+                }
+                self.apply(Outcome::Sent {
+                    chat,
+                    result: Ok(message),
+                });
+            }
         }
     }
 
@@ -659,6 +922,10 @@ impl App {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        if self.compose.is_some() {
+            self.compose_key(key);
+            return Action::None;
         }
         match self.overlay {
             Some(Overlay::Help) => {
@@ -704,6 +971,7 @@ impl App {
                 self.overlay = Some(Overlay::Filter);
             }
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('c') => self.open_compose(),
             KeyCode::Enter | KeyCode::Char('a') if self.sign_in_needed() => {
                 return Action::Authenticate;
             }
@@ -974,11 +1242,46 @@ impl App {
             )),
             heading,
         );
-        let body = Rect {
+        let mut body = Rect {
             y: body.y + 1,
             height: body.height.saturating_sub(1),
             ..body
         };
+        if let Some(compose) = self.compose.as_ref().filter(|c| c.chat == row.id) {
+            let (rows, (line, column)) =
+                layout_draft(&compose.text, compose.cursor, usize::from(body.width));
+            let shown = rows.len().min(COMPOSE_ROWS);
+            let [conversation, editor] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(shown as u16 + 1)])
+                    .areas(body);
+            body = conversation;
+            let title = match compose.stage {
+                Stage::Editing => " MESSAGE ",
+                Stage::Confirming => " SEND THIS? ",
+                Stage::Sending => " SENDING ",
+            };
+            let block = Block::default()
+                .borders(Borders::TOP)
+                .border_style(theme.active_rule())
+                .title(Span::styled(title, theme.column_header()));
+            let inner = block.inner(editor);
+            frame.render_widget(block, editor);
+            let start = (line + 1).saturating_sub(COMPOSE_ROWS);
+            let lines: Vec<Line> = if compose.text.is_empty() {
+                vec![Line::styled("Write a message…", theme.muted())]
+            } else {
+                rows.into_iter()
+                    .skip(start)
+                    .take(COMPOSE_ROWS)
+                    .map(|row| Line::styled(row, theme.body()))
+                    .collect()
+            };
+            frame.render_widget(Paragraph::new(lines), inner);
+            if compose.stage == Stage::Editing {
+                let x = inner.x + (column as u16).min(inner.width.saturating_sub(1));
+                frame.set_cursor_position((x, inner.y + (line - start) as u16));
+            }
+        }
         let id = row.id.clone();
         self.thread_height = usize::from(body.height);
         let Some(thread) = self.threads.get(&id) else {
@@ -1067,6 +1370,25 @@ impl App {
             frame.render_widget(Paragraph::new(prompt), status);
             let x = status.x + 9 + self.filter.width() as u16;
             frame.set_cursor_position((x.min(status.right().saturating_sub(1)), status.y));
+        } else if let Some(compose) = self
+            .compose
+            .as_ref()
+            .filter(|c| c.stage == Stage::Confirming)
+        {
+            let title = self
+                .rows
+                .iter()
+                .find(|row| row.id == compose.chat)
+                .map_or("this chat", |row| row.title.as_str());
+            let prompt =
+                format!("Send to {title} as you?  y sends  ·  any other key keeps editing");
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    render::truncate(&prompt, usize::from(status.width)),
+                    theme.accent(),
+                )),
+                status,
+            );
         } else {
             let style = match self.notice.tone {
                 Tone::Quiet => theme.muted(),
@@ -1087,7 +1409,17 @@ impl App {
     /// Key hints for the current context, dropping the least important ones
     /// first when the terminal is narrow. Lower rank means more important.
     fn hints(&self, width: usize) -> Line<'static> {
-        let all: Vec<(&str, &str, u8)> = if self.overlay == Some(Overlay::Filter) {
+        let mut all: Vec<(&str, &str, u8)> = if let Some(compose) = &self.compose {
+            match compose.stage {
+                Stage::Editing => vec![
+                    ("enter", "send", 0),
+                    ("ctrl-j", "new line", 1),
+                    ("esc", "close, keep draft", 0),
+                ],
+                Stage::Confirming => vec![("y", "send", 0), ("any key", "keep editing", 0)],
+                Stage::Sending => vec![("ctrl-c", "quit", 1)],
+            }
+        } else if self.overlay == Some(Overlay::Filter) {
             vec![("enter", "keep", 0), ("esc", "clear", 0), ("↑↓", "move", 1)]
         } else if self.sign_in_needed() {
             vec![
@@ -1116,6 +1448,14 @@ impl App {
                 ("q", "quit", 0),
             ]
         };
+        if self.compose.is_none()
+            && self.overlay.is_none()
+            && !self.sign_in_needed()
+            && self.can_send()
+        {
+            let rank = if self.focus == Focus::Thread { 0 } else { 2 };
+            all.insert(all.len() - 3, ("c", "reply", rank));
+        }
         let mut chosen = vec![false; all.len()];
         let mut used = 0;
         for rank in 0..=3 {
@@ -1154,7 +1494,8 @@ impl App {
             ("g / G", "First / last chat, or oldest / newest message"),
             ("o", "Load older messages in this chat"),
             ("/", "Filter chats by name or last message"),
-            ("r", "Refresh chats and the open conversation"),
+            ("c", "Write a message in the open chat"),
+            ("r", "Refresh now; chats also refresh on their own"),
             ("enter / a", "Sign in when the session needs attention"),
             ("q / ctrl-c", "Return to the shell"),
         ];
@@ -1173,7 +1514,11 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "Read-only: nothing here sends, edits or marks messages as read.",
+            if self.can_send() {
+                "Nothing is sent until you confirm with y; nothing is edited or marked read."
+            } else {
+                "Read-only: nothing here sends, edits or marks messages as read."
+            },
             theme.success(),
         ));
         let height = lines.len() as u16 + 2;
@@ -1274,6 +1619,63 @@ fn chat_item(
     } else {
         item
     }
+}
+
+/// Wraps a draft to `width` columns, honouring line breaks, and finds the row and
+/// column of the byte offset `cursor`.
+fn layout_draft(text: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut column = 0;
+    let mut at = None;
+    for (i, c) in text.char_indices() {
+        if c == '\n' {
+            if i == cursor {
+                at = Some((rows.len() - 1, column));
+            }
+            rows.push(String::new());
+            column = 0;
+            continue;
+        }
+        let w = c.width().unwrap_or(0);
+        if column + w > width {
+            rows.push(String::new());
+            column = 0;
+        }
+        if i == cursor {
+            at = Some((rows.len() - 1, column));
+        }
+        rows.last_mut().expect("never empty").push(c);
+        column += w;
+    }
+    let at = at.unwrap_or((rows.len() - 1, column));
+    (rows, at)
+}
+
+/// Puts a fresh first page ahead of what was loaded before. Older pages are kept, with
+/// their cursor, only when the fresh page overlaps them, so a burst of new items never
+/// leaves a silent gap.
+fn merge_newest(
+    fresh: Vec<Value>,
+    cursor: Option<String>,
+    old: Vec<Value>,
+    old_cursor: Option<String>,
+) -> (Vec<Value>, Option<String>) {
+    let ids: HashSet<&str> = fresh.iter().filter_map(|v| v["id"].as_str()).collect();
+    let overlaps = old
+        .iter()
+        .any(|v| v["id"].as_str().is_some_and(|id| ids.contains(id)));
+    if cursor.is_none() || !overlaps {
+        return (fresh, cursor);
+    }
+    let rest: Vec<Value> = old
+        .into_iter()
+        .filter(|v| !v["id"].as_str().is_some_and(|id| ids.contains(id)))
+        .collect();
+    let cursor = if rest.is_empty() { cursor } else { old_cursor };
+    let mut items = fresh;
+    items.extend(rest);
+    (items, cursor)
 }
 
 /// Lays a conversation out for a pane: centred day rules, coloured senders,
@@ -1959,6 +2361,138 @@ mod tests {
             press(&mut app, KeyCode::Enter),
             Action::Authenticate
         ));
+    }
+
+    fn frame_text(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn composing_asks_before_sending_and_the_message_appears() {
+        let mut app = demo_app();
+        app.open_selected();
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.focus == Focus::Thread);
+        // List keys are text while composing.
+        type_text(&mut app, "on it q r /");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        type_text(&mut app, "shipping");
+        assert!(app.overlay.is_none());
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(compose.text, "on it q r /\nshipping");
+        assert!(frame_text(&mut app).contains("MESSAGE"));
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Confirming);
+        assert!(frame_text(&mut app).contains("Send to Launch room as you?"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Editing);
+        assert!(app.threads["19:launch@thread.v2"].items.len() == 7);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.compose.is_none());
+        assert_eq!(app.notice.text, "Sent.");
+        let thread = &app.threads["19:launch@thread.v2"];
+        assert_eq!(thread.items.len(), 8);
+        assert_eq!(thread.items[0]["body"]["content"], "on it q r /\nshipping");
+        assert!(frame_text(&mut app).contains("shipping"));
+    }
+
+    #[test]
+    fn drafts_survive_closing_and_blank_ones_are_not_offered() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Editing);
+        type_text(&mut app, "draft");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_none());
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('c'));
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(compose.text, " drat");
+        assert_eq!(compose.cursor, compose.text.len());
+    }
+
+    #[test]
+    fn read_only_profiles_only_explain_how_to_send() {
+        let now: Zoned = "2026-10-13T10:15:00+02:00[Europe/Amsterdam]"
+            .parse()
+            .unwrap();
+        let source = Source::Live {
+            backend: Arc::new(TeamsBackend::Graph(crate::graph::GraphClient::new(
+                "fixture".into(),
+            ))),
+            profile: "fixture".into(),
+            can_send: false,
+        };
+        let mut app = App::new(source, Theme { color: false }, now.clone());
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&now)),
+        });
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.compose.is_none());
+        assert!(app.notice.text.contains("read-only"));
+        assert!(!frame_text(&mut app).contains("c reply"));
+    }
+
+    #[test]
+    fn reloads_keep_older_pages_only_when_the_fresh_page_overlaps() {
+        let ids = |items: &[Value]| -> Vec<String> {
+            items
+                .iter()
+                .map(|v| v["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let page =
+            |names: &[&str]| -> Vec<Value> { names.iter().map(|id| json!({"id": id})).collect() };
+        let old = page(&["c", "b", "a"]);
+        let (items, cursor) = merge_newest(
+            page(&["d", "c"]),
+            Some("new".into()),
+            old.clone(),
+            Some("old".into()),
+        );
+        assert_eq!(ids(&items), ["d", "c", "b", "a"]);
+        assert_eq!(cursor.as_deref(), Some("old"));
+        let (items, cursor) =
+            merge_newest(page(&["f", "e"]), Some("new".into()), old.clone(), None);
+        assert_eq!(ids(&items), ["f", "e"], "no overlap means a possible gap");
+        assert_eq!(cursor.as_deref(), Some("new"));
+        let (items, cursor) = merge_newest(page(&["d", "c"]), None, old, Some("old".into()));
+        assert_eq!(
+            ids(&items),
+            ["d", "c"],
+            "a complete page replaces everything"
+        );
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn drafts_wrap_and_track_the_cursor() {
+        assert_eq!(layout_draft("", 0, 10), (vec![String::new()], (0, 0)));
+        let (rows, at) = layout_draft("abcdef\ngh", 8, 4);
+        assert_eq!(rows, ["abcd", "ef", "gh"]);
+        assert_eq!(at, (2, 1));
+        assert_eq!(layout_draft("abcd", 4, 4).1, (0, 4));
+        assert_eq!(layout_draft("ab\n", 3, 4).1, (1, 0));
+        let (rows, at) = layout_draft("你好你", "你好".len(), 4);
+        assert_eq!(rows, ["你好", "你"]);
+        assert_eq!(at, (1, 0));
     }
 
     #[test]

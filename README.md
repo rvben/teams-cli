@@ -62,8 +62,10 @@ ChannelMessage.Send
 `teams` (or `teams tui`) opens a keyboard-first chat reader: recent chats on the
 left with unread markers, last-message previews and times, and the selected
 conversation on the right, grouped by day and sender. Reads run in the
-background and are cached per chat, so moving through the list never blocks.
-Narrow terminals show one pane at a time, and `NO_COLOR` is respected.
+background and are cached per chat, so moving through the list never blocks, and
+chats refresh on their own without losing your place: on the desktop backend the open
+chat every 3 seconds and the list every 15, on Graph every 15 seconds and every minute. Narrow terminals show one pane at a time, and
+`NO_COLOR` is respected.
 
 | Key | Action |
 | --- | --- |
@@ -73,11 +75,17 @@ Narrow terminals show one pane at a time, and `NO_COLOR` is respected.
 | `pgup`/`pgdn`, `g`/`G` | Page, or jump to the oldest/newest message |
 | `o` | Load older messages in the open chat |
 | `/` | Filter chats by name or last message |
-| `r` | Refresh |
+| `c` | Write a message in the open chat (`enter` to send, `ctrl-j` for a new line, `esc` to close and keep the draft) |
+| `r` | Refresh now |
 | `?` | Show every key |
 | `q` | Quit |
 
-The TUI is read-only and works with both the Graph and desktop backends.
+The TUI works with both the Graph and desktop backends. It sends only on a profile
+that allows writes (Graph without `read_only`, or desktop created with `--allow-send`),
+and only after you confirm the message with `y`; writability is checked again before
+every send. Like `messages send`, a send is never retried: if it fails, the draft is
+kept, the chat reloads so you can see whether it arrived, and nothing is resent until
+you confirm again. Drafts live in memory only.
 
 The TUI is also the recovery path: an unconfigured profile, missing credential,
 expired refresh session, or Microsoft `401` opens a focused connection screen.
@@ -189,8 +197,8 @@ next starts. The result has the Graph send shape plus `"source": "desktop"`,
 recognised without sending anything.
 
 Teams, channels, identity, subscriptions, replies, mentions, attachments and edits
-return `unsupported` on desktop; the TUI reads chats from the same cache and does not
-send. Existing profiles without a backend field
+return `unsupported` on desktop; the TUI reads chats from the same cache and sends
+through the same path as `messages send`. Existing profiles without a backend field
 continue to use Graph; Graph remains the default for `init`.
 
 The endpoint must already be enabled through an explicit Teams debugging launch.

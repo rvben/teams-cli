@@ -300,7 +300,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             ]);
             value
         },
-        json!({"name":"tui", "description":"Open the keyboard-first terminal interface", "effects":"read_only", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
+        json!({"name":"tui", "description":"Open the keyboard-first terminal interface; sends a chat message only after an explicit confirmation, on a profile that allows writes", "effects":"non_idempotent", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
         {
             let mut value = single(
                 "doctor",
@@ -353,7 +353,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         match command["name"].as_str().unwrap_or_default() {
             "tui" => {
                 command["extensions"]["desktop"] = json!(
-                    "Windows/WSL only; chats and chat messages from the Teams client's local cache"
+                    "Windows/WSL only; chats and chat messages from the Teams client's local cache; sending needs a profile created with --allow-send"
                 )
             }
             "chats list" | "messages list" => {

@@ -596,9 +596,12 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
         // `None` means the person already asked to sign in from inside the TUI.
         let connection_error = match client(profile_arg).await {
             Ok(backend) => {
+                let can_send = config::load(Some(&profile_name))
+                    .is_ok_and(|(_, profile)| profile.require_writable().is_ok());
                 let source = tui::Source::Live {
                     backend: std::sync::Arc::new(backend),
                     profile: profile_name.clone(),
+                    can_send,
                 };
                 match tokio::task::block_in_place(|| tui::run(source))? {
                     tui::TuiExit::Quit => return Ok(()),
