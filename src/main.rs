@@ -15,7 +15,7 @@ use teams_cli::desktop::{self, DesktopClient};
 use teams_cli::error::AppError;
 use teams_cli::graph::{self, Page};
 use teams_cli::output::{Output, OutputFormat, print_error, structured_from_args};
-use teams_cli::{schema, tui};
+use teams_cli::{render, schema, tui};
 
 #[tokio::main]
 async fn main() {
@@ -121,7 +121,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
         } => {
             let client = client(profile_arg).await?;
             let mut result = client.chats(page.limit, page.cursor.as_deref()).await?;
-            render_page(&mut result, &page, out)
+            render_conversation(&mut result, &page, out, render::chats)
         }
         Command::Messages {
             command:
@@ -142,7 +142,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                     page.cursor.as_deref(),
                 )
                 .await?;
-            render_page(&mut result, &page, out)
+            render_conversation(&mut result, &page, out, render::messages)
         }
         Command::Messages {
             command:
@@ -493,10 +493,15 @@ async fn client(profile_arg: Option<&str>) -> Result<TeamsBackend, AppError> {
     TeamsBackend::connect(profile_arg).await
 }
 
-fn render_page(page: &mut Page, args: &PageArgs, out: Output) -> Result<(), AppError> {
+fn render_conversation(
+    page: &mut Page,
+    args: &PageArgs,
+    out: Output,
+    text: fn(&Page, &render::View, &str) -> String,
+) -> Result<(), AppError> {
     graph::select_fields(page, args.fields.as_deref())?;
     let continuation = page.next_cursor.as_deref().unwrap_or("<cursor>");
-    render_page_text(page, out, "--cursor", continuation)
+    out.value(page, || text(page, &render::View::terminal(), continuation))
 }
 
 fn render_offset_page(page: &mut Page, args: &OffsetPageArgs, out: Output) -> Result<(), AppError> {

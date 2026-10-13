@@ -6,5 +6,6 @@ pub mod desktop;
 pub mod error;
 pub mod graph;
 pub mod output;
+pub mod render;
 pub mod schema;
 pub mod tui;
