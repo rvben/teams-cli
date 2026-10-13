@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Personal Teams desktop chat reads and plain-text sends on Windows and WSL, including personal/Skype profile names and signed-in user identity.
+
+### Fixed
+
+- Preserve personal identity namespaces and leave missing or conflicting viewer mappings unknown while keeping account caches isolated.
+
 ## [0.1.10-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.9-alpha.1...v0.1.10-alpha.1) - 2026-10-13
 
 ### Added

@@ -3,6 +3,39 @@ use predicates::prelude::*;
 use serde_json::Value;
 
 #[test]
+fn capabilities_scope_personal_accounts_to_the_desktop_backend() {
+    for command in ["capabilities", "schema"] {
+        let output = Command::cargo_bin("teams")
+            .unwrap()
+            .args(["--json", command])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let backends = if command == "schema" {
+            &value["extensions"]["backends"]
+        } else {
+            &value["backends"]
+        };
+        assert_eq!(
+            backends["desktop"]["account_types"],
+            serde_json::json!([
+                "Microsoft 365 work or school",
+                "personal Microsoft accounts"
+            ])
+        );
+        assert_eq!(
+            backends["desktop"]["account_selection"],
+            "single_account_only"
+        );
+        assert_eq!(
+            backends["graph"]["account_types"],
+            serde_json::json!(["Microsoft 365 work or school"])
+        );
+    }
+}
+
+#[test]
 fn schema_is_offline_and_clispec_v03_shaped() {
     let output = Command::cargo_bin("teams")
         .unwrap()

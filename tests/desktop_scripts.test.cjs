@@ -18,15 +18,26 @@ function request(value) {
   return result;
 }
 
+function cursor(records) {
+  const q = {};
+  let index = 0;
+  const next = () => queueMicrotask(() => {
+    q.result = index < records.length ? { value: records[index++], continue: next } : null;
+    q.onsuccess();
+  });
+  next();
+  return q;
+}
+
 function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = false } = {}) {
   const databases = new Map([
     [name('conversation-manager', 'account-a'), [conversation]],
     [name('replychain-manager', 'account-b'), [{ chat, messageMap: { b: { ...message, content: 'Wrong account' } } }]],
-    [name('profiles', 'account-b'), [{ id: '8:orgid:sender', displayName: 'Wrong Name' }]],
+    [name('profiles', 'account-b'), [{ mri: '8:orgid:sender', displayName: 'Wrong Name' }]],
   ]);
   if (!foreignOnly) {
     databases.set(name('replychain-manager', 'account-a'), [{ chat, messageMap: { a: message } }]);
-    databases.set(name('profiles', 'account-a'), [{ id: '8:orgid:sender', displayName: 'Correct Name' }]);
+    databases.set(name('profiles', 'account-a'), [{ mri: '8:orgid:sender', displayName: 'Correct Name' }]);
   }
   if (ambiguous) databases.set(name('conversation-manager', 'account-b'), [conversation]);
   const opened = [], mutations = [];
@@ -45,8 +56,9 @@ function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = fal
         assert.ok(databases.has(database), `Unknown database: ${database}`);
         opened.push(database);
         return request({ name: database, close() {}, transaction: () => ({ objectStore: () => ({
-          get: id => request(databases.get(database).find(record => record.id === id)),
+          get: id => request(databases.get(database).find(record => (record.mri || record.id) === id)),
           getAll: range => request(databases.get(database).filter(record => !range || record.chat === range.chat)),
+          openCursor: () => cursor(databases.get(database)),
         }) }) });
       },
     },
@@ -58,8 +70,8 @@ function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = fal
   const select = vm.runInContext(source('desktop_cache.js'), context);
   const read = vm.runInContext(source('desktop.js'), context);
   const send = vm.runInContext(source('desktop_send.js'), context);
-  return { opened, mutations, inspections: () => inspections,
-    read: params => read({ query: 'messages', chat, limit: 50, after: null, ...params }, select),
+  return { databases, opened, mutations, inspections: () => inspections,
+    read: params => read({ query: 'messages', chat, limit: 50, after: null, personal: false, ...params }, select),
     send: params => send({ chat, content: 'fixture', clientMessageId: '123456789012345678', ...params }, select) };
 }
 
@@ -70,6 +82,107 @@ test('messages and profile names come from the conversation account', async () =
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].body.content, message.content);
   assert.equal(result.items[0].from.user.displayName, 'Correct Name');
+  assert.ok(f.opened.every(database => database.endsWith(':account-a')));
+});
+
+function personalFixture() {
+  const f = fixture();
+  const me = '8:live:fixture-self', other = '8:fixture-recipient';
+  f.databases.set(name('conversation-manager', 'account-a'), [
+    { ...conversation, members: [{ id: me }, { id: other }], lastMessage: {
+      id: message.id, from: me, messagetype: 'Text', content: 'Preview',
+    } },
+    { id: '48:notes', type: 'StreamOfNotes', members: [{ id: me }] },
+  ]);
+  f.databases.set(name('profiles', 'account-a'), [
+    { mri: other, objectId: 'other-account', displayName: 'Recipient' },
+    { mri: me, objectId: 'account-a', displayName: 'Self' },
+  ]);
+  f.databases.set(name('replychain-manager', 'account-a'), [{ chat, messageMap: {
+    a: { ...message, creator: me },
+    b: { ...message, id: '1700000000001', creator: other, messageType: 'RichText/Html', content: '<p>Reply</p>' },
+  } }]);
+  return { ...f, me, other };
+}
+
+test('personal and legacy Skype member names and viewer use exact MRIs', async () => {
+  const f = personalFixture();
+  const result = await f.read({ query: 'chats', personal: true });
+  assert.equal(result.me, f.me);
+  const conversation = result.items.find(c => c.id === chat);
+  assert.equal(conversation.chatType, 'group'); // Preserve observed cache classification.
+  assert.equal(conversation.lastMessagePreview.from.user.id, f.me);
+  assert.equal(conversation.lastMessagePreview.from.user.displayName, 'Self');
+  assert.deepEqual(Array.from(conversation.members, m => [m.userId, m.displayName]),
+    [[f.me, 'Self'], [f.other, 'Recipient']]);
+  assert.equal(result.items.find(c => c.id === '48:notes').members[0].userId, f.me);
+  assert.ok(f.opened.every(database => database.endsWith(':account-a')));
+});
+
+test('personal messages retain sender identity, HTML, timestamps and stable pagination', async () => {
+  const f = personalFixture();
+  const first = await f.read({ personal: true, limit: 1 });
+  assert.equal(first.me, f.me);
+  assert.equal(first.items[0].from.user.id, f.me);
+  assert.equal(first.items[0].from.user.displayName, 'Self');
+  assert.equal(first.items[0].body.content, 'Use &amp; literally');
+  assert.equal(first.items[0].createdDateTime, '2023-11-14T22:13:20.000Z');
+  const second = await f.read({ personal: true, limit: 1, after: first.next });
+  assert.equal(second.items[0].from.user.id, f.other);
+  assert.equal(second.items[0].from.user.displayName, 'Recipient');
+  assert.equal(second.items[0].body.contentType, 'html');
+  assert.equal(second.items[0].body.content, '<p>Reply</p>');
+  assert.equal(second.next, null);
+});
+
+test('personal identity namespaces do not collide with Skype or work identities', async () => {
+  const f = personalFixture();
+  const ids = ['8:live:same', '8:same', 'same'];
+  f.databases.set(name('conversation-manager', 'account-a'), [{ ...conversation,
+    members: ids.map(id => ({ id: id === 'same' ? '8:orgid:same' : id })) }]);
+  f.databases.set(name('profiles', 'account-a'), ids.map((id, i) => ({
+    mri: id === 'same' ? '8:orgid:same' : id, displayName: `Name ${i}`,
+  })));
+  const result = await f.read({ query: 'chats', personal: true });
+  assert.deepEqual(Array.from(result.items[0].members, m => [m.userId, m.displayName]),
+    ids.map((id, i) => [id, `Name ${i}`]));
+  assert.equal(result.me, null);
+});
+
+test('missing personal profiles leave the viewer unknown and reads available', async () => {
+  const f = personalFixture();
+  f.databases.delete(name('profiles', 'account-a'));
+  const result = await f.read({ personal: true });
+  assert.equal(result.me, null);
+  assert.equal(result.items.length, 2);
+  assert.equal(result.items[0].from.user.id, f.me);
+  assert.equal(result.items[0].from.user.displayName, null);
+  assert.ok(f.opened.every(database => database.endsWith(':account-a')));
+});
+
+test('conflicting viewer mappings never pick an arbitrary cached profile', async () => {
+  const f = personalFixture();
+  f.databases.get(name('profiles', 'account-a')).push({
+    mri: '8:live:conflicting-self', objectId: 'account-a', displayName: 'Conflicting Self',
+  });
+  for (const personal of [false, true]) {
+    const result = await f.read({ personal });
+    assert.equal(result.me, null);
+    assert.equal(result.items.length, 2);
+  }
+});
+
+test('work viewer mapping keeps Graph object IDs and excludes foreign own profiles', async () => {
+  const f = fixture();
+  f.databases.get(name('profiles', 'account-b')).push({
+    mri: '8:live:foreign-self', objectId: 'account-a', displayName: 'Foreign Self',
+  });
+  assert.equal((await f.read()).me, 'account-a');
+  f.databases.get(name('profiles', 'account-a')).push({
+    mri: '8:orgid:account-a', objectId: 'account-a', displayName: 'Self',
+  });
+  assert.equal((await f.read()).me, 'account-a');
+  assert.equal((await f.read({ personal: true })).me, 'account-a');
   assert.ok(f.opened.every(database => database.endsWith(':account-a')));
 });
 

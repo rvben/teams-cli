@@ -40,7 +40,7 @@ pub fn messaging_unsupported() -> AppError {
 }
 
 fn account_selection_error() -> AppError {
-    AppError::Desktop("Multiple Teams account caches are available in this window; desktop account selection is not supported yet".into())
+    AppError::Desktop("Multiple Teams accounts are available on this endpoint; desktop account selection is not supported yet".into())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -968,7 +968,7 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         });
-        assert_eq!(scripts, ["9f76a3e5b60e", "b9d1fd2a4447", "3e837cc21336"]);
+        assert_eq!(scripts, ["b6a79262f320", "b9d1fd2a4447", "3e837cc21336"]);
     }
 
     #[test]

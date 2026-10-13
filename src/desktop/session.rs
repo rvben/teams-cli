@@ -17,7 +17,7 @@ const CACHE_SCRIPT: &str = include_str!("../desktop_cache.js");
 
 pub struct Session<S> {
     system: S,
-    page: Option<(u16, Cdp)>,
+    page: Option<(u16, Cdp, bool)>,
 }
 
 impl<S: System> Session<S> {
@@ -34,10 +34,9 @@ impl<S: System> Session<S> {
     /// Answers a read request with `{"error": code}` or `{"result": <evaluate result>}`.
     pub async fn read(&mut self, request: &Value) -> Result<Value, AppError> {
         let (port, params) = read_params(request)?;
-        let expression = format!("({READ_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)");
-        if let Some((connected, page)) = &mut self.page
+        if let Some((connected, page, personal)) = &mut self.page
             && *connected == port
-            && let Ok(result) = page.evaluate(&expression).await
+            && let Ok(result) = page.evaluate(&read_expression(&params, *personal)).await
         {
             return Ok(json!({"result": result}));
         }
@@ -49,15 +48,22 @@ impl<S: System> Session<S> {
         if metadata.status != ProbeStatus::MetadataOk {
             return Ok(refusal(metadata.status));
         }
-        let Some(target) = teams_pages(&targets).into_iter().next() else {
+        let candidates = match unambiguous_pages(&targets) {
+            Ok(pages) => pages,
+            Err(refused) => return Ok(refused),
+        };
+        let Some(target) = candidates.into_iter().next() else {
             return Ok(json!({"error": "no_target"}));
         };
-        let Ok(mut page) = Cdp::connect(port, target).await else {
+        let Ok(mut page) = Cdp::connect(port, target.id).await else {
             return Ok(json!({"error": "read_failed"}));
         };
-        match page.evaluate(&expression).await {
+        match page
+            .evaluate(&read_expression(&params, target.personal))
+            .await
+        {
             Ok(result) => {
-                self.page = Some((port, page));
+                self.page = Some((port, page, target.personal));
                 Ok(json!({"result": result}))
             }
             Err(_) => Ok(json!({"error": "read_failed"})),
@@ -102,13 +108,13 @@ impl<S: System> Session<S> {
         if metadata.status != ProbeStatus::MetadataOk {
             return Err(refusal(metadata.status));
         }
-        let candidates = teams_pages(&targets);
+        let candidates = unambiguous_pages(&targets)?;
         if candidates.is_empty() {
             return Err(json!({"error": "no_target"}));
         }
         let probe = format!("({SEND_SCRIPT})({{\"probe\":true}}).then(JSON.stringify)");
         for target in candidates {
-            let Ok(mut page) = Cdp::connect(port, target).await else {
+            let Ok(mut page) = Cdp::connect(port, target.id).await else {
                 continue;
             };
             let main = page
@@ -121,6 +127,12 @@ impl<S: System> Session<S> {
         }
         Err(json!({"error": "layout"}))
     }
+}
+
+fn read_expression(params: &Value, personal: bool) -> String {
+    let mut params = params.clone();
+    params["personal"] = json!(personal);
+    format!("({READ_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)")
 }
 
 /// Revalidates a send request and builds the page parameters; they reach the page only as
@@ -204,20 +216,44 @@ fn read_params(request: &Value) -> Result<(u16, Value), AppError> {
 
 /// The Teams pages in endpoint order; their ids become part of the socket path, so they
 /// are validated.
-fn teams_pages(targets: &[Value]) -> Vec<&str> {
+#[derive(Debug, PartialEq)]
+struct TeamsPage<'a> {
+    id: &'a str,
+    personal: bool,
+}
+
+fn teams_pages(targets: &[Value]) -> Vec<TeamsPage<'_>> {
     targets
         .iter()
         .filter_map(|target| {
-            let url = target["url"].as_str()?;
+            let url = url::Url::parse(target["url"].as_str()?).ok()?;
             let id = target["id"].as_str()?;
+            let host = url.host_str()?;
             (target["type"] == "page"
-                && (url.starts_with("https://teams.microsoft.com/")
-                    || url.starts_with("https://teams.cloud.microsoft/"))
+                && url.scheme() == "https"
+                && url.port_or_known_default() == Some(443)
+                && url.username().is_empty()
+                && url.password().is_none()
+                && matches!(
+                    host,
+                    "teams.microsoft.com" | "teams.cloud.microsoft" | "teams.live.com"
+                )
                 && (8..=64).contains(&id.len())
                 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then_some(id)
+            .then_some(TeamsPage {
+                id,
+                personal: host == "teams.live.com",
+            })
         })
         .collect()
+}
+
+fn unambiguous_pages(targets: &[Value]) -> Result<Vec<TeamsPage<'_>>, Value> {
+    let pages = teams_pages(targets);
+    if pages.iter().any(|page| page.personal) && pages.iter().any(|page| !page.personal) {
+        return Err(json!({"error": "account_ambiguous"}));
+    }
+    Ok(pages)
 }
 
 #[cfg(test)]
@@ -266,8 +302,105 @@ mod tests {
             json!({"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "../../x"}),
             json!({"type": "page", "url": "https://teams.cloud.microsoft/v2/", "id": "CCCCCCCC"}),
         ];
-        assert_eq!(teams_pages(&targets), ["CCCCCCCC"]);
+        assert_eq!(
+            teams_pages(&targets),
+            [TeamsPage {
+                id: "CCCCCCCC",
+                personal: false
+            }]
+        );
         assert!(teams_pages(&targets[..3]).is_empty());
+    }
+
+    #[test]
+    fn personal_pages_require_the_exact_secure_origin_and_safe_ids() {
+        let targets = [
+            json!({"type":"page","url":"https://teams.live.com/v2/","id":"AAAAAAAA"}),
+            json!({"type":"page","url":"https://teams.live.com:443","id":"BBBBBBBB"}),
+            json!({"type":"page","url":"https://teams.live.com.evil.example/v2/","id":"CCCCCCCC"}),
+            json!({"type":"page","url":"http://teams.live.com/v2/","id":"DDDDDDDD"}),
+            json!({"type":"page","url":"https://teams.live.com:444/v2/","id":"EEEEEEEE"}),
+            json!({"type":"page","url":"https://teams.live.com@evil.example/v2/","id":"FFFFFFFF"}),
+            json!({"type":"page","url":"https://evil.example@teams.live.com/v2/","id":"11111111"}),
+            json!({"type":"page","url":"https://teams.live.com/v2/","id":"../../x"}),
+            json!({"type":"service_worker","url":"https://teams.live.com/v2/","id":"22222222"}),
+        ];
+        assert_eq!(
+            teams_pages(&targets),
+            [
+                TeamsPage {
+                    id: "AAAAAAAA",
+                    personal: true
+                },
+                TeamsPage {
+                    id: "BBBBBBBB",
+                    personal: true
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn personal_reads_keep_the_identity_context_when_reusing_the_page() {
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let counter = evaluations.clone();
+        let port = devtools_server(
+            json!([{"type":"page","url":"https://teams.live.com/v2/","id":"ABCDEF12"}]),
+            move |request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    request["params"]["expression"]
+                        .as_str()
+                        .unwrap()
+                        .contains(r#""personal":true"#)
+                );
+                Some(
+                    json!({"id":request["id"],"result":{"result":{"type":"string","value":"{}"}}})
+                        .to_string(),
+                )
+            },
+        )
+        .await;
+        let mut session = Session::new(FakeSystem::teams());
+        for _ in 0..2 {
+            assert_eq!(
+                session
+                    .read(&read_request(port, None, 5, None).unwrap())
+                    .await
+                    .unwrap()["result"]["result"]["value"],
+                "{}"
+            );
+        }
+        assert_eq!(evaluations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mixed_personal_and_work_pages_are_refused_before_evaluation() {
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let counter = evaluations.clone();
+        let port = devtools_server(
+            json!([
+                {"type":"page","url":"https://teams.live.com/v2/","id":"AAAAAAAA"},
+                {"type":"page","url":"https://teams.microsoft.com/v2/","id":"BBBBBBBB"},
+            ]),
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+        )
+        .await;
+        let mut session = Session::new(FakeSystem::teams());
+        let refused = json!({"error":"account_ambiguous"});
+        assert_eq!(
+            session
+                .read(&read_request(port, None, 5, None).unwrap())
+                .await
+                .unwrap(),
+            refused
+        );
+        assert_eq!(session.send_check(port).await.unwrap(), refused);
+        assert_eq!(session.send(&send_request(port)).await.unwrap(), refused);
+        assert_eq!(evaluations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -347,12 +480,12 @@ mod tests {
     }
 
     /// Three Teams pages; only the second hosts the send client. Counts send evaluations.
-    async fn teams_window(sends: Arc<AtomicUsize>, answer_send: bool) -> u16 {
+    async fn teams_window(sends: Arc<AtomicUsize>, answer_send: bool, origin: &str) -> u16 {
         devtools_server(
             json!([
-                {"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "AAAAAAAA"},
-                {"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "BBBBBBBB"},
-                {"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "CCCCCCCC"},
+                {"type": "page", "url": format!("{origin}/v2/"), "id": "AAAAAAAA"},
+                {"type": "page", "url": format!("{origin}/v2/"), "id": "BBBBBBBB"},
+                {"type": "page", "url": format!("{origin}/v2/"), "id": "CCCCCCCC"},
             ]),
             move |request| {
                 let expression = request["params"]["expression"].as_str().unwrap();
@@ -380,24 +513,26 @@ mod tests {
 
     #[tokio::test]
     async fn sends_go_to_the_window_with_the_client_and_run_once() {
-        let sends = Arc::new(AtomicUsize::new(0));
-        let port = teams_window(sends.clone(), true).await;
-        let session = Session::new(FakeSystem::teams());
-        assert_eq!(session.send_check(port).await.unwrap(), json!({"ok": true}));
-        sends.store(0, Ordering::SeqCst);
-        let reply = session.send(&send_request(port)).await.unwrap();
-        assert_eq!(
-            reply["result"]["result"]["value"],
-            r#"{"id":"1700000000000"}"#
-        );
-        // Two probes (the first page is not the window), then one send.
-        assert_eq!(sends.load(Ordering::SeqCst), 2001);
+        for origin in ["https://teams.microsoft.com", "https://teams.live.com"] {
+            let sends = Arc::new(AtomicUsize::new(0));
+            let port = teams_window(sends.clone(), true, origin).await;
+            let session = Session::new(FakeSystem::teams());
+            assert_eq!(session.send_check(port).await.unwrap(), json!({"ok": true}));
+            sends.store(0, Ordering::SeqCst);
+            let reply = session.send(&send_request(port)).await.unwrap();
+            assert_eq!(
+                reply["result"]["result"]["value"],
+                r#"{"id":"1700000000000"}"#
+            );
+            // Two probes (the first page is not the window), then one send.
+            assert_eq!(sends.load(Ordering::SeqCst), 2001);
+        }
     }
 
     #[tokio::test]
     async fn a_lost_send_answer_is_unconfirmed_and_not_retried() {
         let sends = Arc::new(AtomicUsize::new(0));
-        let port = teams_window(sends.clone(), false).await;
+        let port = teams_window(sends.clone(), false, "https://teams.microsoft.com").await;
         let session = Session::new(FakeSystem::teams());
         assert_eq!(
             session.send(&send_request(port)).await.unwrap(),
@@ -413,7 +548,7 @@ mod tests {
             ..FakeSystem::teams()
         });
         let sends = Arc::new(AtomicUsize::new(0));
-        let port = teams_window(sends.clone(), true).await;
+        let port = teams_window(sends.clone(), true, "https://teams.microsoft.com").await;
         assert_eq!(
             untrusted.send(&send_request(port)).await.unwrap(),
             json!({"error": "non_teams_listener_refused"})

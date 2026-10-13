@@ -288,7 +288,8 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         eprintln!("\n  teams\n  Microsoft Teams, without leaving your flow.\n");
         eprintln!("  We’ll open Microsoft sign-in in your browser.");
         eprintln!("  No password or client secret is shared with teams-cli.");
-        eprintln!("  Work or school accounts are supported; personal accounts are not.\n");
+        eprintln!("  Graph supports work or school accounts.");
+        eprintln!("  For a personal account on Windows/WSL, use `teams init --backend desktop`.\n");
     }
     let client_id = args
         .client_id
@@ -1036,13 +1037,13 @@ fn doctor_report(
 fn capabilities(out: Output) -> Result<(), AppError> {
     let value = serde_json::json!({
         "supported":["delegated work/school sign-in","identity","joined teams","channels","chats","chat messages","channel messages","send messages","TUI"],
-        "unsupported":["personal Microsoft accounts","user calls and screen sharing","private Teams protocols","tenant administration"],
-        "account_types":["Microsoft 365 work or school"],
+        "unsupported":["personal Microsoft accounts through Graph","user calls and screen sharing","private Teams protocols","tenant administration"],
+        "account_types":["Microsoft 365 work or school","personal Microsoft accounts (desktop on Windows/WSL)"],
         "api":"Microsoft Graph v1.0",
         "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL also chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI works on both.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL, personal and work/school accounts also support chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI works on both.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
 }
 
 /// Desktop sends act through the user's own Teams window, so each one is confirmed at the

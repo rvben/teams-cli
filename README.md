@@ -166,7 +166,7 @@ Like the other tools in the suite, the config file is selected with `--profile`,
 
 Use a desktop profile to inspect an existing Teams debugging endpoint on macOS,
 Windows, or WSL, and to read chats (and, if you opt in, send chat messages) on
-Windows or WSL:
+Windows or WSL with a signed-in personal Microsoft account or a work/school account:
 
 ```console
 teams init --profile local --backend desktop --read-only --no-login
@@ -179,7 +179,7 @@ teams init --profile local --backend desktop --desktop-port 19222 --no-login
 teams --profile local chats list --limit 20
 teams --profile local messages list --chat '19:...@thread.v2'
 # Windows/WSL: opt in to sending plain-text chat messages
-teams init --profile local --backend desktop --allow-send --no-login
+teams init --profile local --backend desktop --desktop-port 19222 --allow-send --no-login
 teams --profile local messages send --chat '19:...@thread.v2' --body 'On my way'
 ```
 
@@ -187,10 +187,14 @@ On Windows and WSL, `chats list` and `messages list --chat` read from the runnin
 Teams client's local cache: the helper evaluates one fixed, read-only script in the
 Teams page and returns projected fields (ids, topics, members, last-message previews,
 read state, timestamps, senders, bodies), never tokens or raw records. Member and sender
-names come from Teams' cached profiles, so 1:1 chats show the other person's name. Pages use the same shape and opaque `--cursor` as Graph
+names come from the matching account's cached profiles. The signed-in user's identity
+is resolved from that same cache; if a personal profile is missing or conflicting,
+the viewer stays unknown rather than guessing. Personal and legacy Skype user ids
+retain their `8:live:` or `8:` prefixes. Pages use the same shape and opaque `--cursor` as Graph
 and add `"source": "desktop_cache"`. The cache only holds what Teams has synced, so
-older history in a chat you never scrolled back through can be missing. Chat ids are
-the same as Graph's; the chat with yourself is listed too, with the id `48:notes`, so
+older history in a chat you never scrolled back through can be missing. Use the chat
+ids returned by `chats list`; personal chats are accessed through the desktop backend.
+The chat with yourself is listed too, with the id `48:notes`, so
 you can try sending there first. On macOS these commands return `unsupported`.
 
 Desktop profiles are read-only unless created with `init --allow-send`;
@@ -243,7 +247,8 @@ the first Teams-origin page over the same verified loopback port and keep that
 connection open; if it drops, the listener is verified again before the next read.
 Related cache databases are selected for the same account. If a window exposes
 several conversation-account caches, reads and sends refuse with a desktop error;
-selecting among those accounts is not supported yet.
+selecting among those accounts is not supported yet. An endpoint exposing both
+personal and work/school Teams pages is also refused rather than choosing an account.
 
 On first use under WSL, the helper is downloaded from the matching GitHub release,
 checked against the release's `SHA256SUMS`, and cached in
@@ -285,7 +290,7 @@ fails with `desktop_error` rather than guessing.
 
 ## Graph boundaries
 
-- Microsoft 365 work or school accounts only. The relevant Teams Graph endpoints do not support personal Microsoft accounts.
+- The Graph backend supports Microsoft 365 work or school accounts only. Use the experimental desktop backend on Windows or WSL for personal Microsoft accounts; the relevant Teams Graph endpoints do not support them.
 - A work account can authenticate successfully before Microsoft Teams is licensed or provisioned; `teams doctor` distinguishes identity access from Teams availability.
 - Calling and screen sharing are not available as a delegated user CLI; Graph calling is built around bot/application scenarios.
 - No extracted desktop tokens, browser interception, or direct calls to private Teams services; the experimental desktop backend reads the local client cache and sends only through the Teams window's own client.

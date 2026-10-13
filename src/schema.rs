@@ -620,6 +620,7 @@ pub fn backend_capabilities() -> Value {
     json!({
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
         "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl"],
+            "account_types":["Microsoft 365 work or school","personal Microsoft accounts"],"account_selection":"single_account_only",
             "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (windows, wsl)","chat messages (windows, wsl)","send plain-text chat messages (windows, wsl; opt-in)","TUI (windows, wsl)"],
             "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","automatic Teams launch or restart"],
             "requires":"existing Teams-owned loopback debugging endpoint; WSL requires Windows executable interop",
