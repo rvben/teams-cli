@@ -162,7 +162,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                 (BackendKind::Desktop, Some(chat)) => {
                     desktop::check_chat(chat)?;
                     if !(yes || io::stdin().is_terminal() && io::stderr().is_terminal()) {
-                        return Err(AppError::NonInteractive(
+                        return Err(AppError::ConfirmationRequired(
                             "desktop sends need confirmation; pass --yes when not running in a terminal"
                                 .into(),
                         ));
@@ -504,7 +504,7 @@ fn profile_command(command: ProfileCommand, yes: bool, out: Output) -> Result<()
         }
         ProfileCommand::Remove { name } => {
             if !yes {
-                return Err(AppError::InvalidInput(
+                return Err(AppError::ConfirmationRequired(
                     "profile removal requires --yes".into(),
                 ));
             }
@@ -992,7 +992,7 @@ fn capabilities(out: Output) -> Result<(), AppError> {
         "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL also chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`.\n\nNot supported\n  Desktop teams, channels, replies, attachments and live TUI; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL also chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI works on both.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
 }
 
 /// Desktop sends act through the user's own Teams window, so each one is confirmed at the
@@ -1011,7 +1011,9 @@ fn confirm_desktop_send(chat: &str, body: &str) -> Result<(), AppError> {
     if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         Ok(())
     } else {
-        Err(AppError::InvalidInput("send cancelled".into()))
+        Err(AppError::ConfirmationRequired(
+            "send cancelled; nothing was sent".into(),
+        ))
     }
 }
 

@@ -20,6 +20,10 @@ pub enum AppError {
     #[error("{0}")]
     NonInteractive(String),
     #[error("{0}")]
+    ConfirmationRequired(String),
+    #[error("{0}")]
+    Unconfirmed(String),
+    #[error("{0}")]
     Unsupported(String),
     #[error("{0}")]
     Desktop(String),
@@ -81,6 +85,18 @@ pub const NON_INTERACTIVE: ErrorContract = ErrorContract {
     retryable: false,
     description: "An interactive command was invoked without a terminal",
 };
+pub const CONFIRMATION_REQUIRED: ErrorContract = ErrorContract {
+    kind: "confirmation_required",
+    exit_code: 2,
+    retryable: false,
+    description: "The operation needs confirmation: answer the prompt in a terminal, or pass --yes",
+};
+pub const UNCONFIRMED: ErrorContract = ErrorContract {
+    kind: "unconfirmed",
+    exit_code: 8,
+    retryable: false,
+    description: "A send may have been delivered but was not confirmed; check the conversation before sending again",
+};
 pub const UNEXPECTED: ErrorContract = ErrorContract {
     kind: "unexpected_error",
     exit_code: 1,
@@ -123,6 +139,8 @@ pub const ALL: &[ErrorContract] = &[
     RATE_LIMIT,
     API,
     NON_INTERACTIVE,
+    CONFIRMATION_REQUIRED,
+    UNCONFIRMED,
     UNEXPECTED,
     UNSUPPORTED,
     DESKTOP,
@@ -140,6 +158,8 @@ impl AppError {
             Self::RateLimit(_) => RATE_LIMIT,
             Self::Api(_) => API,
             Self::NonInteractive(_) => NON_INTERACTIVE,
+            Self::ConfirmationRequired(_) => CONFIRMATION_REQUIRED,
+            Self::Unconfirmed(_) => UNCONFIRMED,
             Self::Unsupported(_) => UNSUPPORTED,
             Self::Desktop(_) => DESKTOP,
             Self::Unhealthy(_) => UNHEALTHY,

@@ -57,13 +57,16 @@ pub fn print_error(error: &AppError, structured: bool) {
     }
     let contract = error.contract();
     if structured {
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "error": {
                 "kind": contract.kind,
                 "message": error.to_string(),
                 "retryable": contract.retryable,
             }
         });
+        if let AppError::RateLimit(Some(seconds)) = error {
+            envelope["error"]["retry_after_seconds"] = (*seconds).into();
+        }
         eprintln!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| r#"{"error":{"kind":"unexpected_error","message":"error serialization failed","retryable":false}}"#.into()));
     }
 }

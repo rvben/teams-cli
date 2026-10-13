@@ -126,8 +126,23 @@ impl GraphClient {
             .json(&serde_json::json!({"body": {"contentType": "text", "content": body}}))
             .send()
             .await
-            .map_err(|e| AppError::Unexpected(format!("Microsoft Graph is unreachable: {e}")))?;
-        self.response_value(response).await
+            .map_err(|e| {
+                if e.is_connect() || e.is_builder() {
+                    AppError::Unexpected(format!("Microsoft Graph is unreachable: {e}"))
+                } else {
+                    unconfirmed()
+                }
+            })?;
+        // Once the request has left, a server fault or an unreadable answer can hide a
+        // delivered message; never let a caller treat that as safe to resend.
+        if matches!(response.status().as_u16(), 500 | 502 | 504) {
+            return Err(unconfirmed());
+        }
+        self.checked(response)
+            .await?
+            .json()
+            .await
+            .map_err(|_| unconfirmed())
     }
 
     async fn get_value(&self, url: &str) -> Result<Value, AppError> {
@@ -263,6 +278,12 @@ impl GraphClient {
             _ => Err(AppError::Api(format!("{message} ({status})"))),
         }
     }
+}
+
+fn unconfirmed() -> AppError {
+    AppError::Unconfirmed(
+        "Microsoft Graph did not confirm the message; it may still be delivered. Check the conversation before sending again".into(),
+    )
 }
 
 fn permission_error(message: &str) -> AppError {

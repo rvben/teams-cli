@@ -212,7 +212,7 @@ fn desktop_sends_are_refused_before_reading_stdin() {
     );
     assert_eq!(
         refused_send(&temp, CHAT, None)["error"]["kind"],
-        "tty_required",
+        "confirmation_required",
         "without a terminal a desktop send needs --yes"
     );
 }

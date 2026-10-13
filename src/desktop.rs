@@ -330,7 +330,7 @@ fn send_request(port: u16, chat: &str, body: &str) -> Result<Value, AppError> {
 fn send_error(code: &str) -> AppError {
     match code {
         "not_found" => AppError::NotFound("chat not found in the Teams desktop cache".into()),
-        "unconfirmed" => AppError::Desktop(
+        "unconfirmed" => AppError::Unconfirmed(
             "Teams did not confirm the message; it may still be delivered. Check the chat before sending again".into(),
         ),
         "layout" => AppError::Desktop(
