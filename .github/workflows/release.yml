@@ -22,9 +22,12 @@ jobs:
   version:
     name: Verify release version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Match tag to package version
+        id: version
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -40,6 +43,7 @@ jobs:
             test "$GITHUB_REF_TYPE" = "tag"
             test "v${version}" = "$GITHUB_REF_NAME"
           fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
   verify:
     uses: ./.github/workflows/ci.yml
@@ -81,12 +85,23 @@ jobs:
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package binary
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/package/
           cp README.md LICENSE CHANGELOG.md dist/package/
-          tar -C dist/package -czf "dist/teams-cli-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" .
+          tar -C dist/package -czf "dist/teams-cli-v${RELEASE_VERSION}-${{ matrix.target }}.tar.gz" .
           rm -rf dist/package
+      - name: Smoke test packaged binary
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          smoke="${RUNNER_TEMP}/teams-binary-smoke"
+          mkdir -p "$smoke"
+          tar -xzf "dist/teams-cli-v${RELEASE_VERSION}-${{ matrix.target }}.tar.gz" -C "$smoke"
+          python scripts/smoke-release.py "$smoke/${{ matrix.binary }}" "$RELEASE_VERSION"
       - name: Attest build provenance
         if: ${{ inputs.dry_run != true }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -206,7 +221,13 @@ jobs:
         if: ${{ inputs.dry_run != true }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        shell: bash
+        run: |
+          args=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes "${args[@]}"
 
   crates-io:
     name: Publish crates.io
