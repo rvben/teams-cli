@@ -338,8 +338,53 @@ pub fn platform() -> Result<&'static str, AppError> {
 
 pub fn powershell() -> Result<PathBuf, AppError> {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|p| p.join("powershell.exe")).find(|p| p.is_file())
-        .ok_or_else(|| AppError::Desktop("powershell.exe was not found on PATH; enable Windows executable interop when using WSL".into()))
+        .map(|p| p.join("powershell.exe"))
+        .chain(standard_powershell())
+        .find(|p| p.is_file())
+        .ok_or_else(|| AppError::Desktop("powershell.exe was not found on PATH or in the standard Windows location; enable Windows executable interop when using WSL".into()))
+}
+
+/// Where Windows installs PowerShell, for shells whose PATH omits Windows
+/// directories (for example WSL with `appendWindowsPath = false`).
+fn standard_powershell() -> Option<PathBuf> {
+    const RELATIVE: &str = "System32/WindowsPowerShell/v1.0/powershell.exe";
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot")?;
+        Some(PathBuf::from(root).join(RELATIVE))
+    } else if platform().ok()? == "wsl_windows_helper" {
+        let conf = std::fs::read_to_string("/etc/wsl.conf").unwrap_or_default();
+        Some(
+            PathBuf::from(wsl_mount_root(&conf))
+                .join("c/Windows")
+                .join(RELATIVE),
+        )
+    } else {
+        None
+    }
+}
+
+/// The `[automount] root` from wsl.conf, defaulting to `/mnt/`.
+fn wsl_mount_root(conf: &str) -> String {
+    let mut section = "";
+    for line in conf.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim();
+        } else if section.eq_ignore_ascii_case("automount")
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "root"
+        {
+            let root = value
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches('"');
+            if !root.is_empty() {
+                return format!("{}/", root.trim_end_matches('/'));
+            }
+        }
+    }
+    "/mnt/".into()
 }
 
 pub fn local_prerequisites() -> Result<&'static str, AppError> {
@@ -639,6 +684,20 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    #[test]
+    fn wsl_mount_root_reads_automount_section() {
+        assert_eq!(wsl_mount_root(""), "/mnt/");
+        assert_eq!(wsl_mount_root("[boot]\nsystemd=true\n"), "/mnt/");
+        assert_eq!(
+            wsl_mount_root("[network]\nroot = /x\n[automount]\nroot = /\n"),
+            "/"
+        );
+        assert_eq!(
+            wsl_mount_root("[automount]\nenabled=true\nroot=\"/win\" # drives\n"),
+            "/win/"
+        );
+    }
 
     #[test]
     fn read_requests_validate_chat_ids_and_cursors() {
