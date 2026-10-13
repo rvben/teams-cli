@@ -64,6 +64,51 @@ fn schema_is_offline_and_clispec_v03_shaped() {
 }
 
 #[test]
+fn schema_validates_against_the_official_clispec_v03_schema() {
+    let official: Value = serde_json::from_str(include_str!("fixtures/clispec-v0.3.json")).unwrap();
+    let validator = jsonschema::validator_for(&official).unwrap();
+    let schema = |args: &[&str]| -> Value {
+        let output = Command::cargo_bin("teams")
+            .unwrap()
+            .arg("schema")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let full = schema(&[]);
+    if let Err(error) = validator.validate(&full) {
+        panic!("{error} at {}", error.instance_path());
+    }
+    let kinds: Vec<&str> = full["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    let globals: Vec<&str> = full["global_args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
+    for command in full["commands"].as_array().unwrap() {
+        let name = command["name"].as_str().unwrap();
+        assert!(validator.is_valid(&schema(&["--command", name])), "{name}");
+        for kind in command["errors"].as_array().unwrap() {
+            assert!(kinds.contains(&kind.as_str().unwrap()), "{name}: {kind}");
+        }
+        if let Some(bypass) = command["confirmation_bypass_arg"].as_str() {
+            assert!(globals.contains(&bypass), "{name}");
+        }
+        let example = command["example"]["args"].as_array().unwrap();
+        let words: Vec<&str> = example.iter().map(|a| a.as_str().unwrap()).collect();
+        assert_eq!(words[..name.split(' ').count()].join(" "), name);
+    }
+}
+
+#[test]
 fn schema_can_select_one_command() {
     Command::cargo_bin("teams")
         .unwrap()
@@ -218,6 +263,8 @@ fn suite_exit_codes_and_error_kinds_are_stable() {
     assert_eq!(code("rate_limit"), 6);
     assert_eq!(code("read_only"), 2);
     assert_eq!(code("unhealthy"), 7);
+    assert_eq!(code("unconfirmed"), 8);
+    assert_eq!(code("confirmation_required"), 2);
 }
 
 #[test]

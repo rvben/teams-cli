@@ -190,7 +190,8 @@ request with its own sign-in, and nothing is shown or clicked in its window. Eac
 asks for confirmation on a terminal and requires `--yes` otherwise. The listener is
 verified again and a fresh connection to the Teams main window is used for every send,
 and a send is never retried: if Teams does not answer, the command reports that the
-message may still be delivered, so check the chat before sending again. Teams queues
+message may still be delivered (error kind `unconfirmed`, exit code 8), so check the chat
+before sending again. Teams queues
 the message like any other, so a send made just before Teams closes goes out when Teams
 next starts. The result has the Graph send shape plus `"source": "desktop"`,
 `clientMessageId` and Teams' own `status`. `doctor` checks that the send path is still
@@ -259,6 +260,15 @@ fails with `desktop_error` rather than guessing.
 ## CLI Spec
 
 `teams schema` is offline, unauthenticated, and follows [CLI Spec v0.3](https://clispec.dev/): flat invocable command paths, declared effects and cardinality, bounded collections, stable error kinds and exit codes, stdout/stderr separation, and safe noninteractive behavior. Its backend capabilities and per-command backend extensions distinguish Graph operations from the experimental desktop backend.
+
+For agents, each command declares the error kinds it can return, an example invocation, its output fields (nested where useful), argument defaults and limits, and the environment variables that affect it; `teams schema` validates against the official v0.3 JSON Schema in the test suite. Two error kinds matter most for writes:
+
+| Kind | Exit | Meaning |
+| --- | --- | --- |
+| `confirmation_required` | 2 | The command needs confirmation; it prompts on a terminal, otherwise pass `--yes`. Nothing was done. |
+| `unconfirmed` | 8 | A send may have been delivered but was not confirmed (Graph server fault or lost answer, or Teams did not answer). Read the conversation before sending again; never retry blindly. |
+
+`rate_limit` errors include `retry_after_seconds` when Microsoft provides it. Sends cannot be made idempotent, because neither Graph nor Teams accepts a caller-supplied key.
 
 ## Releasing
 
