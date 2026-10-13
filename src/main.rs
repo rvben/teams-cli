@@ -812,16 +812,10 @@ async fn doctor(profile_arg: Option<&str>, offline: bool, out: Output) -> Result
         },
         detail: teams_detail,
     });
-    let healthy = checks.iter().all(|check| check.status != "fail");
+    let healthy = is_healthy(&checks);
     let value =
         serde_json::json!({"backend":"graph","checks":checks,"healthy":healthy,"offline":offline});
-    out.value(&value, || {
-        checks
-            .iter()
-            .map(|check| format!("{:<18} {:<4}  {}", check.name, check.status, check.detail))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
+    doctor_report(&value, &checks, out)
 }
 
 async fn desktop_doctor(
@@ -894,17 +888,40 @@ async fn desktop_doctor(
         status: "unverified",
         detail: "sign-in, chat and message access have not been implemented or verified".into(),
     });
-    let healthy = checks.iter().all(|c| c.status != "fail");
+    let healthy = is_healthy(&checks);
     let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"healthy":healthy,"offline":offline,
         "endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),"session_verified":false,"signed_in":null,
         "desktop_port":profile.desktop_port,"connection":connection,"checks":checks});
-    out.value(&value, || {
+    doctor_report(&value, &checks, out)
+}
+
+fn is_healthy(checks: &[Check]) -> bool {
+    checks.iter().all(|check| check.status != "fail")
+}
+
+/// Prints the full report, then fails with `unhealthy` so scripts can rely on the exit code.
+fn doctor_report(value: &Value, checks: &[Check], out: Output) -> Result<(), AppError> {
+    let width = checks.iter().map(|c| c.status.len()).max().unwrap_or(0);
+    out.value(value, || {
         checks
             .iter()
-            .map(|c| format!("{:<18} {:<10} {}", c.name, c.status, c.detail))
+            .map(|c| format!("{:<18} {:<width$}  {}", c.name, c.status, c.detail))
             .collect::<Vec<_>>()
             .join("\n")
-    })
+    })?;
+    let failed: Vec<_> = checks
+        .iter()
+        .filter(|c| c.status == "fail")
+        .map(|c| c.name)
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Unhealthy(format!(
+            "doctor found failing checks: {}",
+            failed.join(", ")
+        )))
+    }
 }
 
 fn capabilities(out: Output) -> Result<(), AppError> {

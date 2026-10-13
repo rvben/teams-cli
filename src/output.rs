@@ -51,7 +51,9 @@ impl Output {
 pub fn print_error(error: &AppError, structured: bool) {
     if !structured {
         eprintln!("Error: {error}");
-        eprintln!("Hint: run `teams doctor` for a guided diagnosis.");
+        if !matches!(error, AppError::Unhealthy(_)) {
+            eprintln!("Hint: run `teams doctor` for a guided diagnosis.");
+        }
     }
     let contract = error.contract();
     if structured {

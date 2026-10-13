@@ -24,6 +24,8 @@ pub enum AppError {
     #[error("{0}")]
     Desktop(String),
     #[error("{0}")]
+    Unhealthy(String),
+    #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Unexpected(String),
@@ -105,6 +107,13 @@ pub const DESKTOP: ErrorContract = ErrorContract {
     description: "Desktop connection diagnostics could not complete",
 };
 
+pub const UNHEALTHY: ErrorContract = ErrorContract {
+    kind: "unhealthy",
+    exit_code: 7,
+    retryable: false,
+    description: "Diagnostics completed and at least one check failed",
+};
+
 pub const ALL: &[ErrorContract] = &[
     INVALID_INPUT,
     AUTH,
@@ -117,6 +126,7 @@ pub const ALL: &[ErrorContract] = &[
     UNEXPECTED,
     UNSUPPORTED,
     DESKTOP,
+    UNHEALTHY,
 ];
 
 impl AppError {
@@ -132,6 +142,7 @@ impl AppError {
             Self::NonInteractive(_) => NON_INTERACTIVE,
             Self::Unsupported(_) => UNSUPPORTED,
             Self::Desktop(_) => DESKTOP,
+            Self::Unhealthy(_) => UNHEALTHY,
             Self::Io(_) | Self::Unexpected(_) => UNEXPECTED,
         }
     }

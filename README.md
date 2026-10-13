@@ -159,7 +159,8 @@ Results omit titles, full URLs, target IDs, WebSocket URLs and private origins.
 Endpoint discovery does not verify sign-in: `signed_in` stays `null`, `verified`
 and `session_verified` stay `false`, and `endpoint_available` describes metadata
 access only. `doctor.healthy` means the requested diagnostic checks passed; it does
-not imply that desktop messaging works. Offline commands do not contact the
+not imply that desktop messaging works. When any check fails, `doctor` still prints
+the full report and then exits with code 7 (`unhealthy`). Offline commands do not contact the
 endpoint. Desktop profiles ignore Graph OAuth environment settings and credentials;
 `auth login`/`logout` return `unsupported` because Teams owns its session.
 A CLI profile selects connection configuration, not a Teams account. There is no

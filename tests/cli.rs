@@ -217,6 +217,41 @@ fn suite_exit_codes_and_error_kinds_are_stable() {
     assert_eq!(code("api_error"), 5);
     assert_eq!(code("rate_limit"), 6);
     assert_eq!(code("read_only"), 2);
+    assert_eq!(code("unhealthy"), 7);
+}
+
+#[test]
+fn doctor_reports_failing_checks_and_exits_unhealthy() {
+    let temp = tempfile::tempdir().unwrap();
+    let teams = || {
+        let mut command = Command::cargo_bin("teams").unwrap();
+        command
+            .env("XDG_CONFIG_HOME", temp.path())
+            .env_remove("TEAMS_PROFILE")
+            .env_remove("TEAMS_ACCESS_TOKEN");
+        command
+    };
+    teams().args(["init", "--no-login"]).assert().success();
+
+    let output = teams().args(["doctor", "--offline"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["healthy"], false);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("\"kind\":\"unhealthy\""));
+    assert!(stderr.contains("credential_store"));
+
+    teams()
+        .args(["--output", "text", "doctor", "--offline"])
+        .assert()
+        .code(7)
+        .stdout(predicate::str::contains(
+            "channel_history    optional  optional;",
+        ))
+        .stdout(predicate::str::contains(
+            "credential_store   fail      run `teams auth login`",
+        ))
+        .stderr(predicate::str::contains("Hint:").not());
 }
 
 #[test]
