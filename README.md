@@ -80,6 +80,11 @@ chat every 3 seconds and the list every 15, on Graph every 15 seconds and every 
 | `?` | Show every key |
 | `q` | Quit |
 
+The mouse works too: the wheel scrolls whichever pane is under the pointer (older
+messages load when you scroll past the top of a chat), and a click opens a chat or
+focuses the conversation. Because the reader captures the mouse, hold `shift` while
+dragging to select text in most terminals.
+
 The TUI works with both the Graph and desktop backends. It sends only on a profile
 that allows writes (Graph without `read_only`, or desktop created with `--allow-send`),
 and only after you confirm the message with `y`; writability is checked again before

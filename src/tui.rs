@@ -10,7 +10,10 @@ use std::io::{self, IsTerminal};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -44,13 +47,16 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const SPLIT_WIDTH: u16 = 80;
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 14;
-/// How often a live session quietly reloads; the desktop cache is local, Graph is not.
 /// How often a live session re-reads the open chat and the chat list. Desktop reads come
 /// from the local cache, so they can be frequent; Graph is kept within its rate limits.
 const DESKTOP_POLL: (Duration, Duration) = (Duration::from_secs(3), Duration::from_secs(15));
 const GRAPH_POLL: (Duration, Duration) = (Duration::from_secs(15), Duration::from_secs(60));
 /// Rows the composer grows to before its draft scrolls.
 const COMPOSE_ROWS: usize = 5;
+/// Lines one ledger entry takes: title, preview and a blank separator.
+const CHAT_ROW_HEIGHT: u16 = 3;
+/// Conversation lines one mouse-wheel notch scrolls.
+const WHEEL_LINES: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiExit {
@@ -69,22 +75,35 @@ pub enum Source {
     Demo,
 }
 
-struct TerminalGuard;
+/// Raw mode and the alternate screen for as long as it lives; with `mouse`, the
+/// terminal also reports wheel and clicks instead of turning the wheel into arrow keys.
+struct TerminalGuard {
+    mouse: bool,
+}
 
 impl TerminalGuard {
-    fn enter() -> Result<Self, AppError> {
+    fn enter(mouse: bool) -> Result<Self, AppError> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+        let entered = if mouse {
+            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+        } else {
+            execute!(io::stdout(), EnterAlternateScreen)
+        };
+        if let Err(error) = entered {
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        Ok(Self)
+        Ok(Self { mouse })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        if self.mouse {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
@@ -109,20 +128,26 @@ pub fn run(source: Source) -> Result<TuiExit, AppError> {
         Zoned::now().with_time_zone(TimeZone::system()),
     );
     app.start();
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(true)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     loop {
         app.tick();
         terminal.draw(|frame| app.draw(frame))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match app.handle_key(key) {
-                Action::None => {}
-                Action::Quit => return Ok(TuiExit::Quit),
-                Action::Authenticate => return Ok(TuiExit::Authenticate),
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let action = match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            Event::Mouse(mouse) => {
+                app.handle_mouse(mouse);
+                Action::None
             }
+            _ => Action::None,
+        };
+        match action {
+            Action::None => {}
+            Action::Quit => return Ok(TuiExit::Quit),
+            Action::Authenticate => return Ok(TuiExit::Authenticate),
         }
     }
 }
@@ -287,6 +312,11 @@ struct App {
     /// Conversation lines hidden below the viewport; 0 follows the newest.
     scroll: usize,
     thread_height: usize,
+    /// Conversation lines above the viewport when scrolled to the newest.
+    thread_overflow: usize,
+    /// Where the last frame drew the ledger rows and the conversation pane, for the mouse.
+    ledger_area: Option<Rect>,
+    thread_area: Option<Rect>,
     overlay: Option<Overlay>,
     notice: Notice,
     frame: usize,
@@ -322,6 +352,9 @@ impl App {
             focus: Focus::Chats,
             scroll: 0,
             thread_height: 10,
+            thread_overflow: 0,
+            ledger_area: None,
+            thread_area: None,
             overlay: None,
             notice: Notice::new(Tone::Quiet, "Reading your chats…"),
             frame: 0,
@@ -1014,22 +1047,91 @@ impl App {
             KeyCode::End | KeyCode::Char('G') if in_thread => self.scroll = 0,
             KeyCode::Home | KeyCode::Char('g') => self.select(0),
             KeyCode::End | KeyCode::Char('G') => self.select(usize::MAX),
-            KeyCode::Char('o') => match self.selected_row().map(|row| row.id.clone()) {
-                Some(id) if self.threads.get(&id).is_some_and(|t| t.cursor.is_some()) => {
-                    self.notice = Notice::new(Tone::Quiet, "Reading older messages…");
-                    self.load_messages(id, true);
-                }
-                Some(_) => self.notice = Notice::new(Tone::Quiet, "No older messages to load."),
-                None => {}
-            },
+            KeyCode::Char('o') => self.load_older(true),
             _ => {}
         }
         Action::None
     }
 
+    /// Reads the page before the oldest loaded message; `announce` also says when
+    /// there is none, which the wheel stays quiet about.
+    fn load_older(&mut self, announce: bool) {
+        let Some(id) = self.selected_row().map(|row| row.id.clone()) else {
+            return;
+        };
+        match self.threads.get(&id) {
+            Some(thread) if thread.loading_older => {}
+            Some(thread) if thread.cursor.is_some() => {
+                self.notice = Notice::new(Tone::Quiet, "Reading older messages…");
+                self.load_messages(id, true);
+            }
+            _ if announce => {
+                self.notice = Notice::new(Tone::Quiet, "No older messages to load.");
+            }
+            _ => {}
+        }
+    }
+
+    /// The wheel scrolls whichever pane is under the pointer, and a click picks a
+    /// chat or focuses the conversation. The composer keeps its chat, so clicks on
+    /// the ledger wait until it is closed.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let over = |area: Option<Rect>| {
+            area.is_some_and(|a| {
+                a.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+            })
+        };
+        if self.overlay == Some(Overlay::Help) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.overlay = None;
+            }
+            return;
+        }
+        let in_thread = over(self.thread_area);
+        let in_ledger = over(self.ledger_area);
+        match mouse.kind {
+            MouseEventKind::ScrollUp if in_thread => {
+                if self.scroll >= self.thread_overflow {
+                    self.load_older(false);
+                } else {
+                    self.scroll = (self.scroll + WHEEL_LINES).min(self.thread_overflow);
+                }
+            }
+            MouseEventKind::ScrollDown if in_thread => {
+                self.scroll = self.scroll.saturating_sub(WHEEL_LINES);
+            }
+            MouseEventKind::ScrollUp if in_ledger && self.compose.is_none() => {
+                self.select(self.list.selected().unwrap_or(0).saturating_sub(1));
+            }
+            MouseEventKind::ScrollDown if in_ledger && self.compose.is_none() => {
+                self.select(self.list.selected().map_or(0, |i| i + 1));
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_thread => {
+                if self.selected_row().is_some() {
+                    self.focus = Focus::Thread;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_ledger && self.compose.is_none() => {
+                let Some(area) = self.ledger_area else {
+                    return;
+                };
+                let row = usize::from((mouse.row - area.y) / CHAT_ROW_HEIGHT);
+                let index = self.list.offset() + row;
+                if index < self.visible.len() {
+                    self.select(index);
+                    self.focus = Focus::Thread;
+                    self.open_selected();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         let theme = self.theme;
+        self.ledger_area = None;
+        self.thread_area = None;
         frame.render_widget(Block::default().style(theme.canvas()), area);
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
             let message = Paragraph::new(vec![
@@ -1194,10 +1296,13 @@ impl App {
             )));
         }
         frame.render_stateful_widget(List::new(items), list_area, &mut self.list);
+        self.ledger_area = Some(list_area);
     }
 
     fn draw_thread(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let theme = self.theme;
+        self.thread_area = Some(area);
+        self.thread_overflow = 0;
         let area = Rect {
             x: area.x + 2,
             width: area.width.saturating_sub(3),
@@ -1344,6 +1449,7 @@ impl App {
         lines.extend(conversation_lines(&entries, usize::from(body.width), theme));
         let height = usize::from(body.height);
         let overflow = lines.len().saturating_sub(height);
+        self.thread_overflow = overflow;
         self.scroll = self.scroll.min(overflow);
         let start = overflow - self.scroll;
         let mut shown: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
@@ -1493,6 +1599,15 @@ impl App {
             ("pgup / pgdn", "Scroll the conversation by half a screen"),
             ("g / G", "First / last chat, or oldest / newest message"),
             ("o", "Load older messages in this chat"),
+            (
+                "wheel",
+                "Scroll the pane under the pointer; older messages load at the top",
+            ),
+            ("click", "Open a chat, or focus the conversation"),
+            (
+                "shift-drag",
+                "Select text to copy, while the mouse is in use here",
+            ),
             ("/", "Filter chats by name or last message"),
             ("c", "Write a message in the open chat"),
             ("r", "Refresh now; chats also refresh on their own"),
@@ -2150,7 +2265,7 @@ pub fn request_authentication(
     let theme = Theme {
         color: std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
     };
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(false)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     loop {
         terminal.draw(|frame| draw_connection(frame, theme, profile, configured, reason))?;
@@ -2324,6 +2439,102 @@ mod tests {
         assert!(buffer_text(terminal.backend().buffer()).contains("KEYBOARD MAP"));
         assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::None));
         assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::Quit));
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_under_the_pointer_and_clicks_open_chats() {
+        let mut app = demo_app();
+        app.open_selected();
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let ledger = app.ledger_area.expect("ledger drawn");
+        let thread = app.thread_area.expect("conversation drawn");
+        assert!(
+            app.thread_overflow > WHEEL_LINES,
+            "the demo chat overflows 16 rows"
+        );
+
+        // The wheel over the conversation scrolls it even while the ledger has focus.
+        assert!(app.focus == Focus::Chats);
+        mouse(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            thread.x + 5,
+            thread.y + 5,
+        );
+        assert_eq!(app.scroll, WHEEL_LINES);
+        assert_eq!(app.list.selected(), Some(0), "the ledger did not move");
+        for _ in 0..50 {
+            mouse(
+                &mut app,
+                MouseEventKind::ScrollUp,
+                thread.x + 5,
+                thread.y + 5,
+            );
+        }
+        assert_eq!(
+            app.scroll, app.thread_overflow,
+            "scrolling stops at the oldest line"
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            thread.x + 5,
+            thread.y + 5,
+        );
+        assert_eq!(app.scroll, app.thread_overflow - WHEEL_LINES);
+
+        // The wheel over the ledger moves the selection, which resets the conversation.
+        mouse(&mut app, MouseEventKind::ScrollDown, ledger.x + 2, ledger.y);
+        assert_eq!(app.list.selected(), Some(1));
+        assert_eq!(app.scroll, 0);
+        mouse(&mut app, MouseEventKind::ScrollUp, ledger.x + 2, ledger.y);
+        assert_eq!(app.list.selected(), Some(0));
+
+        // A click on the second entry opens it; a click in the conversation focuses it.
+        let left = MouseEventKind::Down(MouseButton::Left);
+        mouse(&mut app, left, ledger.x + 2, ledger.y + CHAT_ROW_HEIGHT + 1);
+        assert_eq!(app.list.selected(), Some(1));
+        assert!(app.focus == Focus::Thread);
+        let id = app.selected_row().unwrap().id.clone();
+        assert!(app.threads.contains_key(&id));
+        press(&mut app, KeyCode::Tab);
+        assert!(app.focus == Focus::Chats);
+        mouse(&mut app, left, thread.x + 5, thread.y + 5);
+        assert!(app.focus == Focus::Thread);
+
+        // Outside both panes, and while the help is open, the mouse does nothing else.
+        mouse(&mut app, MouseEventKind::ScrollDown, 0, 0);
+        assert_eq!(app.list.selected(), Some(1));
+        press(&mut app, KeyCode::Char('?'));
+        mouse(&mut app, MouseEventKind::ScrollDown, ledger.x + 2, ledger.y);
+        assert_eq!(app.list.selected(), Some(1));
+        mouse(&mut app, left, 0, 0);
+        assert!(app.overlay.is_none(), "a click closes the help");
+    }
+
+    #[test]
+    fn the_composer_keeps_its_chat_when_the_ledger_is_clicked() {
+        let mut app = demo_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.compose.is_some());
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let ledger = app.ledger_area.expect("ledger drawn");
+        let left = MouseEventKind::Down(MouseButton::Left);
+        mouse(&mut app, left, ledger.x + 2, ledger.y + CHAT_ROW_HEIGHT + 1);
+        mouse(&mut app, MouseEventKind::ScrollDown, ledger.x + 2, ledger.y);
+        assert_eq!(app.list.selected(), Some(0));
     }
 
     #[test]
