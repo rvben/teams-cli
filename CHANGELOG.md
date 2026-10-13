@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.8-alpha.1...v0.1.9-alpha.1) - 2026-10-13
+
+This alpha replaces `0.1.8-alpha.1`, whose publication stopped at the Windows
+archive smoke test. Desktop support remains limited to connection diagnostics.
+
+### Fixed
+
+- **ci**: use portable temporary paths for Windows archive smoke tests ([5239bde](https://github.com/rvben/teams-cli/commit/5239bde5f3adde32c24616a9988c0c7e7c2ead76))
+
 ## [0.1.8-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.7...v0.1.8-alpha.1) - 2026-10-13
 
 ### Added

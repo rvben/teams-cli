@@ -25,16 +25,16 @@ Cargo and Python package versions are kept synchronized as one release unit.
 
 ## Alpha and beta releases
 
-Use a prerelease such as `0.1.8-alpha.1` while desktop support is limited to
+Use a prerelease such as `0.1.9-alpha.1` while desktop support is limited to
 connection diagnostics. GitHub marks tags containing a prerelease suffix as
 prereleases and leaves them out of the latest stable release selection. Maturin
-normalizes the Python distribution version to PEP 440 (`0.1.8a1` for that example);
+normalizes the Python distribution version to PEP 440 (`0.1.9a1` for that example);
 the CLI still reports its Cargo version.
 
 Vership 0.5.26 has no prerelease bump option. Prepare the patch once with
 `vership bump patch --prepare`, then apply the prerelease suffix to the unpublished
 candidate's Cargo version, lockfile and changelog and amend its release commit,
-including the `Vership-Release: v0.1.8-alpha.1` marker. This is a local workaround
+including the `Vership-Release: v0.1.9-alpha.1` marker. This is a local workaround
 for the unsupported version operation; continue with `vership release --dry-run`
 and `vership release` for the reviewed candidate.
 
@@ -42,8 +42,8 @@ After the workflows finish, verify the Cargo/GitHub version and normalized Pytho
 version separately:
 
 ```sh
-vership verify 0.1.8-alpha.1 --targets tag,release,crates
-vership verify 0.1.8a1 --targets pypi
+vership verify 0.1.9-alpha.1 --targets tag,release,crates
+vership verify 0.1.9a1 --targets pypi
 ```
 
 The binary build jobs extract and smoke test their packaged CLI before uploading
