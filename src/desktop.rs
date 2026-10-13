@@ -1,17 +1,34 @@
 //! Existing-endpoint diagnostics and read-only chat access through the Teams client's own
-//! cache. Never launches Teams; evaluates only the fixed read script embedded in the helper.
+//! cache. Never launches Teams; evaluates only the fixed read script in `desktop.js`.
+//!
+//! On Windows the CLI verifies the endpoint and reads in-process. Under WSL it drives the
+//! Windows build of itself as a long-lived helper (`teams.exe desktop-helper`).
+#[cfg(any(windows, test))]
+mod cdp;
+pub mod helper;
+#[cfg(not(windows))]
+pub mod install;
+#[cfg(any(windows, test))]
+mod owner;
+#[cfg(any(windows, test))]
+pub mod session;
+#[cfg(windows)]
+pub mod windows;
+
 use crate::{error::AppError, graph::Page};
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{path::PathBuf, process::Stdio, time::Duration};
-use tokio::{io::AsyncWriteExt, process::Command};
+#[cfg(any(target_os = "macos", windows, test))]
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::{path::PathBuf, process::Stdio};
+#[cfg(target_os = "macos")]
+use tokio::process::Command;
 
-const SCRIPT: &str = include_str!("desktop.ps1");
+#[cfg(target_os = "macos")]
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(any(target_os = "macos", windows, test))]
 const MAX_METADATA: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
 
@@ -77,7 +94,7 @@ pub struct ConnectionMetadata {
 }
 
 impl ConnectionMetadata {
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", windows, test))]
     fn empty(port: u16) -> Self {
         Self {
             port,
@@ -96,9 +113,22 @@ impl ConnectionMetadata {
     }
 }
 
-#[derive(Debug)]
 pub struct DesktopClient {
     port: u16,
+    /// The verified page connection, reused across reads.
+    #[cfg(windows)]
+    session: tokio::sync::Mutex<session::Session<windows::WindowsSystem>>,
+    /// The Windows helper under WSL, started on first use.
+    #[cfg(not(windows))]
+    helper: tokio::sync::Mutex<helper::HelperClient>,
+}
+
+impl std::fmt::Debug for DesktopClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DesktopClient")
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DesktopClient {
@@ -108,8 +138,15 @@ impl DesktopClient {
                 "desktop port must be between 1024 and 65535".into(),
             ));
         }
-        Ok(Self { port })
+        Ok(Self {
+            port,
+            #[cfg(windows)]
+            session: tokio::sync::Mutex::new(session::Session::new(windows::WindowsSystem)),
+            #[cfg(not(windows))]
+            helper: Default::default(),
+        })
     }
+
     pub async fn probe(&self) -> Result<ConnectionMetadata, AppError> {
         let transport = platform()?;
         if transport == "macos_loopback" {
@@ -118,15 +155,19 @@ impl DesktopClient {
                 .await
                 .map_err(|_| AppError::Desktop("desktop metadata inspection timed out".into()))?;
         }
-        self.probe_windows().await
-    }
-
-    async fn probe_windows(&self) -> Result<ConnectionMetadata, AppError> {
-        let text = self
-            .run_helper(json!({"operation":"probe","port":self.port}), MAX_METADATA)
-            .await?;
-        serde_json::from_str(&text)
-            .map_err(|_| AppError::Desktop("Windows helper returned invalid metadata".into()))
+        #[cfg(windows)]
+        return self.session.lock().await.probe(self.port).await;
+        #[cfg(not(windows))]
+        {
+            let metadata = self
+                .helper
+                .lock()
+                .await
+                .call(json!({"op": "probe", "port": self.port}))
+                .await?;
+            serde_json::from_value(metadata)
+                .map_err(|_| AppError::Desktop("Windows helper returned invalid metadata".into()))
+        }
     }
 
     pub async fn chats(&self, limit: u16, cursor: Option<&str>) -> Result<Page, AppError> {
@@ -154,49 +195,17 @@ impl DesktopClient {
                 "desktop chat reading is available on Windows and WSL only".into(),
             ));
         }
-        read_page(&self.run_helper(request, MAX_READ).await?)
+        #[cfg(windows)]
+        let reply = self.session.lock().await.read(&request).await?;
+        #[cfg(not(windows))]
+        let reply = self
+            .helper
+            .lock()
+            .await
+            .call(json!({"op": "read", "request": request}))
+            .await?;
+        read_page(&reply)
     }
-
-    async fn run_helper(&self, request: Value, limit: usize) -> Result<String, AppError> {
-        let executable = powershell()?;
-        let encoded = STANDARD.encode(
-            helper_script()
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>(),
-        );
-        let mut command = Command::new(executable);
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            &encoded,
-        ]);
-        let output = run_process(command, Some(serde_json::to_vec(&request).unwrap())).await?;
-        if !output.status.success() {
-            return Err(AppError::Desktop("Windows desktop helper failed; check PowerShell availability and policy. No Teams lifecycle or policy settings were changed".into()));
-        }
-        if output.stdout.len() > limit {
-            return Err(AppError::Desktop(
-                "Windows helper response exceeds the size limit".into(),
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .trim_start_matches('\u{feff}')
-            .trim()
-            .into())
-    }
-}
-
-/// Comments and indentation are dropped to stay within the Windows command-line limit.
-fn helper_script() -> String {
-    SCRIPT
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn valid_id(id: &str) -> bool {
@@ -261,10 +270,9 @@ fn decode_cursor(cursor: &str) -> Result<Value, AppError> {
     Ok(json!({"t":t,"id":id}))
 }
 
-/// Maps the helper's output: a refusal code, or the raw `Runtime.evaluate` reply.
-fn read_page(text: &str) -> Result<Page, AppError> {
-    let invalid = || AppError::Desktop("Windows helper returned an invalid chat response".into());
-    let reply: Value = serde_json::from_str(text).map_err(|_| invalid())?;
+/// Maps a session reply: a refusal code, or the raw `Runtime.evaluate` result.
+fn read_page(reply: &Value) -> Result<Page, AppError> {
+    let invalid = || AppError::Desktop("the Teams page returned an invalid chat response".into());
     if let Some(code) = reply.get("error").and_then(Value::as_str) {
         let status = serde_json::from_value::<ProbeStatus>(json!(code)).ok();
         return Err(AppError::Desktop(match (status, code) {
@@ -320,7 +328,7 @@ pub fn platform() -> Result<&'static str, AppError> {
     if cfg!(target_os = "macos") {
         Ok("macos_loopback")
     } else if cfg!(windows) {
-        Ok("windows_helper")
+        Ok("windows_native")
     } else if cfg!(target_os = "linux")
         && std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .unwrap_or_default()
@@ -336,55 +344,42 @@ pub fn platform() -> Result<&'static str, AppError> {
     }
 }
 
-pub fn powershell() -> Result<PathBuf, AppError> {
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|p| p.join("powershell.exe"))
-        .chain(standard_powershell())
-        .find(|p| p.is_file())
-        .ok_or_else(|| AppError::Desktop("powershell.exe was not found on PATH or in the standard Windows location; enable Windows executable interop when using WSL".into()))
-}
-
-/// Where Windows installs PowerShell, for shells whose PATH omits Windows
-/// directories (for example WSL with `appendWindowsPath = false`).
-fn standard_powershell() -> Option<PathBuf> {
-    const RELATIVE: &str = "System32/WindowsPowerShell/v1.0/powershell.exe";
-    if cfg!(windows) {
-        let root = std::env::var_os("SystemRoot")?;
-        Some(PathBuf::from(root).join(RELATIVE))
-    } else if platform().ok()? == "wsl_windows_helper" {
-        let conf = std::fs::read_to_string("/etc/wsl.conf").unwrap_or_default();
-        Some(
-            PathBuf::from(wsl_mount_root(&conf))
-                .join("c/Windows")
-                .join(RELATIVE),
+/// The hidden `desktop-helper` command: answers the Linux CLI under WSL until stdin closes.
+pub async fn serve_helper() -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        helper::serve(
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+            &mut session::Session::new(windows::WindowsSystem),
         )
-    } else {
-        None
+        .await
     }
+    #[cfg(not(windows))]
+    Err(AppError::Unsupported(
+        "the desktop helper runs only on Windows".into(),
+    ))
 }
 
-/// The `[automount] root` from wsl.conf, defaulting to `/mnt/`.
-fn wsl_mount_root(conf: &str) -> String {
-    let mut section = "";
-    for line in conf.lines().map(str::trim) {
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            section = name.trim();
-        } else if section.eq_ignore_ascii_case("automount")
-            && let Some((key, value)) = line.split_once('=')
-            && key.trim() == "root"
-        {
-            let root = value
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches('"');
-            if !root.is_empty() {
-                return format!("{}/", root.trim_end_matches('/'));
-            }
-        }
+/// The WSL helper's install state for `doctor` as (status, detail); `None` where no
+/// helper is involved. Never downloads.
+pub fn helper_check() -> Option<(&'static str, String)> {
+    #[cfg(not(windows))]
+    if platform().ok() == Some("wsl_windows_helper") {
+        return Some(match install::state() {
+            Ok(install::HelperState::Override(path)) if !path.is_file() => (
+                "fail",
+                format!(
+                    "TEAMS_DESKTOP_HELPER points to {}, which does not exist",
+                    path.display()
+                ),
+            ),
+            Ok(state @ install::HelperState::Missing(_)) => ("skip", state.describe()),
+            Ok(state) => ("pass", state.describe()),
+            Err(error) => ("fail", error.to_string()),
+        });
     }
-    "/mnt/".into()
+    None
 }
 
 pub fn local_prerequisites() -> Result<&'static str, AppError> {
@@ -395,47 +390,34 @@ pub fn local_prerequisites() -> Result<&'static str, AppError> {
                 "lsof is required for Teams listener ownership checks".into(),
             ));
         }
-    } else {
-        powershell()?;
+    } else if transport == "wsl_windows_helper"
+        && !["WSLInterop", "WSLInterop-late"].iter().any(|name| {
+            std::path::Path::new("/proc/sys/fs/binfmt_misc")
+                .join(name)
+                .exists()
+        })
+    {
+        return Err(AppError::Desktop(
+            "WSL cannot run Windows executables; enable interop in /etc/wsl.conf".into(),
+        ));
     }
     Ok(transport)
 }
 
-async fn run_process(
-    mut command: Command,
-    input: Option<Vec<u8>>,
-) -> Result<std::process::Output, AppError> {
+#[cfg(target_os = "macos")]
+async fn run_process(mut command: Command) -> Result<std::process::Output, AppError> {
     command
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|_| AppError::Desktop("could not start the local metadata helper".into()))?;
-    let operation = async {
-        if let Some(input) = input {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| AppError::Desktop("metadata helper input is unavailable".into()))?;
-            stdin
-                .write_all(&input)
-                .await
-                .map_err(|_| AppError::Desktop("could not send the metadata request".into()))?;
-            drop(stdin);
-        }
-        child
-            .wait_with_output()
-            .await
-            .map_err(|_| AppError::Desktop("could not read the metadata helper result".into()))
-    };
-    tokio::time::timeout(PROCESS_TIMEOUT, operation).await
-        .map_err(|_| AppError::Desktop("metadata helper timed out; WSL may retain a Windows-side helper process. No Teams restart or session operation was requested".into()))?
+    tokio::time::timeout(PROCESS_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| AppError::Desktop("metadata helper timed out".into()))?
+        .map_err(|_| AppError::Desktop("could not read the metadata helper result".into()))
 }
 
 #[cfg(target_os = "macos")]
@@ -449,7 +431,7 @@ impl DesktopClient {
             "-sTCP:LISTEN",
             "-Fpn",
         ]);
-        let output = run_process(command, None).await?;
+        let output = run_process(command).await?;
         let text = String::from_utf8_lossy(&output.stdout);
         let listeners = parse_listeners(&text)?;
         let mut metadata = ConnectionMetadata::empty(self.port);
@@ -473,7 +455,7 @@ impl DesktopClient {
         }
         let mut uid_command = Command::new("/usr/bin/id");
         uid_command.arg("-u");
-        let uid_output = run_process(uid_command, None).await?;
+        let uid_output = run_process(uid_command).await?;
         let uid = String::from_utf8_lossy(&uid_output.stdout)
             .trim()
             .parse::<u32>()
@@ -490,29 +472,7 @@ impl DesktopClient {
             metadata.status = ProbeStatus::NonTeamsListenerRefused;
             return Ok(metadata);
         }
-        match read_metadata(self.port).await {
-            Ok((version, targets)) => {
-                metadata.version = Some(BrowserVersion {
-                    browser: version
-                        .get("Browser")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .into(),
-                    protocol: version
-                        .get("Protocol-Version")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .into(),
-                });
-                metadata.browser_websocket_advertised = version
-                    .get("webSocketDebuggerUrl")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| !v.is_empty());
-                metadata.targets = targets.iter().map(sanitize_target).collect();
-                metadata.status = ProbeStatus::MetadataOk;
-            }
-            Err(_) => metadata.status = ProbeStatus::MetadataProbeFailed,
-        }
+        fill_metadata(&mut metadata).await;
         Ok(metadata)
     }
 }
@@ -558,7 +518,7 @@ async fn teams_owner(mut pid: u32, uid: u32) -> Result<bool, AppError> {
         }
         let mut command = Command::new("/bin/ps");
         command.args(["-p", &pid.to_string(), "-o", "uid=,ppid=,comm="]);
-        let output = run_process(command, None).await?;
+        let output = run_process(command).await?;
         if !output.status.success() {
             return Ok(false);
         }
@@ -590,7 +550,32 @@ async fn teams_owner(mut pid: u32, uid: u32) -> Result<bool, AppError> {
     Ok(false)
 }
 
-#[cfg(any(target_os = "macos", test))]
+/// Reads endpoint metadata into `metadata` for an already-verified listener and returns
+/// the raw targets, which stay in-process.
+#[cfg(any(target_os = "macos", windows, test))]
+async fn fill_metadata(metadata: &mut ConnectionMetadata) -> Vec<Value> {
+    let Ok((version, targets)) = read_metadata(metadata.port).await else {
+        metadata.status = ProbeStatus::MetadataProbeFailed;
+        return vec![];
+    };
+    let text = |key: &str| {
+        version
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    metadata.version = Some(BrowserVersion {
+        browser: text("Browser"),
+        protocol: text("Protocol-Version"),
+    });
+    metadata.browser_websocket_advertised = !text("webSocketDebuggerUrl").is_empty();
+    metadata.targets = targets.iter().map(sanitize_target).collect();
+    metadata.status = ProbeStatus::MetadataOk;
+    targets
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
 async fn read_metadata(port: u16) -> Result<(Value, Vec<Value>), AppError> {
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -638,7 +623,7 @@ async fn read_metadata(port: u16) -> Result<(Value, Vec<Value>), AppError> {
     ))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn sanitize_target(target: &Value) -> TargetMetadata {
     let uri = target
         .get("url")
@@ -686,20 +671,6 @@ mod tests {
     };
 
     #[test]
-    fn wsl_mount_root_reads_automount_section() {
-        assert_eq!(wsl_mount_root(""), "/mnt/");
-        assert_eq!(wsl_mount_root("[boot]\nsystemd=true\n"), "/mnt/");
-        assert_eq!(
-            wsl_mount_root("[network]\nroot = /x\n[automount]\nroot = /\n"),
-            "/"
-        );
-        assert_eq!(
-            wsl_mount_root("[automount]\nenabled=true\nroot=\"/win\" # drives\n"),
-            "/win/"
-        );
-    }
-
-    #[test]
     fn read_requests_validate_chat_ids_and_cursors() {
         let request = read_request(9222, None, 5, None).unwrap();
         assert_eq!(request["query"], "chats");
@@ -724,8 +695,8 @@ mod tests {
         }
     }
 
-    fn reply(value: Value) -> String {
-        json!({"id":1,"result":{"result":{"type":"string","value":value.to_string()}}}).to_string()
+    fn reply(value: Value) -> Value {
+        json!({"result":{"result":{"type":"string","value":value.to_string()}}})
     }
 
     #[test]
@@ -751,30 +722,17 @@ mod tests {
             read_page(&reply(json!({"error": "not_found"}))),
             Err(AppError::NotFound(_))
         ));
-        let layout = json!({"id":1,"result":{"exceptionDetails":{"exception":{"description":"Error: layout\n    at x"}}}});
-        assert!(
-            matches!(read_page(&layout.to_string()), Err(AppError::Desktop(m)) if m.contains("layout"))
-        );
-        for text in [
-            r#"{"error":"no_target"}"#,
-            r#"{"error":"non_teams_listener_refused"}"#,
-            r#"{"error":"read_failed"}"#,
-            "not json",
-            &reply(json!({"items": [], "next": {"t": 1, "id": "bad id"}})),
+        let layout = json!({"result":{"exceptionDetails":{"exception":{"description":"Error: layout\n    at x"}}}});
+        assert!(matches!(read_page(&layout), Err(AppError::Desktop(m)) if m.contains("layout")));
+        for reply in [
+            json!({"error": "no_target"}),
+            json!({"error": "non_teams_listener_refused"}),
+            json!({"error": "read_failed"}),
+            json!("not an object"),
+            reply(json!({"items": [], "next": {"t": 1, "id": "bad id"}})),
         ] {
-            assert!(matches!(read_page(text), Err(AppError::Desktop(_))));
+            assert!(matches!(read_page(&reply), Err(AppError::Desktop(_))));
         }
-    }
-
-    #[test]
-    fn native_script_fits_windows_command_line() {
-        let encoded = helper_script()
-            .encode_utf16()
-            .count()
-            .saturating_mul(2)
-            .div_ceil(3)
-            * 4;
-        assert!(encoded < 32000);
     }
 
     #[test]

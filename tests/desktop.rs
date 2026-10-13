@@ -258,7 +258,7 @@ fn backend_options_and_schema_describe_only_implemented_capabilities() {
     init(&temp);
     let output = cli(&temp).args(["doctor", "--offline"]).output().unwrap();
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    // The local transport check fails where PowerShell is unavailable.
+    // The local transport check fails off macOS, Windows and WSL.
     let expected = if value["healthy"] == true { 0 } else { 7 };
     assert_eq!(output.status.code(), Some(expected));
     assert_eq!(value["backend"], "desktop");

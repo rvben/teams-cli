@@ -95,6 +95,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
         return Err(AppError::Unsupported("desktop authentication is managed in Teams; sign in or out in the app. Use `teams auth status` for connection diagnostics".into()));
     }
     match command {
+        Command::DesktopHelper => desktop::serve_helper().await,
         Command::Init(args) => init(profile_arg.unwrap_or("default"), args, out).await,
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
         Command::Profile { command } => profile_command(command, yes, out),
@@ -836,6 +837,13 @@ async fn desktop_doctor(
                 .unwrap_or_else(|e| e.to_string()),
         },
     ];
+    if let Some((status, detail)) = desktop::helper_check() {
+        checks.push(Check {
+            name: "desktop_helper",
+            status,
+            detail,
+        });
+    }
     let connection = if !offline && prerequisites.is_ok() {
         match DesktopClient::new(profile.desktop_port)?.probe().await {
             Ok(metadata) => Some(metadata),

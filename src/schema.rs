@@ -396,8 +396,8 @@ pub fn backend_capabilities() -> Value {
         "desktop":{"experimental":true,"read_only":true,"platforms":["macos","windows","wsl"],
             "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (windows, wsl)","chat messages (windows, wsl)"],
             "unsupported":["teams and channels","identity","send messages","subscriptions","automatic Teams launch or restart"],
-            "requires":"existing Teams-owned loopback debugging endpoint; Windows/WSL require powershell.exe",
-            "transport":{"macos":"native_loopback","windows":"windows_helper","wsl":"windows_helper_stdio"},
+            "requires":"existing Teams-owned loopback debugging endpoint; WSL requires Windows executable interop",
+            "transport":{"macos":"native_loopback","windows":"windows_native","wsl":"windows_helper_stdio"},
             "chat_source":"desktop_cache","session_verified":false,"default_port":crate::config::DEFAULT_DESKTOP_PORT}
     })
 }

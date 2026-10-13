@@ -10,7 +10,7 @@ use serde_json::Value;
 
 pub enum TeamsBackend {
     Graph(GraphClient),
-    Desktop(DesktopClient),
+    Desktop(Box<DesktopClient>),
 }
 
 impl TeamsBackend {
@@ -20,7 +20,9 @@ impl TeamsBackend {
             BackendKind::Graph => Ok(Self::Graph(GraphClient::new(
                 auth::access_token(&name, &selected).await?,
             ))),
-            BackendKind::Desktop => Ok(Self::Desktop(DesktopClient::new(selected.desktop_port)?)),
+            BackendKind::Desktop => Ok(Self::Desktop(Box::new(DesktopClient::new(
+                selected.desktop_port,
+            )?))),
         }
     }
 

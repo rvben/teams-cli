@@ -85,6 +85,9 @@ pub enum Command {
     },
     /// Generate shell completions
     Completions { shell: Shell },
+    /// Serve desktop reads for the Linux CLI under WSL over stdin and stdout
+    #[command(hide = true, name = "desktop-helper")]
+    DesktopHelper,
 }
 
 #[derive(Debug, Args)]

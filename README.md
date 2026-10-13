@@ -184,15 +184,24 @@ initialization probes the existing endpoint. A normal Teams launch usually has n
 endpoint, which `doctor` reports as `no_listener`.
 
 macOS checks listener binding and installed Teams process ancestry before reading
-loopback metadata. Windows uses a fixed PowerShell helper with JSON stdin/stdout;
-WSL invokes that Windows helper through executable interop, so NAT mode needs no
-networking changes. Windows requires the installed MSTeams package and
-`powershell.exe` on PATH. Both paths refuse non-loopback listeners and unrelated
-owners. The Windows reader also verifies the Teams process belongs to the invoking
-Windows user. Diagnostics are limited to `GET /json/version` and `GET /json/list`, and their
-results omit titles, full URLs, target IDs, WebSocket URLs and private origins.
-Chat reads then attach to the first Teams-origin page over the same verified
-loopback port.
+loopback metadata. On Windows, `teams.exe` checks the listener itself through the
+Windows APIs: every listener on the port must be loopback-only and descend from an
+`ms-teams.exe` that belongs to the installed MSTeams package and runs as the invoking
+Windows user. Under WSL, the Linux CLI starts the Windows build of the same version as
+a helper (`teams.exe desktop-helper`) and keeps it running for the session, talking JSON
+over its stdin and stdout, so NAT mode needs no networking changes. Diagnostics are
+limited to `GET /json/version` and `GET /json/list`, and their results omit titles,
+full URLs, target IDs, WebSocket URLs and private origins. Chat reads then attach to
+the first Teams-origin page over the same verified loopback port and keep that
+connection open; if it drops, the listener is verified again before the next read.
+
+On first use under WSL, the helper is downloaded from the matching GitHub release,
+checked against the release's `SHA256SUMS`, and cached in
+`~/.cache/teams-cli/windows-helper/<version>/`. `doctor` reports whether it is
+installed and never downloads it. Set `TEAMS_DESKTOP_HELPER` to use another
+`teams.exe` of the same version, or run `make windows-helper` (needs
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin)) to build one for a
+development checkout.
 
 Endpoint discovery does not verify sign-in: `signed_in` stays `null`, `verified`
 and `session_verified` stay `false`, and `endpoint_available` describes metadata
@@ -204,20 +213,13 @@ endpoint. Desktop profiles ignore Graph OAuth environment settings and credentia
 A CLI profile selects connection configuration, not a Teams account. There is no
 automatic fallback to Graph.
 
-The helper timeout is 45 seconds. Cancellation stops the local helper, but WSL can
-retain a Windows-side helper process until its own bounded request completes.
+Each read is bounded to 45 seconds. The WSL helper exits when the CLI does, though
+Windows can keep it alive until an in-flight read completes.
 Microsoft treats [WebView2 flags](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags)
 as development diagnostics and advises against relying on them in production.
 This backend is experimental: chat reading depends on the Teams client's internal
 cache layout, and an unrecognised layout fails with `desktop_error` rather than
 guessing.
-
-Windows CI runs synthetic tests against the production PowerShell reader. To run
-them elsewhere with an installed PowerShell:
-
-```console
-TEAMS_TEST_POWERSHELL=/path/to/pwsh cargo test --test desktop_bridge -- --ignored
-```
 
 ## Graph boundaries
 
