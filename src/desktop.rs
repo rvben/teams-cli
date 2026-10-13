@@ -834,6 +834,49 @@ mod tests {
         json!({"result": {"result": {"type": "string", "value": value.to_string()}}})
     }
 
+    /// Helpers and CLIs of different versions talk to each other whenever their protocol
+    /// numbers match, so everything that crosses between them is pinned here: the
+    /// requests the CLI builds and the page scripts whose results it parses. When this
+    /// fails, bump `helper::PROTOCOL` if a helper or CLI of the old protocol would misread
+    /// the new one; otherwise just update the expectations.
+    #[test]
+    fn the_protocol_is_pinned() {
+        assert_eq!(helper::PROTOCOL, 2);
+        let cursor = encode_cursor(&json!({"t": 1, "id": "m1"})).unwrap();
+        assert_eq!(
+            read_request(9222, Some(NOTES), 20, Some(&cursor)).unwrap(),
+            json!({"operation": "read", "port": 9222, "query": "messages",
+                   "chat_id": NOTES, "limit": 20, "after": {"t": 1, "id": "m1"}})
+        );
+        assert_eq!(
+            read_request(9222, None, 20, None).unwrap(),
+            json!({"operation": "read", "port": 9222, "query": "chats",
+                   "chat_id": null, "limit": 20, "after": null})
+        );
+        let mut send = send_request(9222, NOTES, "hi").unwrap();
+        assert!(
+            send["client_message_id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 18)
+        );
+        send["client_message_id"] = json!("<id>");
+        assert_eq!(
+            send,
+            json!({"operation": "send", "port": 9222, "chat_id": NOTES,
+                   "body": "hi", "client_message_id": "<id>"})
+        );
+        let scripts = [include_str!("desktop.js"), include_str!("desktop_send.js")].map(|script| {
+            use sha2::Digest;
+            // Line endings depend on the checkout, not on the script.
+            let digest = sha2::Sha256::digest(script.replace('\r', ""));
+            digest[..6]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        });
+        assert_eq!(scripts, ["3ee7c6f94e71", "1ab6c9523718"]);
+    }
+
     #[test]
     fn send_requests_validate_and_carry_a_fresh_client_message_id() {
         let request = send_request(9222, CHAT, "hello\nthere").unwrap();

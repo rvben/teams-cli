@@ -582,7 +582,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 "TEAMS_ACCESS_TOKEN":"Graph access token that overrides the stored credential for this run",
                 "TEAMS_CLIENT_ID":"Graph application ID override",
                 "TEAMS_TENANT":"Graph tenant override",
-                "TEAMS_DESKTOP_HELPER":"Path to a teams.exe of the same version to use as the WSL desktop helper"
+                "TEAMS_DESKTOP_HELPER":"Path to a teams.exe speaking the same helper protocol to use as the WSL desktop helper"
             },
             "collection_envelope":{
                 "items":"array of records described by the command's output_fields",

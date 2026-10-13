@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use super::helper::PROTOCOL;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const OVERRIDE: &str = "TEAMS_DESKTOP_HELPER";
 const MAX_ARCHIVE: usize = 64 * 1024 * 1024;
@@ -42,6 +44,23 @@ pub fn state() -> Result<HelperState, AppError> {
     })
 }
 
+/// How to get a helper that speaks this CLI's protocol, for whichever helper is in use.
+pub fn remedy() -> String {
+    match state() {
+        Ok(HelperState::Override(_)) => format!(
+            "point {OVERRIDE} at a teams.exe that speaks protocol {PROTOCOL}, such as teams-cli {VERSION} for Windows, or unset it to use the matching release"
+        ),
+        Ok(HelperState::Installed(path) | HelperState::Missing(path)) => {
+            let dir = path.parent().unwrap_or(&path);
+            format!(
+                "delete {} to download the matching release again, or run `make windows-helper` in a source checkout",
+                dir.display()
+            )
+        }
+        Err(error) => error.to_string(),
+    }
+}
+
 /// The helper's path, downloading and installing it if needed.
 pub async fn ensure() -> Result<PathBuf, AppError> {
     let path = match state()? {
@@ -56,20 +75,30 @@ pub async fn ensure() -> Result<PathBuf, AppError> {
         HelperState::Missing(path) => path,
     };
     let asset = format!("teams-cli-v{VERSION}-x86_64-pc-windows-msvc.tar.gz");
+    let release = format!("{}/releases/tag/v{VERSION}", env!("CARGO_PKG_REPOSITORY"));
     let base = format!(
         "{}/releases/download/v{VERSION}",
         env!("CARGO_PKG_REPOSITORY")
     );
+    // Whatever went wrong, the same archive can be fetched and pointed at by hand.
+    let by_hand = |problem: String| {
+        AppError::Desktop(format!(
+            "{problem}; download {asset} from {release}, unpack teams.exe and set {OVERRIDE} to its path, or run `make windows-helper` in a source checkout"
+        ))
+    };
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .user_agent(concat!("teams-cli/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|_| AppError::Desktop("could not create the helper downloader".into()))?;
-    let sums = download(&http, &format!("{base}/SHA256SUMS")).await?;
-    let archive = download(&http, &format!("{base}/{asset}")).await?;
-    let expected = checksum(&String::from_utf8_lossy(&sums), &asset).ok_or_else(|| {
-        AppError::Desktop(format!("SHA256SUMS of v{VERSION} does not list {asset}"))
-    })?;
+    let sums = download(&http, &format!("{base}/SHA256SUMS"))
+        .await
+        .map_err(by_hand)?;
+    let archive = download(&http, &format!("{base}/{asset}"))
+        .await
+        .map_err(by_hand)?;
+    let expected = checksum(&String::from_utf8_lossy(&sums), &asset)
+        .ok_or_else(|| by_hand(format!("SHA256SUMS of v{VERSION} does not list {asset}")))?;
     if hex(&Sha256::digest(&archive)) != expected {
         return Err(AppError::Desktop(format!(
             "{asset} does not match its published checksum; nothing was installed"
@@ -86,22 +115,32 @@ fn root() -> Result<PathBuf, AppError> {
         .join("windows-helper"))
 }
 
-async fn download(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, AppError> {
-    let failed = || {
-        AppError::Desktop(format!(
-            "could not download the Windows desktop helper for teams-cli {VERSION}; for a development build run `make windows-helper` or set {OVERRIDE}"
-        ))
+/// The body at `url`, or what went wrong in words.
+async fn download(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    let failed = |_| {
+        format!(
+            "could not download the Windows desktop helper for teams-cli {VERSION}; check the network connection"
+        )
     };
-    let mut response = http.get(url).send().await.map_err(|_| failed())?;
-    if !response.status().is_success() {
-        return Err(failed());
+    let mut response = http.get(url).send().await.map_err(failed)?;
+    match response.status() {
+        status if status.is_success() => {}
+        reqwest::StatusCode::NOT_FOUND => {
+            return Err(format!(
+                "teams-cli {VERSION} has no published Windows desktop helper (a build that is not a release, or a release still being published)"
+            ));
+        }
+        status => {
+            return Err(format!(
+                "downloading the Windows desktop helper failed with HTTP {}",
+                status.as_u16()
+            ));
+        }
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| failed())? {
+    while let Some(chunk) = response.chunk().await.map_err(failed)? {
         if bytes.len() + chunk.len() > MAX_ARCHIVE {
-            return Err(AppError::Desktop(
-                "helper download exceeds the size limit".into(),
-            ));
+            return Err("the helper download exceeds the size limit".into());
         }
         bytes.extend_from_slice(&chunk);
     }

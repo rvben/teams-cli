@@ -223,9 +223,9 @@ macOS checks listener binding and installed Teams process ancestry before readin
 loopback metadata. On Windows, `teams.exe` checks the listener itself through the
 Windows APIs: every listener on the port must be loopback-only and descend from an
 `ms-teams.exe` that belongs to the installed MSTeams package and runs as the invoking
-Windows user. Under WSL, the Linux CLI starts the Windows build of the same version as
-a helper (`teams.exe desktop-helper`) and keeps it running for the session, talking JSON
-over its stdin and stdout, so NAT mode needs no networking changes. Diagnostics are
+Windows user. Under WSL, the Linux CLI starts the Windows build as a helper
+(`teams.exe desktop-helper`) and keeps it running for the session, talking JSON over
+its stdin and stdout, so NAT mode needs no networking changes. Diagnostics are
 limited to `GET /json/version` and `GET /json/list`, and their results omit titles,
 full URLs, target IDs, WebSocket URLs and private origins. Chat reads then attach to
 the first Teams-origin page over the same verified loopback port and keep that
@@ -235,9 +235,17 @@ On first use under WSL, the helper is downloaded from the matching GitHub releas
 checked against the release's `SHA256SUMS`, and cached in
 `~/.cache/teams-cli/windows-helper/<version>/`. `doctor` reports whether it is
 installed and never downloads it. Set `TEAMS_DESKTOP_HELPER` to use another
-`teams.exe` of the same version, or run `make windows-helper` (needs
+`teams.exe`, or run `make windows-helper` (needs
 [cargo-xwin](https://github.com/rust-cross/cargo-xwin)) to build one for a
-development checkout.
+development checkout. If the download is blocked, fetch the
+`x86_64-pc-windows-msvc` archive from the release page, unpack `teams.exe` and point
+`TEAMS_DESKTOP_HELPER` at it.
+
+The CLI and the helper agree on a protocol number, and any helper that speaks the CLI's
+protocol is accepted, whatever its version. When they differ, the error names both
+sides' version, build and protocol, along with the fix for how the helper was
+installed. `teams --version` shows the commit a binary was built from, with `-dirty`
+for uncommitted changes.
 
 Endpoint discovery does not verify sign-in: `signed_in` stays `null`, `verified`
 and `session_verified` stay `false`, and `endpoint_available` describes metadata

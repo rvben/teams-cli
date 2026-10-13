@@ -1,12 +1,18 @@
 //! The WSL bridge: the Linux CLI keeps one `teams.exe desktop-helper` running and talks
 //! newline-delimited JSON over its stdin and stdout. The helper exits when stdin closes.
-//! Protocol 2 adds sending; helper and CLI must be the same version.
+//! The protocol number is the whole contract: a helper is accepted when it speaks this
+//! CLI's protocol, whatever its version or build, which are only reported. Bump it when
+//! either side would misread the other (`desktop::tests::the_protocol_is_pinned`).
+//! `hello` and its `version` and `protocol` fields never change. Protocol 2 adds sending.
 use crate::error::AppError;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL: u32 = 2;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The commit this binary was built from (see `build.rs`), reported in `hello` for
+/// diagnosis and never compared; empty when unknown.
+const BUILD: &str = env!("TEAMS_BUILD");
 const MAX_LINE: usize = super::MAX_READ + 64 * 1024;
 
 /// Reads one line, refusing lines beyond `MAX_LINE`; `None` at end of input.
@@ -53,7 +59,7 @@ pub async fn serve<S: super::owner::System>(
     while let Some(line) = read_line(&mut reader).await? {
         let request: Value = serde_json::from_str(&line).unwrap_or_default();
         let result = match request["op"].as_str() {
-            Some("hello") => Ok(json!({"version": VERSION, "protocol": PROTOCOL})),
+            Some("hello") => Ok(json!({"version": VERSION, "protocol": PROTOCOL, "build": BUILD})),
             Some("probe") => match request["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
                 Some(port) => session.probe(port).await.map(|metadata| json!(metadata)),
                 None => Err(AppError::InvalidInput("invalid desktop port".into())),
@@ -198,6 +204,32 @@ mod client {
         }
     }
 
+    /// Why a helper that answered `hello` cannot serve this CLI, if it cannot.
+    fn mismatch(hello: &Value) -> Option<String> {
+        (hello["protocol"] != PROTOCOL).then(|| {
+            let theirs = describe(
+                hello["version"].as_str(),
+                hello["build"].as_str(),
+                hello["protocol"].as_u64(),
+            );
+            let ours = describe(Some(VERSION), Some(BUILD), Some(PROTOCOL.into()));
+            format!("is {theirs}, but this CLI is {ours}")
+        })
+    }
+
+    /// `teams-cli 0.1.9 (abc123) speaking protocol 2`, leaving out what is unknown.
+    fn describe(version: Option<&str>, build: Option<&str>, protocol: Option<u64>) -> String {
+        let mut text = format!("teams-cli {}", version.unwrap_or("of an unknown version"));
+        if let Some(build) = build.filter(|b| !b.is_empty()) {
+            text.push_str(&format!(" ({build})"));
+        }
+        match protocol {
+            Some(protocol) => text.push_str(&format!(" speaking protocol {protocol}")),
+            None => text.push_str(" without a protocol number"),
+        }
+        text
+    }
+
     async fn start(executable: &Path) -> Result<Running, AppError> {
         let mut child = Command::new(executable)
             .arg("desktop-helper")
@@ -227,13 +259,15 @@ mod client {
             .await
             .ok()
             .and_then(Result::ok);
-        let compatible = hello
-            .as_ref()
-            .is_some_and(|hello| hello["version"] == VERSION && hello["protocol"] == PROTOCOL);
-        if !compatible {
+        let problem = match &hello {
+            None => Some("did not answer".to_owned()),
+            Some(hello) => mismatch(hello),
+        };
+        if let Some(problem) = problem {
             return Err(AppError::Desktop(format!(
-                "the Windows desktop helper at {} is not teams-cli {VERSION}; reinstall it or run `make windows-helper`",
-                executable.display()
+                "the Windows desktop helper at {} {problem}; {}",
+                executable.display(),
+                super::super::install::remedy()
             )));
         }
         Ok(running)
@@ -246,7 +280,7 @@ mod client {
 
         /// A stand-in helper: answers hello with `version`, then echoes requests, and
         /// exits after `lives` echoes.
-        fn fake_helper(dir: &std::path::Path, version: &str, lives: u32) -> PathBuf {
+        fn fake_helper(dir: &std::path::Path, version: &str, protocol: u32, lives: u32) -> PathBuf {
             let path = dir.join("teams.exe");
             let script = format!(
                 r#"#!/bin/sh
@@ -255,7 +289,7 @@ n=0
 while read -r line; do
   id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
   case "$line" in
-    *'"op":"hello"'*) echo "{{\"id\":$id,\"ok\":{{\"version\":\"{version}\",\"protocol\":{PROTOCOL}}}}}" ;;
+    *'"op":"hello"'*) echo "{{\"id\":$id,\"ok\":{{\"version\":\"{version}\",\"protocol\":{protocol},\"build\":\"0123abcd\"}}}}" ;;
     *'"op":"fail"'*) echo "{{\"id\":$id,\"error\":\"refused\"}}" ;;
     *) n=$((n+1)); echo "{{\"id\":$id,\"ok\":$n}}"; [ $n -ge {lives} ] && exit 0 ;;
   esac
@@ -268,21 +302,39 @@ done
         }
 
         #[tokio::test]
-        async fn handshakes_and_refuses_other_versions() {
+        async fn handshakes_and_refuses_other_protocols_only() {
             let dir = tempfile::tempdir().unwrap();
-            let mut running = start(&fake_helper(dir.path(), VERSION, 9)).await.unwrap();
+            let mut running = start(&fake_helper(dir.path(), VERSION, PROTOCOL, 9))
+                .await
+                .unwrap();
             assert_eq!(running.call(json!({"op": "x"})).await.ok(), Some(json!(1)));
             assert_eq!(running.call(json!({"op": "x"})).await.ok(), Some(json!(2)));
             assert!(matches!(
                 running.call(json!({"op": "fail"})).await,
                 Err(Failure::Refused(m)) if m == "refused"
             ));
+            // Another version or build of the same protocol is accepted.
+            let older = tempfile::tempdir().unwrap();
+            assert!(
+                start(&fake_helper(older.path(), "0.0.1", PROTOCOL, 9))
+                    .await
+                    .is_ok()
+            );
             let other = tempfile::tempdir().unwrap();
-            let error = start(&fake_helper(other.path(), "0.0.0", 9))
+            let error = start(&fake_helper(other.path(), "0.0.1", 1, 9))
                 .await
                 .err()
-                .unwrap();
-            assert!(error.to_string().contains("is not teams-cli"));
+                .unwrap()
+                .to_string();
+            assert!(
+                error
+                    .contains("is teams-cli 0.0.1 (0123abcd) speaking protocol 1, but this CLI is"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("speaking protocol {PROTOCOL};")),
+                "{error}"
+            );
         }
 
         #[tokio::test]
@@ -290,7 +342,7 @@ done
             let dir = tempfile::tempdir().unwrap();
             let mut client = HelperClient {
                 running: None,
-                executable: Some(fake_helper(dir.path(), VERSION, 1)),
+                executable: Some(fake_helper(dir.path(), VERSION, PROTOCOL, 1)),
             };
             // Each helper answers once, then exits; the next call starts a new one.
             for _ in 0..3 {
@@ -308,7 +360,7 @@ done
             // The helper exits right after its first answer, so it is gone for the second.
             let mut client = HelperClient {
                 running: None,
-                executable: Some(fake_helper(dir.path(), VERSION, 1)),
+                executable: Some(fake_helper(dir.path(), VERSION, PROTOCOL, 1)),
             };
             assert_eq!(
                 client.call_once(json!({"op": "x"})).await.unwrap(),
@@ -353,7 +405,10 @@ mod tests {
         };
         let hello = call(json!({"id": 1, "op": "hello"})).await;
         assert_eq!(hello["id"], 1);
-        assert_eq!(hello["ok"]["version"], VERSION);
+        assert_eq!(
+            hello["ok"],
+            json!({"version": VERSION, "protocol": PROTOCOL, "build": BUILD})
+        );
         let probe = call(json!({"id": 2, "op": "probe", "port": 9222})).await;
         assert_eq!(probe["ok"]["status"], "no_listener");
         let bad = call(json!({"id": 3, "op": "read", "request": {"port": 9222}})).await;
