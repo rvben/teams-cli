@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.7...v0.1.8-alpha.1) - 2026-10-13
+
+### Added
+
+- **desktop**: add experimental connection diagnostics ([b24c7c7](https://github.com/rvben/teams-cli/commit/b24c7c7e1fa6cd28dae99b0a1118e60795f1c3d2))
+- Graph-default and experimental Desktop profiles with `doctor`, `auth status`, and capability reporting on macOS, Windows, and WSL. Desktop session, chat, and message access remain unverified and unsupported.
+- Prerelease publication and smoke tests of the extracted release binaries.
+
+### Fixed
+
+- Update `quinn-proto` to address RUSTSEC-2026-0338, RUSTSEC-2026-0340, and RUSTSEC-2026-0343.
+- Exclude design documents and local research from Cargo and Python source packages.
+
 ## [0.1.7](https://github.com/rvben/teams-cli/compare/v0.1.6...v0.1.7) - 2026-09-27
 
 ### Fixed

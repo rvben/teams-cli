@@ -1,6 +1,6 @@
 [package]
 name = "teams-cli"
-version = "0.1.7"
+version = "0.1.8-alpha.1"
 edition = "2024"
 rust-version = "1.90"
 description = "A Microsoft Teams CLI and TUI designed equally for humans and agents"
@@ -11,6 +11,7 @@ documentation = "https://docs.rs/teams-cli"
 readme = "README.md"
 keywords = ["microsoft-teams", "cli", "tui", "graph", "agents"]
 categories = ["command-line-utilities"]
+exclude = ["DESIGN.md", "PRODUCT.md", ".local-research/**", ".impeccable/**"]
 
 [[bin]]
 name = "teams"
