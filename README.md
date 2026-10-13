@@ -211,9 +211,17 @@ through the same path as `messages send`. Existing profiles without a backend fi
 continue to use Graph; Graph remains the default for `init`.
 
 The endpoint must already be enabled through an explicit Teams debugging launch.
-On Windows, for example, set a user environment variable
+On Windows, set the user environment variable
 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`, quit Teams
 fully and start it again; remove the variable and restart Teams to close the port.
+When `doctor` or `init` finds nothing listening on Windows or WSL, it prints both
+commands, ready to paste, for the profile's port (and returns them as
+`debugging_setup` in JSON). The variable applies to every WebView2 app you start
+while it is set, not just Teams. An administrator can limit it to Teams with the
+WebView2 `AdditionalBrowserArguments` policy, a string value named `ms-teams.exe`
+under `HKLM\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`.
+While the port is open, any program running as you can read your chats and send as
+you, so close it when you are done.
 These commands never launch, restart, quit, or sign into Teams, and never enable
 debugging. `init --no-login` saves configuration without probing; ordinary desktop
 initialization probes the existing endpoint. A normal Teams launch usually has no

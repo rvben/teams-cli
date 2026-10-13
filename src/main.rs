@@ -268,11 +268,15 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         } else {
             Some(DesktopClient::new(profile.desktop_port)?.probe().await?)
         };
+        let setup = debugging_setup(connection.as_ref(), profile.desktop_port);
         let value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
             "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
             "read_only":read_only,"desktop_port":profile.desktop_port,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
-            "session_verified":false,"connection":connection});
-        return out.value(&value, || format!("Saved desktop profile '{profile_name}'. Connection diagnostics only; sign-in and chat access are unverified.\nConfig: {}\nNext: `teams --profile {profile_name} doctor`", path.display()));
+            "session_verified":false,"connection":connection,"debugging_setup":setup});
+        return out.value(&value, || {
+            let advice = setup.as_ref().map(|s| format!("\n\n{}", s.text())).unwrap_or_default();
+            format!("Saved desktop profile '{profile_name}'. Connection diagnostics only; sign-in and chat access are unverified.\nConfig: {}\nNext: `teams --profile {profile_name} doctor`{advice}", path.display())
+        });
     }
     if args.desktop_port.is_some() || args.allow_send {
         return Err(AppError::InvalidInput(
@@ -690,6 +694,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debugging_setup_is_offered_only_when_nothing_listens() {
+        assert!(debugging_setup(None, 9333).is_none());
+        for status in [
+            desktop::ProbeStatus::UnsafeListenerRefused,
+            desktop::ProbeStatus::NonTeamsListenerRefused,
+            desktop::ProbeStatus::MetadataProbeFailed,
+            desktop::ProbeStatus::MetadataOk,
+        ] {
+            let connection = desktop::ConnectionMetadata {
+                port: 9333,
+                status,
+                loopback_only: None,
+                teams_owned: None,
+                version: None,
+                browser_websocket_advertised: false,
+                targets: Vec::new(),
+            };
+            assert!(
+                debugging_setup(Some(&connection), 9333).is_none(),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tui_recovers_configuration_and_authentication_only() {
         assert!(tui_auth_recoverable(&AppError::InvalidInput(
             "profile 'work' is not configured; run `teams init`".into()
@@ -841,7 +870,7 @@ async fn doctor(profile_arg: Option<&str>, offline: bool, out: Output) -> Result
     let healthy = is_healthy(&checks);
     let value =
         serde_json::json!({"backend":"graph","checks":checks,"healthy":healthy,"offline":offline});
-    doctor_report(&value, &checks, out)
+    doctor_report(&value, &checks, None, out)
 }
 
 async fn desktop_doctor(
@@ -948,25 +977,46 @@ async fn desktop_doctor(
                 .into(),
     });
     let healthy = is_healthy(&checks);
+    let setup = debugging_setup(connection.as_ref(), profile.desktop_port);
     let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"healthy":healthy,"offline":offline,
         "endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),"session_verified":false,"signed_in":null,
-        "desktop_port":profile.desktop_port,"connection":connection,"checks":checks});
-    doctor_report(&value, &checks, out)
+        "desktop_port":profile.desktop_port,"connection":connection,"debugging_setup":setup,"checks":checks});
+    doctor_report(&value, &checks, setup.map(|s| s.text()), out)
 }
 
 fn is_healthy(checks: &[Check]) -> bool {
     checks.iter().all(|check| check.status != "fail")
 }
 
-/// Prints the full report, then fails with `unhealthy` so scripts can rely on the exit code.
-fn doctor_report(value: &Value, checks: &[Check], out: Output) -> Result<(), AppError> {
+/// The commands to open Teams' debugging port, when a probe found nothing listening.
+fn debugging_setup(
+    connection: Option<&desktop::ConnectionMetadata>,
+    port: u16,
+) -> Option<desktop::DebuggingSetup> {
+    connection
+        .filter(|c| c.status == desktop::ProbeStatus::NoListener)
+        .and_then(|_| desktop::DebuggingSetup::new(port))
+}
+
+/// Prints the full report and any advice after it, then fails with `unhealthy` so scripts
+/// can rely on the exit code.
+fn doctor_report(
+    value: &Value,
+    checks: &[Check],
+    advice: Option<String>,
+    out: Output,
+) -> Result<(), AppError> {
     let width = checks.iter().map(|c| c.status.len()).max().unwrap_or(0);
     out.value(value, || {
-        checks
+        let report = checks
             .iter()
             .map(|c| format!("{:<18} {:<width$}  {}", c.name, c.status, c.detail))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        match &advice {
+            Some(advice) => format!("{report}\n\n{advice}"),
+            None => report,
+        }
     })?;
     let failed: Vec<_> = checks
         .iter()

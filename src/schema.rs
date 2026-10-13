@@ -21,6 +21,21 @@ fn described(mut field: Value, description: &str) -> Value {
     field["description"] = json!(description);
     field
 }
+fn debugging_setup() -> Value {
+    object_field(
+        "debugging_setup",
+        true,
+        "Commands for the user to run that open and close Teams' debugging port; only when nothing listens on the desktop port under Windows or WSL. Running them restarts Teams; the CLI never does",
+        vec![
+            described(
+                field("shell", "string"),
+                "wsl or powershell: where the commands run",
+            ),
+            field("open", "string"),
+            field("close", "string"),
+        ],
+    )
+}
 fn sender() -> Value {
     object_field(
         "from",
@@ -217,6 +232,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     nullable_field("endpoint_available", "boolean"),
                     nullable_field("connection", "object"),
                     field("session_verified", "boolean"),
+                    debugging_setup(),
                 ],
             );
             value["args"] = json!([
@@ -487,6 +503,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     nullable_field("connection", "object"),
                     nullable_field("endpoint_available", "boolean"),
                     field("session_verified", "boolean"),
+                    debugging_setup(),
                 ],
             );
             value["args"] = json!([arg(

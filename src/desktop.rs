@@ -53,7 +53,7 @@ impl ProbeStatus {
     pub fn detail(self) -> &'static str {
         match self {
             Self::NoListener => {
-                "No endpoint on this port. Teams must already be launched with loopback debugging enabled; the CLI does not launch or restart it."
+                "No endpoint on this port: Teams is not running with its debugging port open. `teams doctor` shows the commands to open it; the CLI never changes Teams' settings or restarts it."
             }
             Self::UnsafeListenerRefused => "Refused a listener bound beyond loopback.",
             Self::NonTeamsListenerRefused => {
@@ -502,6 +502,57 @@ pub fn platform() -> Result<&'static str, AppError> {
     }
 }
 
+/// Commands that open and close Teams' debugging port on Windows, for people to run
+/// themselves: the CLI never changes Teams' settings or restarts Teams. Both set the
+/// user variable WebView2 reads at start, then restart Teams so it takes effect.
+#[derive(Debug, Serialize)]
+pub struct DebuggingSetup {
+    /// `wsl` for a WSL shell, `powershell` for Windows PowerShell.
+    pub shell: &'static str,
+    pub open: String,
+    pub close: String,
+}
+
+impl DebuggingSetup {
+    pub fn new(port: u16) -> Option<Self> {
+        let shell = match platform().ok()? {
+            "wsl_windows_helper" => "wsl",
+            "windows_native" => "powershell",
+            _ => return None,
+        };
+        Some(Self::for_shell(shell, port))
+    }
+
+    fn for_shell(shell: &'static str, port: u16) -> Self {
+        // Only double quotes inside, so the WSL form can wrap it in single quotes.
+        let command = |value: &str| {
+            let code = format!(
+                r#"[Environment]::SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", {value}, "User"); Get-Process ms-teams -ErrorAction SilentlyContinue | Stop-Process; Start-Sleep 2; Start-Process "shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams""#
+            );
+            match shell {
+                "wsl" => format!("powershell.exe -NoProfile -Command '{code}'"),
+                _ => code,
+            }
+        };
+        Self {
+            shell,
+            open: command(&format!(r#""--remote-debugging-port={port}""#)),
+            close: command("$null"),
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let shell = match self.shell {
+            "wsl" => "this WSL shell",
+            _ => "PowerShell",
+        };
+        format!(
+            "To open Teams' debugging port, run this in {shell}. It restarts Teams, which ends any call in progress:\n  {}\nTo close it again:\n  {}\nWhile the port is open, any program running as you can read your chats and send as you.",
+            self.open, self.close
+        )
+    }
+}
+
 /// The hidden `desktop-helper` command: answers the Linux CLI under WSL until stdin closes.
 pub async fn serve_helper() -> Result<(), AppError> {
     #[cfg(windows)]
@@ -832,6 +883,33 @@ mod tests {
 
     fn page_reply(value: Value) -> Value {
         json!({"result": {"result": {"type": "string", "value": value.to_string()}}})
+    }
+
+    #[test]
+    fn debugging_setup_sets_and_clears_the_variable_and_restarts_teams() {
+        let wsl = DebuggingSetup::for_shell("wsl", 9333);
+        assert_eq!(
+            wsl.open,
+            r#"powershell.exe -NoProfile -Command '[Environment]::SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--remote-debugging-port=9333", "User"); Get-Process ms-teams -ErrorAction SilentlyContinue | Stop-Process; Start-Sleep 2; Start-Process "shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams"'"#
+        );
+        assert!(
+            wsl.close
+                .contains(r#""WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", $null, "User")"#)
+        );
+        // The WSL form is wrapped in single quotes, so nothing inside may close them.
+        for command in [&wsl.open, &wsl.close] {
+            let inner = &command["powershell.exe -NoProfile -Command '".len()..command.len() - 1];
+            assert!(!inner.contains('\''), "{command}");
+        }
+        let native = DebuggingSetup::for_shell("powershell", 9333);
+        assert!(
+            native
+                .open
+                .starts_with("[Environment]::SetEnvironmentVariable(")
+        );
+        assert!(native.text().contains("in PowerShell"));
+        assert!(wsl.text().contains("in this WSL shell"));
+        assert!(wsl.text().contains("any program running as you"));
     }
 
     /// Helpers and CLIs of different versions talk to each other whenever their protocol
