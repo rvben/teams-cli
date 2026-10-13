@@ -464,6 +464,7 @@ impl App {
                 older,
                 result,
             } => {
+                let opened = self.selected_row().is_some_and(|row| row.id == chat);
                 let Some(thread) = self.threads.get_mut(&chat) else {
                     return;
                 };
@@ -500,6 +501,9 @@ impl App {
                         if self.viewer.is_none() && page.viewer.is_some() {
                             self.viewer = page.viewer;
                             self.rebuild(None);
+                        }
+                        if opened && !older {
+                            self.prefetch_neighbours();
                         }
                     }
                     Err(error) if older || matches!(thread.load, Load::Ready) => {
@@ -577,9 +581,31 @@ impl App {
 
     fn open_selected(&mut self) {
         self.selected_at = None;
+        // A chat that failed while prefetched gets one fresh attempt when opened.
         if let Some(id) = self.selected_row().map(|row| row.id.clone())
-            && !self.threads.contains_key(&id)
+            && self
+                .threads
+                .get(&id)
+                .is_none_or(|thread| matches!(thread.load, Load::Failed { .. }))
         {
+            self.load_messages(id, false);
+        }
+    }
+
+    /// Loads the chats either side of the open one, so stepping through the ledger
+    /// shows them without waiting.
+    fn prefetch_neighbours(&mut self) {
+        let Some(index) = self.list.selected() else {
+            return;
+        };
+        let neighbours: Vec<String> = [index.checked_sub(1), index.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|i| self.visible.get(i))
+            .map(|&i| self.rows[i].id.clone())
+            .filter(|id| !self.threads.contains_key(id))
+            .collect();
+        for id in neighbours {
             self.load_messages(id, false);
         }
     }
@@ -597,13 +623,15 @@ impl App {
         }
     }
 
+    /// Background prefetches stay quiet; only the open chat shows activity.
     fn busy(&self) -> bool {
         matches!(self.chats_load, Load::Loading)
             || self.loading_more
-            || self
-                .threads
-                .values()
-                .any(|t| t.loading_older || matches!(t.load, Load::Loading))
+            || self.selected_row().is_some_and(|row| {
+                self.threads
+                    .get(&row.id)
+                    .is_some_and(|t| t.loading_older || matches!(t.load, Load::Loading))
+            })
     }
 
     fn sign_in_needed(&self) -> bool {
@@ -1894,6 +1922,28 @@ mod tests {
         assert!(buffer_text(terminal.backend().buffer()).contains("KEYBOARD MAP"));
         assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::None));
         assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::Quit));
+    }
+
+    #[test]
+    fn opening_a_chat_prefetches_its_neighbours_and_retries_failures() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        let ids: Vec<String> = app
+            .visible
+            .iter()
+            .map(|&i| app.rows[i].id.clone())
+            .collect();
+        let below = ids[2].clone();
+        assert!(app.threads.contains_key(&ids[0]) && app.threads.contains_key(&below));
+        assert!(!app.threads.contains_key(&ids[3]));
+        app.threads.get_mut(&below).unwrap().load =
+            Load::failed(&AppError::Desktop("read failed".into()));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('j'));
+        app.open_selected();
+        assert!(matches!(app.threads[&below].load, Load::Ready));
+        assert!(app.threads.contains_key(&ids[3]));
     }
 
     #[test]
