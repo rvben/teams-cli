@@ -190,11 +190,21 @@ fn init_can_create_a_read_only_profile_and_config_show_resolves_it() {
 #[test]
 fn profile_lifecycle_and_offline_auth_status_are_local() {
     let temp = tempfile::tempdir().unwrap();
-    for name in ["work", "sandbox"] {
+    // Credentials use profile names independently of config folders.
+    let work = format!("profile-work-{:032x}", rand::random::<u128>());
+    let sandbox = format!("profile-sandbox-{:032x}", rand::random::<u128>());
+    for (name, backend) in [(&work, "graph"), (&sandbox, "desktop")] {
         Command::cargo_bin("teams")
             .unwrap()
             .env("XDG_CONFIG_HOME", temp.path())
-            .args(["--profile", name, "init", "--no-login"])
+            .args([
+                "--profile",
+                name,
+                "init",
+                "--backend",
+                backend,
+                "--no-login",
+            ])
             .assert()
             .success();
     }
@@ -202,7 +212,7 @@ fn profile_lifecycle_and_offline_auth_status_are_local() {
     Command::cargo_bin("teams")
         .unwrap()
         .env("XDG_CONFIG_HOME", temp.path())
-        .args(["profile", "use", "work"])
+        .args(["profile", "use", &work])
         .assert()
         .success();
 
@@ -220,7 +230,7 @@ fn profile_lifecycle_and_offline_auth_status_are_local() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|profile| { profile["name"] == "work" && profile["active"] == true })
+            .any(|profile| { profile["name"] == work && profile["active"] == true })
     );
 
     Command::cargo_bin("teams")
@@ -234,7 +244,7 @@ fn profile_lifecycle_and_offline_auth_status_are_local() {
     Command::cargo_bin("teams")
         .unwrap()
         .env("XDG_CONFIG_HOME", temp.path())
-        .args(["profile", "remove", "sandbox", "--yes"])
+        .args(["profile", "remove", &sandbox, "--yes"])
         .assert()
         .success();
 }
