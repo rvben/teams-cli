@@ -1,5 +1,6 @@
-//! Existing-endpoint diagnostics and read-only chat access through the Teams client's own
-//! cache. Never launches Teams; evaluates only the fixed read script in `desktop.js`.
+//! Existing-endpoint diagnostics, chat reading through the Teams client's own cache, and
+//! sending plain-text chat messages through the Teams window's own client. Never launches
+//! Teams; evaluates only the fixed scripts in `desktop.js` and `desktop_send.js`.
 //!
 //! On Windows the CLI verifies the endpoint and reads in-process. Under WSL it drives the
 //! Windows build of itself as a long-lived helper (`teams.exe desktop-helper`).
@@ -31,9 +32,11 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(any(target_os = "macos", windows, test))]
 const MAX_METADATA: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
+/// Teams' own limit for one chat message.
+pub const MAX_BODY: usize = 28_000;
 
 pub fn messaging_unsupported() -> AppError {
-    AppError::Unsupported("the experimental desktop backend reads chats and chat messages only (Windows/WSL); teams, channels, identity and sending need a Graph profile".into())
+    AppError::Unsupported("the experimental desktop backend reads chats and chat messages and sends plain-text chat messages only (Windows/WSL); teams, channels and identity need a Graph profile".into())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,6 +209,50 @@ impl DesktopClient {
             .await?;
         read_page(&reply)
     }
+
+    /// Sends one plain-text chat message as the signed-in Teams user. Never retried: a lost
+    /// answer is reported as unconfirmed, because Teams may already have the message.
+    pub async fn send(&self, chat: &str, body: &str) -> Result<Value, AppError> {
+        let request = send_request(self.port, chat, body)?;
+        desktop_messaging()?;
+        #[cfg(windows)]
+        let reply = self.session.lock().await.send(&request).await?;
+        #[cfg(not(windows))]
+        let reply = self
+            .helper
+            .lock()
+            .await
+            .call_once(json!({"op": "send", "request": request}))
+            .await?;
+        sent_message(&reply, chat)
+    }
+
+    /// Whether the Teams window that sends messages is reachable; sends nothing.
+    pub async fn send_check(&self) -> Result<(), AppError> {
+        desktop_messaging()?;
+        #[cfg(windows)]
+        let reply = self.session.lock().await.send_check(self.port).await?;
+        #[cfg(not(windows))]
+        let reply = self
+            .helper
+            .lock()
+            .await
+            .call(json!({"op": "send_check", "port": self.port}))
+            .await?;
+        match reply["error"].as_str() {
+            None if reply["ok"] == true => Ok(()),
+            code => Err(send_error(code.unwrap_or_default())),
+        }
+    }
+}
+
+fn desktop_messaging() -> Result<(), AppError> {
+    if platform()? == "macos_loopback" {
+        return Err(AppError::Unsupported(
+            "desktop chat sending is available on Windows and WSL only".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn valid_id(id: &str) -> bool {
@@ -221,12 +268,8 @@ fn read_request(
     limit: u16,
     cursor: Option<&str>,
 ) -> Result<Value, AppError> {
-    if let Some(chat) = chat
-        && !(chat.starts_with("19:") && valid_id(chat))
-    {
-        return Err(AppError::InvalidInput(
-            "desktop chat ids look like `19:...@thread.v2` or `19:...@unq.gbl.spaces`".into(),
-        ));
+    if let Some(chat) = chat {
+        check_chat(chat)?;
     }
     let after = cursor.map(decode_cursor).transpose()?;
     Ok(json!({
@@ -236,6 +279,121 @@ fn read_request(
         "chat_id": chat,
         "limit": limit,
         "after": after,
+    }))
+}
+
+/// A chat id as `teams chats` lists them; `48:notes` is the chat with yourself.
+fn chat_id(id: &str) -> bool {
+    id == NOTES || id.starts_with("19:") && valid_id(id)
+}
+
+const NOTES: &str = "48:notes";
+
+/// Refuses anything but a chat id as `teams chats` lists them.
+pub fn check_chat(chat: &str) -> Result<(), AppError> {
+    if chat_id(chat) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidInput(
+            "desktop chat ids look like `19:...@thread.v2`, `19:...@unq.gbl.spaces` or `48:notes`"
+                .into(),
+        ))
+    }
+}
+
+/// Plain text Teams accepts as one message.
+fn valid_body(body: &str) -> bool {
+    !body.trim().is_empty() && body.chars().count() <= MAX_BODY && !body.contains('\0')
+}
+
+/// A send request with a fresh client message id, which Teams uses to recognise the message.
+fn send_request(port: u16, chat: &str, body: &str) -> Result<Value, AppError> {
+    check_chat(chat)?;
+    if !valid_body(body) {
+        return Err(AppError::InvalidInput(format!(
+            "message body must be non-empty plain text of at most {MAX_BODY} characters"
+        )));
+    }
+    let id: u64 = rand::Rng::random_range(
+        &mut rand::rng(),
+        100_000_000_000_000_000..1_000_000_000_000_000_000,
+    );
+    Ok(json!({
+        "operation": "send",
+        "port": port,
+        "chat_id": chat,
+        "body": body,
+        "client_message_id": id.to_string(),
+    }))
+}
+
+fn send_error(code: &str) -> AppError {
+    match code {
+        "not_found" => AppError::NotFound("chat not found in the Teams desktop cache".into()),
+        "unconfirmed" => AppError::Desktop(
+            "Teams did not confirm the message; it may still be delivered. Check the chat before sending again".into(),
+        ),
+        "layout" => AppError::Desktop(
+            "The Teams window's send interface was not recognised; this Teams version is not supported for sending yet".into(),
+        ),
+        "no_target" => AppError::Desktop(
+            "No Teams window is available on the debugging endpoint; open Teams and sign in".into(),
+        ),
+        code => match serde_json::from_value::<ProbeStatus>(json!(code)) {
+            Ok(status) => AppError::Desktop(status.detail().into()),
+            Err(_) => AppError::Desktop(
+                "The message was not sent; the Teams page could not be reached. Run `teams doctor`".into(),
+            ),
+        },
+    }
+}
+
+/// Maps a send reply to the Graph send shape, plus Teams' own status label.
+fn sent_message(reply: &Value, chat: &str) -> Result<Value, AppError> {
+    if let Some(code) = reply.get("error").and_then(Value::as_str) {
+        return Err(send_error(code));
+    }
+    let result = &reply["result"];
+    if let Some(details) = result.get("exceptionDetails") {
+        // The script reports every failure after handing the message to Teams itself, so an
+        // exception means nothing was sent.
+        let layout = details["exception"]["description"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("Error: layout"));
+        return Err(send_error(if layout { "layout" } else { "" }));
+    }
+    let value: Value = result["result"]["value"]
+        .as_str()
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or_else(|| send_error("unconfirmed"))?;
+    if let Some(code) = value["error"].as_str() {
+        return Err(send_error(code));
+    }
+    let id = value["id"]
+        .as_str()
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| send_error("unconfirmed"))?;
+    let label = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|v| v.len() <= 64 && valid_id(v))
+            .map(String::from)
+    };
+    let arrival = &value["originalArrivalTime"];
+    let created = arrival
+        .as_i64()
+        .or_else(|| arrival.as_str().and_then(|t| t.parse().ok()))
+        .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+        .or_else(|| arrival.as_str().and_then(|t| t.parse().ok()))
+        .map(|t| t.to_string());
+    Ok(json!({
+        "id": id,
+        "chatId": chat,
+        "createdDateTime": created,
+        "webUrl": null,
+        "clientMessageId": label("clientMessageId"),
+        "status": label("status"),
+        "source": "desktop",
     }))
 }
 
@@ -669,6 +827,114 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    const CHAT: &str = "19:a@thread.v2";
+
+    fn page_reply(value: Value) -> Value {
+        json!({"result": {"result": {"type": "string", "value": value.to_string()}}})
+    }
+
+    #[test]
+    fn send_requests_validate_and_carry_a_fresh_client_message_id() {
+        let request = send_request(9222, CHAT, "hello\nthere").unwrap();
+        assert_eq!(request["operation"], "send");
+        assert_eq!(request["chat_id"], CHAT);
+        assert_eq!(request["body"], "hello\nthere");
+        let id = request["client_message_id"].as_str().unwrap();
+        assert!(id.len() == 18 && id.bytes().all(|b| b.is_ascii_digit()));
+        assert_ne!(
+            send_request(9222, CHAT, "x").unwrap()["client_message_id"],
+            request["client_message_id"]
+        );
+        for (chat, body) in [
+            ("fixture", "hello"),
+            ("19:a b@thread.v2", "hello"),
+            ("48:notes2", "hello"),
+            ("48:other", "hello"),
+            (CHAT, ""),
+            (CHAT, " \n\t"),
+            (CHAT, "a\0b"),
+            (CHAT, &"x".repeat(MAX_BODY + 1)),
+        ] {
+            assert!(
+                matches!(
+                    send_request(9222, chat, body),
+                    Err(AppError::InvalidInput(_))
+                ),
+                "{chat:?} accepted"
+            );
+        }
+        assert!(send_request(9222, CHAT, &"é".repeat(MAX_BODY)).is_ok());
+        assert!(send_request(9222, NOTES, "hello").is_ok());
+    }
+
+    #[test]
+    fn sent_messages_map_to_the_graph_shape() {
+        let reply = page_reply(
+            json!({"id": "1760000000000", "clientMessageId": "123456789012345678",
+            "originalArrivalTime": "1760000000000", "status": "Sent"}),
+        );
+        let message = sent_message(&reply, CHAT).unwrap();
+        assert_eq!(message["id"], "1760000000000");
+        assert_eq!(message["chatId"], CHAT);
+        assert_eq!(message["createdDateTime"], "2025-10-09T08:53:20Z");
+        assert_eq!(message["clientMessageId"], "123456789012345678");
+        assert_eq!(message["status"], "Sent");
+        assert_eq!(message["source"], "desktop");
+        for arrival in [json!(1760000000000_i64), json!("2025-10-09T08:53:20Z")] {
+            let reply = page_reply(json!({"id": "1", "originalArrivalTime": arrival}));
+            assert_eq!(
+                sent_message(&reply, CHAT).unwrap()["createdDateTime"],
+                "2025-10-09T08:53:20Z"
+            );
+        }
+        let reply = page_reply(json!({"id": "1", "status": "<b>not a label</b>"}));
+        let message = sent_message(&reply, CHAT).unwrap();
+        assert!(message["status"].is_null() && message["createdDateTime"].is_null());
+    }
+
+    #[test]
+    fn send_failures_say_whether_the_message_may_have_gone() {
+        let unconfirmed = |error: AppError| error.to_string().contains("may still be delivered");
+        for reply in [
+            json!({"error": "unconfirmed"}),
+            page_reply(json!({"error": "unconfirmed"})),
+            page_reply(json!({"id": "bad id"})),
+            page_reply(json!({})),
+            json!({"result": {"result": {"type": "undefined"}}}),
+        ] {
+            assert!(
+                unconfirmed(sent_message(&reply, CHAT).unwrap_err()),
+                "{reply}"
+            );
+        }
+        assert!(matches!(
+            sent_message(&page_reply(json!({"error": "not_found"})), CHAT),
+            Err(AppError::NotFound(_))
+        ));
+        let thrown =
+            json!({"result": {"exceptionDetails": {"exception": {"description": "TypeError: x"}}}});
+        let error = sent_message(&thrown, CHAT).unwrap_err();
+        assert!(
+            !unconfirmed(error)
+                && sent_message(&thrown, CHAT)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not sent")
+        );
+        for code in [
+            "layout",
+            "no_target",
+            "non_teams_listener_refused",
+            "something_else",
+        ] {
+            let error = sent_message(&json!({"error": code}), CHAT).unwrap_err();
+            assert!(
+                matches!(error, AppError::Desktop(_)) && !unconfirmed(error),
+                "{code}"
+            );
+        }
+    }
 
     #[test]
     fn read_requests_validate_chat_ids_and_cursors() {

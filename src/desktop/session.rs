@@ -1,15 +1,18 @@
 //! A verified page connection kept for the life of the process, so only the first read
-//! pays for verification and the socket handshake.
+//! pays for verification and the socket handshake. Sends never reuse it: each one verifies
+//! afresh and evaluates exactly once.
 use super::{
     ConnectionMetadata, ProbeStatus,
     cdp::Cdp,
+    chat_id,
     owner::{System, verify},
-    valid_id,
+    valid_body, valid_id,
 };
 use crate::error::AppError;
 use serde_json::{Value, json};
 
 const READ_SCRIPT: &str = include_str!("../desktop.js");
+const SEND_SCRIPT: &str = include_str!("../desktop_send.js");
 
 pub struct Session<S> {
     system: S,
@@ -45,7 +48,7 @@ impl<S: System> Session<S> {
         if metadata.status != ProbeStatus::MetadataOk {
             return Ok(refusal(metadata.status));
         }
-        let Some(target) = teams_page(&targets) else {
+        let Some(target) = teams_pages(&targets).into_iter().next() else {
             return Ok(json!({"error": "no_target"}));
         };
         let Ok(mut page) = Cdp::connect(port, target).await else {
@@ -59,6 +62,89 @@ impl<S: System> Session<S> {
             Err(_) => Ok(json!({"error": "read_failed"})),
         }
     }
+
+    /// Whether a send could start: `{"ok": true}` or `{"error": code}`. Sends nothing.
+    pub async fn send_check(&self, port: u16) -> Result<Value, AppError> {
+        valid_port(port)?;
+        Ok(match self.main_page(port).await {
+            Ok(_) => json!({"ok": true}),
+            Err(refused) => refused,
+        })
+    }
+
+    /// Sends one message: verifies the listener, finds the Teams window and evaluates the
+    /// send script exactly once. A lost answer is `unconfirmed`, never retried.
+    pub async fn send(&self, request: &Value) -> Result<Value, AppError> {
+        let (port, params) = send_params(request)?;
+        let mut page = match self.main_page(port).await {
+            Ok(page) => page,
+            Err(refused) => return Ok(refused),
+        };
+        Ok(
+            match page
+                .evaluate(&format!("({SEND_SCRIPT})({params}).then(JSON.stringify)"))
+                .await
+            {
+                Ok(result) => json!({"result": result}),
+                Err(_) => json!({"error": "unconfirmed"}),
+            },
+        )
+    }
+
+    /// A fresh connection to the Teams window that hosts the send client, or a refusal.
+    async fn main_page(&self, port: u16) -> Result<Cdp, Value> {
+        let Ok((metadata, targets)) = verify(&self.system, port).await else {
+            return Err(refusal(ProbeStatus::MetadataProbeFailed));
+        };
+        if metadata.status != ProbeStatus::MetadataOk {
+            return Err(refusal(metadata.status));
+        }
+        let candidates = teams_pages(&targets);
+        if candidates.is_empty() {
+            return Err(json!({"error": "no_target"}));
+        }
+        let probe = format!("({SEND_SCRIPT})({{\"probe\":true}}).then(JSON.stringify)");
+        for target in candidates {
+            let Ok(mut page) = Cdp::connect(port, target).await else {
+                continue;
+            };
+            let main = page
+                .evaluate(&probe)
+                .await
+                .is_ok_and(|result| result["result"]["value"].as_str() == Some(r#"{"main":true}"#));
+            if main {
+                return Ok(page);
+            }
+        }
+        Err(json!({"error": "layout"}))
+    }
+}
+
+/// Revalidates a send request and builds the page parameters; they reach the page only as
+/// a JSON literal.
+fn send_params(request: &Value) -> Result<(u16, Value), AppError> {
+    let invalid = || AppError::InvalidInput("invalid desktop send request".into());
+    let port = request["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .ok_or_else(invalid)?;
+    valid_port(port)?;
+    let chat = request["chat_id"]
+        .as_str()
+        .filter(|chat| chat_id(chat))
+        .ok_or_else(invalid)?;
+    let content = request["body"]
+        .as_str()
+        .filter(|body| valid_body(body))
+        .ok_or_else(invalid)?;
+    let id = request["client_message_id"]
+        .as_str()
+        .filter(|id| id.len() == 18 && id.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(invalid)?;
+    Ok((
+        port,
+        json!({"chat": chat, "content": content, "clientMessageId": id}),
+    ))
 }
 
 fn refusal(status: ProbeStatus) -> Value {
@@ -90,7 +176,7 @@ fn read_params(request: &Value) -> Result<(u16, Value), AppError> {
         .ok_or_else(invalid)?;
     let chat = match (query, request["chat_id"].as_str()) {
         ("chats", None) => "",
-        ("messages", Some(chat)) if chat.starts_with("19:") && valid_id(chat) => chat,
+        ("messages", Some(chat)) if chat_id(chat) => chat,
         _ => return Err(invalid()),
     };
     let after = match &request["after"] {
@@ -113,24 +199,30 @@ fn read_params(request: &Value) -> Result<(u16, Value), AppError> {
     ))
 }
 
-/// The first Teams page; its id becomes part of the socket path, so it is validated.
-fn teams_page(targets: &[Value]) -> Option<&str> {
-    targets.iter().find_map(|target| {
-        let url = target["url"].as_str()?;
-        let id = target["id"].as_str()?;
-        (target["type"] == "page"
-            && (url.starts_with("https://teams.microsoft.com/")
-                || url.starts_with("https://teams.cloud.microsoft/"))
-            && (8..=64).contains(&id.len())
-            && id.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then_some(id)
-    })
+/// The Teams pages in endpoint order; their ids become part of the socket path, so they
+/// are validated.
+fn teams_pages(targets: &[Value]) -> Vec<&str> {
+    targets
+        .iter()
+        .filter_map(|target| {
+            let url = target["url"].as_str()?;
+            let id = target["id"].as_str()?;
+            (target["type"] == "page"
+                && (url.starts_with("https://teams.microsoft.com/")
+                    || url.starts_with("https://teams.cloud.microsoft/"))
+                && (8..=64).contains(&id.len())
+                && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(id)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop::{cdp::tests::devtools_server, owner::tests::FakeSystem, read_request};
+    use crate::desktop::{
+        MAX_BODY, cdp::tests::devtools_server, owner::tests::FakeSystem, read_request,
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -171,8 +263,8 @@ mod tests {
             json!({"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "../../x"}),
             json!({"type": "page", "url": "https://teams.cloud.microsoft/v2/", "id": "CCCCCCCC"}),
         ];
-        assert_eq!(teams_page(&targets), Some("CCCCCCCC"));
-        assert_eq!(teams_page(&targets[..3]), None);
+        assert_eq!(teams_pages(&targets), ["CCCCCCCC"]);
+        assert!(teams_pages(&targets[..3]).is_empty());
     }
 
     #[tokio::test]
@@ -219,6 +311,127 @@ mod tests {
         assert_eq!(
             session.read(&request).await.unwrap(),
             json!({"error": "non_teams_listener_refused"})
+        );
+    }
+
+    fn send_request(port: u16) -> Value {
+        crate::desktop::send_request(port, "19:a@thread.v2", "hi <b>\nthere").unwrap()
+    }
+
+    #[test]
+    fn send_params_are_revalidated() {
+        let base = send_request(9222);
+        let (port, params) = send_params(&base).unwrap();
+        assert_eq!(port, 9222);
+        assert_eq!(params["chat"], "19:a@thread.v2");
+        assert_eq!(params["content"], "hi <b>\nthere");
+        assert_eq!(params["clientMessageId"].as_str().unwrap().len(), 18);
+        for (key, value) in [
+            ("port", json!(80)),
+            ("chat_id", json!("19:a'); x")),
+            ("chat_id", json!("48:other")),
+            ("body", json!("  \n")),
+            ("body", json!("a\0b")),
+            ("body", json!("x".repeat(MAX_BODY + 1))),
+            ("body", Value::Null),
+            ("client_message_id", json!("12345")),
+            ("client_message_id", json!("12345678901234567x")),
+        ] {
+            let mut request = base.clone();
+            request[key] = value;
+            assert!(send_params(&request).is_err(), "{key}");
+        }
+    }
+
+    /// Three Teams pages; only the second hosts the send client. Counts send evaluations.
+    async fn teams_window(sends: Arc<AtomicUsize>, answer_send: bool) -> u16 {
+        devtools_server(
+            json!([
+                {"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "AAAAAAAA"},
+                {"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "BBBBBBBB"},
+                {"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "CCCCCCCC"},
+            ]),
+            move |request| {
+                let expression = request["params"]["expression"].as_str().unwrap();
+                assert!(expression.contains("autoSendMessage"));
+                let value = if expression.contains(r#"({"probe":true})"#) {
+                    // The page id is not visible here; answer by probe order instead.
+                    if sends.fetch_add(1000, Ordering::SeqCst) / 1000 == 1 {
+                        r#"{"main":true}"#
+                    } else {
+                        r#"{"main":false}"#
+                    }
+                } else {
+                    assert!(expression.contains(r#""chat":"19:a@thread.v2""#));
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    if !answer_send {
+                        return None;
+                    }
+                    r#"{"id":"1700000000000"}"#
+                };
+                Some(json!({"id": request["id"], "result": {"result": {"type": "string", "value": value}}}).to_string())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn sends_go_to_the_window_with_the_client_and_run_once() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let port = teams_window(sends.clone(), true).await;
+        let session = Session::new(FakeSystem::teams());
+        assert_eq!(session.send_check(port).await.unwrap(), json!({"ok": true}));
+        sends.store(0, Ordering::SeqCst);
+        let reply = session.send(&send_request(port)).await.unwrap();
+        assert_eq!(
+            reply["result"]["result"]["value"],
+            r#"{"id":"1700000000000"}"#
+        );
+        // Two probes (the first page is not the window), then one send.
+        assert_eq!(sends.load(Ordering::SeqCst), 2001);
+    }
+
+    #[tokio::test]
+    async fn a_lost_send_answer_is_unconfirmed_and_not_retried() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let port = teams_window(sends.clone(), false).await;
+        let session = Session::new(FakeSystem::teams());
+        assert_eq!(
+            session.send(&send_request(port)).await.unwrap(),
+            json!({"error": "unconfirmed"})
+        );
+        assert_eq!(sends.load(Ordering::SeqCst) % 1000, 1);
+    }
+
+    #[tokio::test]
+    async fn sends_are_refused_without_a_verified_window() {
+        let untrusted = Session::new(FakeSystem {
+            trusted: vec![],
+            ..FakeSystem::teams()
+        });
+        let sends = Arc::new(AtomicUsize::new(0));
+        let port = teams_window(sends.clone(), true).await;
+        assert_eq!(
+            untrusted.send(&send_request(port)).await.unwrap(),
+            json!({"error": "non_teams_listener_refused"})
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        let empty = devtools_server(json!([]), |_| None).await;
+        let session = Session::new(FakeSystem::teams());
+        assert_eq!(
+            session.send_check(empty).await.unwrap(),
+            json!({"error": "no_target"})
+        );
+        let none = devtools_server(
+            json!([{"type": "page", "url": "https://teams.microsoft.com/v2/", "id": "AAAAAAAA"}]),
+            |request| {
+                Some(json!({"id": request["id"], "result": {"result": {"type": "string", "value": r#"{"main":false}"#}}}).to_string())
+            },
+        )
+        .await;
+        assert_eq!(
+            session.send(&send_request(none)).await.unwrap(),
+            json!({"error": "layout"})
         );
     }
 }

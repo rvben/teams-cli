@@ -9,12 +9,12 @@ prof=async ids=>{const n={};let d;try{d=await open('profiles');const s=d.transac
 await Promise.all(ids.map(async i=>{const r=await req(s.get('8:orgid:'+i));if(r&&r.displayName)n[i]=r.displayName}))}catch(e){}finally{d&&d.close()}return n},
 chain=async(d,id)=>(await req(d.transaction('replychains').objectStore('replychains').getAll(IDBKeyRange.bound([id],[id,[]])))).flatMap(rc=>Object.values(rc.messageMap||{}));
 const cdb=await open('conversation-manager'),me=cdb.name.split(':')[4],cs=cdb.transaction('conversations').objectStore('conversations');let pg;
-try{if(p.query=='chats')pg=page((await req(cs.getAll())).filter(c=>c.type=='Chat'||c.type=='Meeting').map(c=>({t:c.lastMessageTimeUtc||0,id:c.id,c})));
+try{if(p.query=='chats')pg=page((await req(cs.getAll())).filter(c=>c.type=='Chat'||c.type=='Meeting'||c.type=='StreamOfNotes').map(c=>({t:c.lastMessageTimeUtc||0,id:c.id,c})));
 else if(!await req(cs.get(p.chat)))return{error:'not_found'}}finally{cdb.close()}
 const rdb=await open('replychain-manager');try{if(pg){
 const cs=pg.items.map(({c})=>{const lm=c.lastMessage||{},one=/@unq\.gbl\.spaces$/.test(c.id),nm={},h=+((c.properties||{}).consumptionhorizon||'').split(';')[0],
 mem=new Set((c.members||[]).map(m=>uid(m.id)).concat(one?c.id.slice(3).split('@')[0].split('_'):[]));if(lm.imdisplayname)nm[uid(lm.from)]=lm.imdisplayname;
-return{c,one,mem,nm,v:{id:c.id,topic:(c.threadProperties||{}).topic||null,chatType:c.type=='Meeting'?'meeting':one?'oneOnOne':'group',
+return{c,one,mem,nm,v:{id:c.id,topic:(c.threadProperties||{}).topic||null,chatType:c.type=='Meeting'?'meeting':one||c.type=='StreamOfNotes'?'oneOnOne':'group',
 lastUpdatedDateTime:iso(c.lastMessageTimeUtc),viewpoint:{lastMessageReadDateTime:h?iso(h):null},lastMessagePreview:lm.id?{id:lm.id,
 createdDateTime:iso(Date.parse(lm.originalarrivaltime)||lm.id),isDeleted:!!lm.deletionInfo,messageType:sys(lm.messagetype)?'systemEventMessage':'message',
 from:{user:{id:uid(lm.from),displayName:lm.imdisplayname||null}},body:{contentType:/^RichText/.test(lm.messagetype)?'html':'text',content:lm.content||''}}:null}}}),

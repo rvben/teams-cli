@@ -38,6 +38,9 @@ pub struct Profile {
     pub tenant: String,
     #[serde(default)]
     pub read_only: bool,
+    /// Desktop only: sending is an explicit opt-in, so profiles without it stay read-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_send: bool,
     #[serde(default = "default_desktop_port")]
     pub desktop_port: u16,
 }
@@ -52,8 +55,10 @@ impl Profile {
     }
 
     pub fn require_writable(&self) -> Result<(), AppError> {
-        if self.backend == BackendKind::Desktop {
-            return Err(crate::desktop::messaging_unsupported());
+        if self.read_only && self.backend == BackendKind::Desktop {
+            return Err(AppError::ReadOnly(
+                "desktop profiles are read-only unless created with `teams init --backend desktop --allow-send`".into(),
+            ));
         }
         if self.read_only {
             Err(AppError::ReadOnly(
@@ -160,9 +165,16 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
             .or_else(|| stored.map(|profile| profile.tenant.clone()))
             .unwrap_or_else(default_tenant)
     };
+    let stored_read_only = stored.is_some_and(|profile| {
+        profile.read_only || (backend == BackendKind::Desktop && !profile.allow_send)
+    });
     let read_only = match std::env::var("TEAMS_READ_ONLY") {
+        // On desktop the variable can only add the restriction, never lift it.
+        Ok(value) if backend == BackendKind::Desktop => {
+            parse_bool("TEAMS_READ_ONLY", &value)? || stored_read_only
+        }
         Ok(value) => parse_bool("TEAMS_READ_ONLY", &value)?,
-        Err(std::env::VarError::NotPresent) => stored.is_some_and(|profile| profile.read_only),
+        Err(std::env::VarError::NotPresent) => stored_read_only,
         Err(error) => {
             return Err(AppError::InvalidInput(format!(
                 "cannot read TEAMS_READ_ONLY: {error}"
@@ -181,7 +193,8 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
         backend,
         client_id,
         tenant,
-        read_only: read_only || backend == BackendKind::Desktop,
+        read_only,
+        allow_send: backend == BackendKind::Desktop && !read_only,
         desktop_port,
     };
     Ok((name, profile))
@@ -261,7 +274,8 @@ pub fn profile_summaries() -> Result<Vec<ProfileSummary>, AppError> {
             } else {
                 profile.client_id.clone()
             },
-            read_only: profile.read_only || profile.backend == BackendKind::Desktop,
+            read_only: profile.read_only
+                || (profile.backend == BackendKind::Desktop && !profile.allow_send),
             backend: profile.backend,
         })
         .collect())

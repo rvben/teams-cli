@@ -136,19 +136,38 @@ fn desktop_chat_reads_validate_input_before_contacting_teams() {
     }
 }
 
-#[test]
-fn desktop_send_rejects_with_stdin_still_open() {
-    let temp = tempfile::tempdir().unwrap();
-    init(&temp);
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("teams"))
+fn init_sending(temp: &tempfile::TempDir) {
+    cli(temp)
+        .args([
+            "--profile",
+            "local",
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-port",
+            "19222",
+            "--allow-send",
+            "--no-login",
+        ])
+        .assert()
+        .success();
+}
+
+/// Runs a send whose body would come from a stdin that never closes; refusals must not wait for it.
+fn refused_send(temp: &tempfile::TempDir, chat: &str, read_only_env: Option<&str>) -> Value {
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("teams"));
+    command
         .env("XDG_CONFIG_HOME", temp.path())
         .env_remove("TEAMS_PROFILE")
-        .args(["messages", "send", "--chat", "fixture", "--body", "-"])
+        .env_remove("TEAMS_READ_ONLY")
+        .args(["messages", "send", "--chat", chat, "--body", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    if let Some(value) = read_only_env {
+        command.env("TEAMS_READ_ONLY", value);
+    }
+    let mut child = command.spawn().unwrap();
     let start = Instant::now();
     loop {
         if child.try_wait().unwrap().is_some() {
@@ -162,8 +181,92 @@ fn desktop_send_rejects_with_stdin_still_open() {
     }
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(value["error"]["kind"], "unsupported");
+    assert!(output.stdout.is_empty());
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
+const CHAT: &str = "19:fixture@thread.v2";
+
+#[test]
+fn desktop_sends_are_refused_before_reading_stdin() {
+    let temp = tempfile::tempdir().unwrap();
+    init(&temp);
+    assert_eq!(
+        refused_send(&temp, CHAT, None)["error"]["kind"],
+        "read_only"
+    );
+    assert_eq!(
+        refused_send(&temp, CHAT, Some("false"))["error"]["kind"],
+        "read_only",
+        "TEAMS_READ_ONLY cannot lift a desktop profile's restriction"
+    );
+
+    init_sending(&temp);
+    assert_eq!(
+        refused_send(&temp, CHAT, Some("true"))["error"]["kind"],
+        "read_only"
+    );
+    assert_eq!(
+        refused_send(&temp, "fixture", None)["error"]["kind"],
+        "invalid_input"
+    );
+    assert_eq!(
+        refused_send(&temp, CHAT, None)["error"]["kind"],
+        "tty_required",
+        "without a terminal a desktop send needs --yes"
+    );
+}
+
+#[test]
+fn desktop_sending_is_an_explicit_init_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = cli(&temp)
+        .args(["init", "--backend", "desktop", "--allow-send", "--no-login"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["read_only"], false);
+    let status: Value =
+        serde_json::from_slice(&cli(&temp).args(["config", "show"]).output().unwrap().stdout)
+            .unwrap();
+    assert_eq!(status["read_only"], false);
+
+    let conflict = cli(&temp)
+        .args([
+            "init",
+            "--backend",
+            "desktop",
+            "--allow-send",
+            "--read-only",
+            "--no-login",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(2));
+    let graph = cli(&temp)
+        .args(["init", "--allow-send", "--no-login"])
+        .output()
+        .unwrap();
+    assert_eq!(graph.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&graph.stderr).unwrap();
+    assert_eq!(value["error"]["kind"], "invalid_input");
+}
+
+#[test]
+fn desktop_profiles_saved_before_sending_existed_stay_read_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("teams");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(
+        directory.join("config.toml"),
+        "[profiles.default]\nbackend='desktop'\nread_only=false\n",
+    )
+    .unwrap();
+    assert_eq!(
+        refused_send(&temp, CHAT, None)["error"]["kind"],
+        "read_only"
+    );
 }
 
 #[test]
@@ -231,13 +334,10 @@ fn backend_options_and_schema_describe_only_implemented_capabilities() {
     );
     let commands = schema["commands"].as_array().unwrap();
     assert_eq!(
-        commands
-            .iter()
-            .find(|c| c["name"] == "messages send")
-            .unwrap()["extensions"]["backends"],
+        commands.iter().find(|c| c["name"] == "whoami").unwrap()["extensions"]["backends"],
         serde_json::json!(["graph"])
     );
-    for name in ["chats list", "messages list"] {
+    for name in ["chats list", "messages list", "messages send"] {
         let command = commands.iter().find(|c| c["name"] == name).unwrap();
         assert_eq!(
             command["extensions"]["backends"],

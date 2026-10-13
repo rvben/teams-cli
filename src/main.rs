@@ -66,6 +66,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                 device_code: false,
                 channel_history: false,
                 read_only: false,
+                allow_send: false,
             })
         }
         None if io::stdin().is_terminal() && io::stdout().is_terminal() => Command::Tui(TuiArgs {
@@ -154,14 +155,33 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                     body,
                 },
         } => {
+            let (_, profile) = config::load(profile_arg)?;
+            profile.require_writable()?;
+            // Desktop sends are refused before reading a body from stdin when they cannot go ahead.
+            let desktop_chat = match (profile.backend, chat.as_deref()) {
+                (BackendKind::Desktop, Some(chat)) => {
+                    desktop::check_chat(chat)?;
+                    if !(yes || io::stdin().is_terminal() && io::stderr().is_terminal()) {
+                        return Err(AppError::NonInteractive(
+                            "desktop sends need confirmation; pass --yes when not running in a terminal"
+                                .into(),
+                        ));
+                    }
+                    Some(chat)
+                }
+                _ => None,
+            };
             let body = read_body(&body)?;
             if body.trim().is_empty() {
                 return Err(AppError::InvalidInput(
                     "message body cannot be empty".into(),
                 ));
             }
-            let (_, profile) = config::load(profile_arg)?;
-            profile.require_writable()?;
+            if let Some(chat) = desktop_chat
+                && !yes
+            {
+                confirm_desktop_send(chat, &body)?;
+            }
             let client = client(profile_arg).await?;
             let value = client
                 .send(chat.as_deref(), team.as_deref(), channel.as_deref(), &body)
@@ -208,7 +228,13 @@ fn desktop_unsupported(command: &Command) -> bool {
             | Command::List(_)
             | Command::Channels { .. }
             | Command::Messages {
-                command: MessagesCommand::Send { .. } | MessagesCommand::List { chat: None, .. }
+                command: MessagesCommand::Send { chat: None, .. }
+                    | MessagesCommand::Send { team: Some(_), .. }
+                    | MessagesCommand::Send {
+                        channel: Some(_),
+                        ..
+                    }
+                    | MessagesCommand::List { chat: None, .. }
             }
     )
 }
@@ -222,11 +248,18 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         {
             return Err(AppError::InvalidInput("desktop profiles do not use OAuth client, tenant, device-code or channel-history options".into()));
         }
+        if args.allow_send && args.read_only {
+            return Err(AppError::InvalidInput(
+                "--allow-send conflicts with --read-only (or TEAMS_READ_ONLY)".into(),
+            ));
+        }
+        let read_only = !args.allow_send;
         let profile = Profile {
             backend: BackendKind::Desktop,
             client_id: String::new(),
             tenant: String::new(),
-            read_only: true,
+            read_only,
+            allow_send: args.allow_send,
             desktop_port: args.desktop_port.unwrap_or(config::DEFAULT_DESKTOP_PORT),
         };
         let path = config::save(profile_name, profile.clone())?;
@@ -237,13 +270,13 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
         };
         let value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
             "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
-            "read_only":true,"desktop_port":profile.desktop_port,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
+            "read_only":read_only,"desktop_port":profile.desktop_port,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
             "session_verified":false,"connection":connection});
         return out.value(&value, || format!("Saved desktop profile '{profile_name}'. Connection diagnostics only; sign-in and chat access are unverified.\nConfig: {}\nNext: `teams --profile {profile_name} doctor`", path.display()));
     }
-    if args.desktop_port.is_some() {
+    if args.desktop_port.is_some() || args.allow_send {
         return Err(AppError::InvalidInput(
-            "--desktop-port requires --backend desktop".into(),
+            "--desktop-port and --allow-send require --backend desktop".into(),
         ));
     }
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
@@ -276,6 +309,7 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
             client_id: client_id.clone(),
             tenant: tenant.clone(),
             read_only: args.read_only,
+            allow_send: false,
             desktop_port: config::DEFAULT_DESKTOP_PORT,
         },
     )?;
@@ -378,10 +412,10 @@ async fn auth_command(
         let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"configured":true,
             "signed_in":null,"verified":false,"session_verified":false,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
             "identity":null,"authentication":"teams_desktop_session_unverified","offline":offline,
-            "config_path":config::path(),"read_only":true,"desktop_port":profile.desktop_port,
+            "config_path":config::path(),"read_only":profile.read_only,"desktop_port":profile.desktop_port,
             "granted_scopes":null,"channel_history":null,"connection":connection});
-        return out.value(&value, || format!("Profile: {name}\nBackend: desktop (experimental)\nEndpoint: {}\nSigned in: unknown\nSession verified: no\nRead only: yes",
-            connection.as_ref().map(|c| c.status.detail()).unwrap_or("not checked (offline)")));
+        return out.value(&value, || format!("Profile: {name}\nBackend: desktop (experimental)\nEndpoint: {}\nSigned in: unknown\nSession verified: no\nRead only: {}",
+            connection.as_ref().map(|c| c.status.detail()).unwrap_or("not checked (offline)"), yes_no(profile.read_only)));
     }
     match command {
         AuthCommand::Login {
@@ -607,6 +641,7 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
                     device_code: false,
                     channel_history: false,
                     read_only: false,
+                    allow_send: false,
                 },
                 auth_output,
             )
@@ -822,7 +857,12 @@ async fn desktop_doctor(
         Check {
             name: "write_safety",
             status: "pass",
-            detail: "desktop diagnostics are read-only".into(),
+            detail: if profile.read_only {
+                "profile is read-only; diagnostics send nothing"
+            } else {
+                "profile may send chat messages, each confirmed; diagnostics send nothing"
+            }
+            .into(),
         },
         Check {
             name: "desktop_transport",
@@ -844,8 +884,9 @@ async fn desktop_doctor(
             detail,
         });
     }
+    let desktop = DesktopClient::new(profile.desktop_port)?;
     let connection = if !offline && prerequisites.is_ok() {
-        match DesktopClient::new(profile.desktop_port)?.probe().await {
+        match desktop.probe().await {
             Ok(metadata) => Some(metadata),
             Err(error) => {
                 checks.push(Check {
@@ -877,6 +918,24 @@ async fn desktop_doctor(
                 "endpoint check unavailable"
             })
             .into(),
+    });
+    let endpoint_ok = connection.as_ref().is_some_and(|c| c.endpoint_available());
+    let (status, detail) = if profile.read_only {
+        ("skip", "sending disabled by profile".to_string())
+    } else if offline {
+        ("skip", "send check skipped (offline)".to_string())
+    } else if !endpoint_ok {
+        ("skip", "skipped until the endpoint verifies".to_string())
+    } else {
+        match desktop.send_check().await {
+            Ok(()) => ("pass", "the Teams window can send messages".to_string()),
+            Err(error) => ("fail", error.to_string()),
+        }
+    };
+    checks.push(Check {
+        name: "desktop_send",
+        status,
+        detail,
     });
     checks.push(Check {
         name: "session_access",
@@ -930,7 +989,27 @@ fn capabilities(out: Output) -> Result<(), AppError> {
         "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL also chats and chat messages, read-only from the running Teams client's local cache.\n\nNot supported\n  Desktop teams, channels, sending and live TUI; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. On Windows/WSL also chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`.\n\nNot supported\n  Desktop teams, channels, replies, attachments and live TUI; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+}
+
+/// Desktop sends act through the user's own Teams window, so each one is confirmed at the
+/// terminal unless `--yes` was given.
+fn confirm_desktop_send(chat: &str, body: &str) -> Result<(), AppError> {
+    let first = body.trim().lines().next().unwrap_or_default();
+    let preview: String = first.chars().take(60).collect();
+    let more = if preview.len() < body.trim().len() {
+        "…"
+    } else {
+        ""
+    };
+    eprint!("Send to {chat} as you in Teams:\n  {preview}{more}\nSend? [y/N] ");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err(AppError::InvalidInput("send cancelled".into()))
+    }
 }
 
 fn read_body(body: &str) -> Result<String, AppError> {

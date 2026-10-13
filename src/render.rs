@@ -243,7 +243,12 @@ fn chat_title(chat: &Value, viewer: Option<&str>) -> String {
         .filter(|m| viewer.is_none() || str_at(m, &["userId"]) != viewer)
         .filter_map(|m| str_at(m, &["displayName"]))
         .collect();
+    let members = chat["members"].as_array().map_or(&[][..], Vec::as_slice);
+    let only_viewer = viewer.is_some()
+        && !members.is_empty()
+        && members.iter().all(|m| str_at(m, &["userId"]) == viewer);
     match names.as_slice() {
+        [] if only_viewer => "You".into(),
         [] => match str_at(chat, &["chatType"]) {
             Some("oneOnOne") => "(unknown person)".into(),
             Some("meeting") => "(untitled meeting)".into(),
@@ -618,6 +623,9 @@ mod tests {
         assert_eq!(chat_title(&chat, None), "Sam, Ann Smith");
         let chat = json!({"chatType": "oneOnOne", "members": []});
         assert_eq!(chat_title(&chat, Some("me")), "(unknown person)");
+        let notes =
+            json!({"chatType": "oneOnOne", "members": [{"userId": "me", "displayName": "Sam"}]});
+        assert_eq!(chat_title(&notes, Some("me")), "You");
         let members: Vec<Value> = ["A", "B", "C", "D", "E"]
             .map(|n| json!({"userId": n, "displayName": n}))
             .into();

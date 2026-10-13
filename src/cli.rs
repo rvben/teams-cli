@@ -92,7 +92,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// Connection method (desktop currently supports connection diagnostics only)
+    /// Connection method (desktop is experimental: chats, chat messages and opt-in chat sending)
     #[arg(long, value_enum, default_value = "graph")]
     pub backend: crate::config::BackendKind,
     /// Existing loopback debugging port for a desktop profile
@@ -116,6 +116,9 @@ pub struct InitArgs {
     /// Block remote write operations for this profile
     #[arg(long, env = "TEAMS_READ_ONLY")]
     pub read_only: bool,
+    /// Allow a desktop profile to send chat messages (desktop profiles are read-only otherwise)
+    #[arg(long)]
+    pub allow_send: bool,
 }
 
 #[derive(Debug, Subcommand)]

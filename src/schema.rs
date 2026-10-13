@@ -82,7 +82,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 ],
             );
             value["args"] = json!([
-                {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics and read-only chats"},
+                {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics, chats and opt-in chat sending"},
                 {"name":"--desktop-port","type":"integer","description":"Existing loopback endpoint port (desktop only; default 9222)","minimum":1024,"maximum":65535},
                 arg(
                     "--client-id",
@@ -101,7 +101,12 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     "boolean",
                     "Request admin-consented channel-history access"
                 ),
-                arg("--read-only", "boolean", "Block remote write operations")
+                arg("--read-only", "boolean", "Block remote write operations"),
+                arg(
+                    "--allow-send",
+                    "boolean",
+                    "Allow a desktop profile to send chat messages (desktop profiles are read-only otherwise)"
+                )
             ]);
             value
         },
@@ -283,7 +288,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 "non_idempotent",
                 vec![
                     field("id", "string"),
-                    field("createdDateTime", "string"),
+                    nullable_field("createdDateTime", "string"),
                     nullable_field("webUrl", "string"),
                 ],
             );
@@ -342,7 +347,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
     ];
     for command in &mut commands {
         command["extensions"] = json!({"backends": match command["name"].as_str().unwrap_or_default() {
-            "auth login" | "auth logout" | "whoami" | "list" | "channels list" | "messages send" => vec!["graph"],
+            "auth login" | "auth logout" | "whoami" | "list" | "channels list" => vec!["graph"],
             _ => vec!["graph", "desktop"],
         }});
         match command["name"].as_str().unwrap_or_default() {
@@ -354,6 +359,11 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             "chats list" | "messages list" => {
                 command["extensions"]["desktop"] = json!(
                     "Windows/WSL only; chats, not channels; read from the Teams client's local cache; pages carry source \"desktop_cache\""
+                )
+            }
+            "messages send" => {
+                command["extensions"]["desktop"] = json!(
+                    "Windows/WSL only; plain-text chat messages through the running Teams window; needs a profile created with `init --allow-send`, and --yes when not in a terminal; results carry source \"desktop\", clientMessageId and Teams' status"
                 )
             }
             _ => {}
@@ -393,9 +403,9 @@ pub fn generate(command_filter: Option<&str>) -> Value {
 pub fn backend_capabilities() -> Value {
     json!({
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
-        "desktop":{"experimental":true,"read_only":true,"platforms":["macos","windows","wsl"],
-            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (windows, wsl)","chat messages (windows, wsl)"],
-            "unsupported":["teams and channels","identity","send messages","subscriptions","automatic Teams launch or restart"],
+        "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl"],
+            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (windows, wsl)","chat messages (windows, wsl)","send plain-text chat messages (windows, wsl; opt-in)"],
+            "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","automatic Teams launch or restart"],
             "requires":"existing Teams-owned loopback debugging endpoint; WSL requires Windows executable interop",
             "transport":{"macos":"native_loopback","windows":"windows_native","wsl":"windows_helper_stdio"},
             "chat_source":"desktop_cache","session_verified":false,"default_port":crate::config::DEFAULT_DESKTOP_PORT}

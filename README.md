@@ -2,7 +2,7 @@
 
 Microsoft Teams from your terminal—human-first and agent-first.
 
-`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs, with an optional experimental desktop backend that reads chats from a running Teams client on Windows or WSL. It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. The default Graph backend signs in as you with delegated OAuth and protects refresh credentials in your operating system's credential store. Output is readable text on a TTY and structured JSON when piped.
+`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs, with an optional experimental desktop backend that reads chats from, and can send chat messages through, a running Teams client on Windows or WSL. It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. The default Graph backend signs in as you with delegated OAuth and protects refresh credentials in your operating system's credential store. Output is readable text on a TTY and structured JSON when piped.
 
 For humans, no arguments open guided onboarding on first use and the TUI afterward. For agents, no command ever waits for an undeclared prompt: `teams schema` works offline, collection sizes are caller-bounded, writes declare their effects, errors have stable kinds and exit codes, and stdout contains data only.
 
@@ -146,7 +146,8 @@ Like the other tools in the suite, the config file is selected with `--profile`,
 ## Experimental desktop backend
 
 Use a desktop profile to inspect an existing Teams debugging endpoint on macOS,
-Windows, or WSL, and to read chats on Windows or WSL:
+Windows, or WSL, and to read chats (and, if you opt in, send chat messages) on
+Windows or WSL:
 
 ```console
 teams init --profile local --backend desktop --read-only --no-login
@@ -158,6 +159,9 @@ teams init --profile local --backend desktop --desktop-port 19222 --no-login
 # Windows/WSL: read chats and chat messages
 teams --profile local chats list --limit 20
 teams --profile local messages list --chat '19:...@thread.v2'
+# Windows/WSL: opt in to sending plain-text chat messages
+teams init --profile local --backend desktop --allow-send --no-login
+teams --profile local messages send --chat '19:...@thread.v2' --body 'On my way'
 ```
 
 On Windows and WSL, `chats list` and `messages list --chat` read from the running
@@ -167,11 +171,26 @@ read state, timestamps, senders, bodies), never tokens or raw records. Member an
 names come from Teams' cached profiles, so 1:1 chats show the other person's name. Pages use the same shape and opaque `--cursor` as Graph
 and add `"source": "desktop_cache"`. The cache only holds what Teams has synced, so
 older history in a chat you never scrolled back through can be missing. Chat ids are
-the same as Graph's. On macOS these commands return `unsupported`.
+the same as Graph's; the chat with yourself is listed too, with the id `48:notes`, so
+you can try sending there first. On macOS these commands return `unsupported`.
 
-Teams, channels, identity, subscriptions, and sends return `unsupported` on
-desktop; the TUI reads chats from the same cache. Desktop profiles are always read-only,
-including when `TEAMS_READ_ONLY=false`. Existing profiles without a backend field
+Desktop profiles are read-only unless created with `init --allow-send`;
+`TEAMS_READ_ONLY=true` still blocks sending, but `TEAMS_READ_ONLY=false` cannot unlock a
+desktop profile. With the opt-in, `messages send --chat` sends one plain-text message
+through the running Teams window, the same way its Send button does: Teams performs the
+request with its own sign-in, and nothing is shown or clicked in its window. Each send
+asks for confirmation on a terminal and requires `--yes` otherwise. The listener is
+verified again and a fresh connection to the Teams main window is used for every send,
+and a send is never retried: if Teams does not answer, the command reports that the
+message may still be delivered, so check the chat before sending again. Teams queues
+the message like any other, so a send made just before Teams closes goes out when Teams
+next starts. The result has the Graph send shape plus `"source": "desktop"`,
+`clientMessageId` and Teams' own `status`. `doctor` checks that the send path is still
+recognised without sending anything.
+
+Teams, channels, identity, subscriptions, replies, mentions, attachments and edits
+return `unsupported` on desktop; the TUI reads chats from the same cache and does not
+send. Existing profiles without a backend field
 continue to use Graph; Graph remains the default for `init`.
 
 The endpoint must already be enabled through an explicit Teams debugging launch.
@@ -218,15 +237,15 @@ Windows can keep it alive until an in-flight read completes.
 Microsoft treats [WebView2 flags](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags)
 as development diagnostics and advises against relying on them in production.
 This backend is experimental: chat reading depends on the Teams client's internal
-cache layout, and an unrecognised layout fails with `desktop_error` rather than
-guessing.
+cache layout and sending on its internal send interface, and an unrecognised layout
+fails with `desktop_error` rather than guessing.
 
 ## Graph boundaries
 
 - Microsoft 365 work or school accounts only. The relevant Teams Graph endpoints do not support personal Microsoft accounts.
 - A work account can authenticate successfully before Microsoft Teams is licensed or provisioned; `teams doctor` distinguishes identity access from Teams availability.
 - Calling and screen sharing are not available as a delegated user CLI; Graph calling is built around bot/application scenarios.
-- No extracted desktop tokens, browser interception, or private Teams service calls; the experimental desktop backend only reads the local client cache.
+- No extracted desktop tokens, browser interception, or direct calls to private Teams services; the experimental desktop backend reads the local client cache and sends only through the Teams window's own client.
 - Tenant policy and admin consent can restrict delegated capabilities.
 
 ## CLI Spec

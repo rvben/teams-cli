@@ -74,6 +74,10 @@ impl TeamsBackend {
         channel: Option<&str>,
         body: &str,
     ) -> Result<Value, AppError> {
-        self.graph()?.send(chat, team, channel, body).await
+        match (self, chat, team, channel) {
+            (Self::Graph(client), ..) => client.send(chat, team, channel, body).await,
+            (Self::Desktop(client), Some(chat), None, None) => client.send(chat, body).await,
+            (Self::Desktop(_), ..) => Err(desktop::messaging_unsupported()),
+        }
     }
 }

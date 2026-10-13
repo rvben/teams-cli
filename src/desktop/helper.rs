@@ -1,10 +1,11 @@
 //! The WSL bridge: the Linux CLI keeps one `teams.exe desktop-helper` running and talks
 //! newline-delimited JSON over its stdin and stdout. The helper exits when stdin closes.
+//! Protocol 2 adds sending; helper and CLI must be the same version.
 use crate::error::AppError;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LINE: usize = super::MAX_READ + 64 * 1024;
 
@@ -58,6 +59,13 @@ pub async fn serve<S: super::owner::System>(
                 None => Err(AppError::InvalidInput("invalid desktop port".into())),
             },
             Some("read") => session.read(&request["request"]).await,
+            Some("send") => session.send(&request["request"]).await,
+            Some("send_check") => {
+                match request["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
+                    Some(port) => session.send_check(port).await,
+                    None => Err(AppError::InvalidInput("invalid desktop port".into())),
+                }
+            }
             _ => Err(AppError::InvalidInput(
                 "unknown desktop helper request".into(),
             )),
@@ -147,25 +155,46 @@ mod client {
                     Err(Failure::Transport) => self.running = None,
                 }
             }
-            let executable = match &self.executable {
-                Some(executable) => executable.clone(),
-                None => super::super::install::ensure().await?,
-            };
-            let mut running = start(&executable).await?;
-            self.executable = Some(executable);
-            match running.call(request).await {
-                Ok(value) => {
-                    self.running = Some(running);
-                    Ok(value)
+            match self.started().await?.call(request).await {
+                Ok(value) => Ok(value),
+                Err(Failure::Refused(message)) => Err(AppError::Desktop(message)),
+                Err(Failure::Transport) => {
+                    self.running = None;
+                    Err(AppError::Desktop(
+                        "the Windows desktop helper stopped unexpectedly".into(),
+                    ))
                 }
-                Err(Failure::Refused(message)) => {
-                    self.running = Some(running);
-                    Err(AppError::Desktop(message))
-                }
-                Err(Failure::Transport) => Err(AppError::Desktop(
-                    "the Windows desktop helper stopped unexpectedly".into(),
-                )),
             }
+        }
+
+        /// Sends `request` exactly once. A lost answer becomes `{"error": "unconfirmed"}`
+        /// instead of a retry, because the helper may already have acted on it.
+        pub async fn call_once(&mut self, request: Value) -> Result<Value, AppError> {
+            match self.started().await?.call(request).await {
+                Ok(value) => Ok(value),
+                Err(Failure::Refused(message)) => Err(AppError::Desktop(message)),
+                Err(Failure::Transport) => {
+                    self.running = None;
+                    Ok(json!({"error": "unconfirmed"}))
+                }
+            }
+        }
+
+        /// The running helper, started first if needed.
+        async fn started(&mut self) -> Result<&mut Running, AppError> {
+            let running = match self.running.take() {
+                Some(running) => running,
+                None => {
+                    let executable = match &self.executable {
+                        Some(executable) => executable.clone(),
+                        None => super::super::install::ensure().await?,
+                    };
+                    let running = start(&executable).await?;
+                    self.executable = Some(executable);
+                    running
+                }
+            };
+            Ok(self.running.insert(running))
         }
     }
 
@@ -272,6 +301,29 @@ done
                 Err(AppError::Desktop(m)) if m == "refused"
             ));
         }
+
+        #[tokio::test]
+        async fn a_lost_answer_to_a_single_call_is_unconfirmed() {
+            let dir = tempfile::tempdir().unwrap();
+            // The helper exits right after its first answer, so it is gone for the second.
+            let mut client = HelperClient {
+                running: None,
+                executable: Some(fake_helper(dir.path(), VERSION, 1)),
+            };
+            assert_eq!(
+                client.call_once(json!({"op": "x"})).await.unwrap(),
+                json!(1)
+            );
+            assert_eq!(
+                client.call_once(json!({"op": "x"})).await.unwrap(),
+                json!({"error": "unconfirmed"})
+            );
+            // The next call starts a fresh helper rather than reusing the dead one.
+            assert_eq!(
+                client.call_once(json!({"op": "x"})).await.unwrap(),
+                json!(1)
+            );
+        }
     }
 }
 
@@ -306,7 +358,11 @@ mod tests {
         assert_eq!(probe["ok"]["status"], "no_listener");
         let bad = call(json!({"id": 3, "op": "read", "request": {"port": 9222}})).await;
         assert!(bad["error"].is_string() && bad.get("ok").is_none());
-        let unknown = call(json!({"id": 4, "op": "launch"})).await;
+        let send = call(json!({"id": 4, "op": "send", "request": {"port": 9222}})).await;
+        assert!(send["error"].is_string() && send.get("ok").is_none());
+        let check = call(json!({"id": 5, "op": "send_check", "port": 9222})).await;
+        assert_eq!(check["ok"]["error"], "no_listener");
+        let unknown = call(json!({"id": 6, "op": "launch"})).await;
         assert!(unknown["error"].is_string());
         // Both halves share the stream; the server sees end of input once both are gone.
         drop((client_read, client_write));
