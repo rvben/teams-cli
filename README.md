@@ -57,6 +57,28 @@ Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send
 ChannelMessage.Send
 ```
 
+## Terminal interface
+
+`teams` (or `teams tui`) opens a keyboard-first chat reader: recent chats on the
+left with unread markers, last-message previews and times, and the selected
+conversation on the right, grouped by day and sender. Reads run in the
+background and are cached per chat, so moving through the list never blocks.
+Narrow terminals show one pane at a time, and `NO_COLOR` is respected.
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `j`/`k` | Move through chats, or scroll the open conversation |
+| `enter`, `→` / `esc`, `←` | Open a chat / return to the list |
+| `tab` | Switch between the list and the conversation |
+| `pgup`/`pgdn`, `g`/`G` | Page, or jump to the oldest/newest message |
+| `o` | Load older messages in the open chat |
+| `/` | Filter chats by name or last message |
+| `r` | Refresh |
+| `?` | Show every key |
+| `q` | Quit |
+
+The TUI is read-only and works with both the Graph and desktop backends.
+
 The TUI is also the recovery path: an unconfigured profile, missing credential,
 expired refresh session, or Microsoft `401` opens a focused connection screen.
 Press `Enter` or `a` to restore the normal terminal, complete Microsoft sign-in,
@@ -147,8 +169,8 @@ and add `"source": "desktop_cache"`. The cache only holds what Teams has synced,
 older history in a chat you never scrolled back through can be missing. Chat ids are
 the same as Graph's. On macOS these commands return `unsupported`.
 
-Teams, channels, identity, subscriptions, sends, and live TUI data return
-`unsupported` on desktop. Demo/snapshot TUI modes remain available. Desktop profiles are always read-only,
+Teams, channels, identity, subscriptions, and sends return `unsupported` on
+desktop; the TUI reads chats from the same cache. Desktop profiles are always read-only,
 including when `TEAMS_READ_ONLY=false`. Existing profiles without a backend field
 continue to use Graph; Graph remains the default for `init`.
 

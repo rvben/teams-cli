@@ -209,7 +209,7 @@ fn desktop_unsupported(command: &Command) -> bool {
             | Command::Messages {
                 command: MessagesCommand::Send { .. } | MessagesCommand::List { chat: None, .. }
             }
-    ) || matches!(command, Command::Tui(args) if !args.demo && !args.snapshot)
+    )
 }
 
 async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), AppError> {
@@ -552,92 +552,72 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
         return Ok(());
     }
     if args.demo {
-        return tui::run(tui::demo_data());
+        tokio::task::block_in_place(|| tui::run(tui::Source::Demo))?;
+        return Ok(());
     }
     let profile_name = config::selected_profile_name(profile_arg)?;
     let mut reason_override = None;
     loop {
-        match load_tui_data(profile_arg).await {
-            Ok(data) => return tui::run(data),
-            Err(error) if tui_auth_recoverable(&error) => {
-                let configured = config::configured_profile(profile_arg).is_some();
-                let reason = reason_override
-                    .take()
-                    .unwrap_or_else(|| tui_connection_reason(&error));
-                if tui::request_authentication(&profile_name, configured, &reason)?
-                    == tui::TuiExit::Quit
-                {
-                    return Ok(());
-                }
-
-                let auth_output = Output {
-                    format: OutputFormat::Text,
-                    quiet: false,
+        // `None` means the person already asked to sign in from inside the TUI.
+        let connection_error = match client(profile_arg).await {
+            Ok(backend) => {
+                let source = tui::Source::Live {
+                    backend: std::sync::Arc::new(backend),
+                    profile: profile_name.clone(),
                 };
-                let result = if configured {
-                    let (_, profile) = config::load(profile_arg)?;
-                    auth::login(&profile_name, &profile, false, false, &auth_output)
-                        .await
-                        .map(|_| ())
-                } else {
-                    init(
-                        &profile_name,
-                        InitArgs {
-                            backend: BackendKind::Graph,
-                            desktop_port: None,
-                            client_id: None,
-                            tenant: None,
-                            no_login: false,
-                            device_code: false,
-                            channel_history: false,
-                            read_only: false,
-                        },
-                        auth_output,
-                    )
-                    .await
-                };
-                if let Err(error) = result {
-                    reason_override = Some(format!(
-                        "Sign-in did not complete: {} You can try again.",
-                        concise_error(&error)
-                    ));
+                match tokio::task::block_in_place(|| tui::run(source))? {
+                    tui::TuiExit::Quit => return Ok(()),
+                    tui::TuiExit::Authenticate => None,
                 }
             }
+            Err(error) if tui_auth_recoverable(&error) => Some(error),
             Err(error) => return Err(error),
+        };
+        let configured = config::configured_profile(profile_arg).is_some();
+        if let Some(error) = connection_error {
+            let reason = reason_override
+                .take()
+                .unwrap_or_else(|| tui_connection_reason(&error));
+            if tui::request_authentication(&profile_name, configured, &reason)?
+                == tui::TuiExit::Quit
+            {
+                return Ok(());
+            }
+        }
+
+        let auth_output = Output {
+            format: OutputFormat::Text,
+            quiet: false,
+        };
+        let result = if configured {
+            let (_, profile) = config::load(profile_arg)?;
+            auth::login(&profile_name, &profile, false, false, &auth_output)
+                .await
+                .map(|_| ())
+        } else {
+            init(
+                &profile_name,
+                InitArgs {
+                    backend: BackendKind::Graph,
+                    desktop_port: None,
+                    client_id: None,
+                    tenant: None,
+                    no_login: false,
+                    device_code: false,
+                    channel_history: false,
+                    read_only: false,
+                },
+                auth_output,
+            )
+            .await
+        };
+        if let Err(error) = result {
+            reason_override = Some(format!(
+                "Sign-in did not complete: {} You can try again.",
+                concise_error(&error)
+            ));
         }
     }
-}
-
-async fn load_tui_data(profile_arg: Option<&str>) -> Result<tui::TuiData, AppError> {
-    let graph = client(profile_arg).await?;
-    let me = graph.me().await?;
-    let teams = graph.teams(50, 0).await?;
-    let mut conversations: Vec<tui::Conversation> = teams
-        .items
-        .into_iter()
-        .map(|team| tui::Conversation {
-            name: team
-                .get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or("Unnamed team")
-                .into(),
-            unread: 0,
-            messages: Vec::new(),
-        })
-        .collect();
-    if conversations.is_empty() {
-        conversations.push(tui::Conversation {
-            name: "No joined teams".into(),
-            unread: 0,
-            messages: vec![],
-        });
-    }
-    Ok(tui::TuiData {
-        account: string_at(&me, "/displayName")
-            .unwrap_or("Microsoft 365")
-            .into(),
-        conversations,
-    })
 }
 
 fn tui_auth_recoverable(error: &AppError) -> bool {

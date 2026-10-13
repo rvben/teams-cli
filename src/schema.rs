@@ -347,8 +347,9 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         }});
         match command["name"].as_str().unwrap_or_default() {
             "tui" => {
-                command["extensions"]["desktop"] =
-                    json!("demo/snapshot only; live desktop data is unsupported")
+                command["extensions"]["desktop"] = json!(
+                    "Windows/WSL only; chats and chat messages from the Teams client's local cache"
+                )
             }
             "chats list" | "messages list" => {
                 command["extensions"]["desktop"] = json!(
@@ -394,7 +395,7 @@ pub fn backend_capabilities() -> Value {
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
         "desktop":{"experimental":true,"read_only":true,"platforms":["macos","windows","wsl"],
             "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (windows, wsl)","chat messages (windows, wsl)"],
-            "unsupported":["teams and channels","identity","live TUI","send messages","subscriptions","automatic Teams launch or restart"],
+            "unsupported":["teams and channels","identity","send messages","subscriptions","automatic Teams launch or restart"],
             "requires":"existing Teams-owned loopback debugging endpoint; Windows/WSL require powershell.exe",
             "transport":{"macos":"native_loopback","windows":"windows_helper","wsl":"windows_helper_stdio"},
             "chat_source":"desktop_cache","session_verified":false,"default_port":crate::config::DEFAULT_DESKTOP_PORT}

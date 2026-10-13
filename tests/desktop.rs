@@ -103,7 +103,6 @@ fn desktop_commands_reject_before_oauth_or_tui_prompts() {
         ],
         vec!["auth", "login", "--device-code"],
         vec!["auth", "logout"],
-        vec!["tui"],
     ] {
         let output = cli(&temp)
             .env("TEAMS_ACCESS_TOKEN", "GRAPH-FIXTURE-TOKEN")

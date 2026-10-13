@@ -16,7 +16,7 @@ const MAX_METADATA: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
 
 pub fn messaging_unsupported() -> AppError {
-    AppError::Unsupported("the experimental desktop backend reads chats and chat messages only (Windows/WSL); teams, channels, identity, sending and the live TUI need a Graph profile".into())
+    AppError::Unsupported("the experimental desktop backend reads chats and chat messages only (Windows/WSL); teams, channels, identity and sending need a Graph profile".into())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
