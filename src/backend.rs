@@ -1,0 +1,70 @@
+//! Shared operations for CLI, TUI and other frontends. Desktop data access is gated.
+use crate::{
+    auth,
+    config::{self, BackendKind},
+    desktop::{self, DesktopClient},
+    error::AppError,
+    graph::{GraphClient, Page},
+};
+use serde_json::Value;
+
+pub enum TeamsBackend {
+    Graph(GraphClient),
+    Desktop(DesktopClient),
+}
+
+impl TeamsBackend {
+    pub async fn connect(profile: Option<&str>) -> Result<Self, AppError> {
+        let (name, selected) = config::load(profile)?;
+        match selected.backend {
+            BackendKind::Graph => Ok(Self::Graph(GraphClient::new(
+                auth::access_token(&name, &selected).await?,
+            ))),
+            BackendKind::Desktop => Ok(Self::Desktop(DesktopClient::new(selected.desktop_port)?)),
+        }
+    }
+
+    fn graph(&self) -> Result<&GraphClient, AppError> {
+        match self {
+            Self::Graph(client) => Ok(client),
+            Self::Desktop(_) => Err(desktop::messaging_unsupported()),
+        }
+    }
+
+    pub async fn me(&self) -> Result<Value, AppError> {
+        self.graph()?.me().await
+    }
+    pub async fn teams(&self, limit: u16, offset: usize) -> Result<Page, AppError> {
+        self.graph()?.teams(limit, offset).await
+    }
+    pub async fn teams_available(&self) -> Result<(), AppError> {
+        self.graph()?.teams_available().await
+    }
+    pub async fn channels(&self, team: &str, limit: u16, offset: usize) -> Result<Page, AppError> {
+        self.graph()?.channels(team, limit, offset).await
+    }
+    pub async fn chats(&self, limit: u16, cursor: Option<&str>) -> Result<Page, AppError> {
+        self.graph()?.chats(limit, cursor).await
+    }
+    pub async fn messages(
+        &self,
+        chat: Option<&str>,
+        team: Option<&str>,
+        channel: Option<&str>,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<Page, AppError> {
+        self.graph()?
+            .messages(chat, team, channel, limit, cursor)
+            .await
+    }
+    pub async fn send(
+        &self,
+        chat: Option<&str>,
+        team: Option<&str>,
+        channel: Option<&str>,
+        body: &str,
+    ) -> Result<Value, AppError> {
+        self.graph()?.send(chat, team, channel, body).await
+    }
+}

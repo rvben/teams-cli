@@ -64,19 +64,26 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         {
             let mut value = single(
                 "init",
-                "Configure an Entra public client and optionally sign in",
+                "Configure a Graph or experimental desktop profile",
                 "idempotent",
                 vec![
                     field("profile", "string"),
+                    field("backend", "string"),
                     field("config_path", "string"),
-                    field("signed_in", "boolean"),
+                    nullable_field("signed_in", "boolean"),
                     field("client_id", "string"),
                     field("tenant", "string"),
                     field("channel_history_requested", "boolean"),
                     field("read_only", "boolean"),
+                    nullable_field("desktop_port", "integer"),
+                    nullable_field("endpoint_available", "boolean"),
+                    nullable_field("connection", "object"),
+                    field("session_verified", "boolean"),
                 ],
             );
             value["args"] = json!([
+                {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics only"},
+                {"name":"--desktop-port","type":"integer","description":"Existing loopback endpoint port (desktop only; default 9222)","minimum":1024,"maximum":65535},
                 arg(
                     "--client-id",
                     "string",
@@ -86,7 +93,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 arg(
                     "--no-login",
                     "boolean",
-                    "Save configuration without signing in"
+                    "Save configuration without sign-in or desktop endpoint access"
                 ),
                 arg("--device-code", "boolean", "Use device-code sign-in"),
                 arg(
@@ -138,19 +145,23 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 vec![
                     field("profile", "string"),
                     field("configured", "boolean"),
-                    field("signed_in", "boolean"),
+                    field("backend", "string"),
+                    nullable_field("signed_in", "boolean"),
                     field("verified", "boolean"),
                     nullable_field("identity", "object"),
                     field("config_path", "string"),
                     field("read_only", "boolean"),
                     nullable_array_field("granted_scopes", "string"),
                     nullable_field("channel_history", "boolean"),
+                    nullable_field("endpoint_available", "boolean"),
+                    nullable_field("connection", "object"),
+                    field("session_verified", "boolean"),
                 ],
             );
             value["args"] = json!([arg(
                 "--offline",
                 "boolean",
-                "Inspect local credential state without contacting Microsoft Graph"
+                "Inspect local state without contacting Graph or the desktop endpoint"
             )]);
             value
         },
@@ -187,6 +198,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             "read_only",
             vec![
                 field("profile", "string"),
+                field("backend", "string"),
+                nullable_field("desktop_port", "integer"),
                 field("client_id", "string"),
                 field("tenant", "string"),
                 field("read_only", "boolean"),
@@ -286,14 +299,21 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         {
             let mut value = single(
                 "doctor",
-                "Check configuration, credential storage, Microsoft identity, and Teams provisioning",
+                "Check configuration and the selected backend's access (desktop is metadata only)",
                 "read_only",
-                vec![array_field("checks", "object"), field("healthy", "boolean")],
+                vec![
+                    field("backend", "string"),
+                    array_field("checks", "object"),
+                    field("healthy", "boolean"),
+                    nullable_field("connection", "object"),
+                    nullable_field("endpoint_available", "boolean"),
+                    field("session_verified", "boolean"),
+                ],
             );
             value["args"] = json!([arg(
                 "--offline",
                 "boolean",
-                "Check local state without contacting Microsoft Graph"
+                "Check local state without contacting Graph or the desktop endpoint"
             )]);
             value
         },
@@ -307,6 +327,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 array_field("account_types", "string"),
                 field("api", "string"),
                 array_field("notes", "string"),
+                field("backends", "object"),
             ],
         ),
         json!({
@@ -319,6 +340,16 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         }),
         json!({"name":"completions", "description":"Generate a shell completion script", "effects":"read_only", "output_kind":"opaque", "media_type":"text/plain", "args":[arg("shell", "string", "Shell name")]}),
     ];
+    for command in &mut commands {
+        command["extensions"] = json!({"backends": match command["name"].as_str().unwrap_or_default() {
+            "auth login" | "auth logout" | "whoami" | "list" | "channels list" | "chats list" | "messages list" | "messages send" => vec!["graph"],
+            _ => vec!["graph", "desktop"],
+        }});
+        if command["name"] == "tui" {
+            command["extensions"]["desktop"] =
+                json!("demo/snapshot only; live desktop data is unsupported");
+        }
+    }
     if let Some(filter) = command_filter {
         commands.retain(|value| value["name"] == filter);
     }
@@ -338,6 +369,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         "commands": commands,
         "errors": error::ALL.iter().map(|e| json!({"kind":e.kind,"exit_code":e.exit_code,"retryable":e.retryable,"description":e.description})).collect::<Vec<_>>(),
         "extensions": {
+            "backends":backend_capabilities(),
             "authentication":"delegated_oauth",
             "api":"Microsoft Graph v1.0",
             "default_client_id": crate::config::DEFAULT_CLIENT_ID,
@@ -346,5 +378,17 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             "baseline_scopes": crate::auth::BASE_SCOPES.split_whitespace().collect::<Vec<_>>(),
             "privileged_scopes":[crate::auth::CHANNEL_HISTORY_SCOPE]
         }
+    })
+}
+
+pub fn backend_capabilities() -> Value {
+    json!({
+        "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
+        "desktop":{"experimental":true,"read_only":true,"platforms":["macos","windows","wsl"],
+            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status"],
+            "unsupported":["chat and message access","identity","live TUI","send messages","subscriptions","automatic Teams launch or restart"],
+            "requires":"existing Teams-owned loopback debugging endpoint; Windows/WSL require powershell.exe",
+            "transport":{"macos":"native_loopback","windows":"windows_helper","wsl":"windows_helper_stdio"},
+            "session_verified":false,"default_port":crate::config::DEFAULT_DESKTOP_PORT}
     })
 }

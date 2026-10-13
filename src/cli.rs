@@ -32,7 +32,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Guided Microsoft Entra app and account setup
+    /// Configure a Graph or experimental desktop profile
     Init(InitArgs),
     /// Manage delegated Microsoft authentication
     Auth {
@@ -70,9 +70,9 @@ pub enum Command {
     },
     /// Open the keyboard-first terminal interface
     Tui(TuiArgs),
-    /// Check configuration, credential storage, and Graph access
+    /// Check the selected backend's configuration and access
     Doctor {
-        /// Check local state without contacting Microsoft Graph
+        /// Check configuration/platform without contacting Graph or the desktop endpoint
         #[arg(long)]
         offline: bool,
     },
@@ -89,13 +89,19 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
+    /// Connection method (desktop currently supports connection diagnostics only)
+    #[arg(long, value_enum, default_value = "graph")]
+    pub backend: crate::config::BackendKind,
+    /// Existing loopback debugging port for a desktop profile
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1024..))]
+    pub desktop_port: Option<u16>,
     /// Override the maintained teams-cli public-client application ID
-    #[arg(long, env = "TEAMS_CLIENT_ID")]
+    #[arg(long)]
     pub client_id: Option<String>,
     /// Tenant ID/domain, or `organizations`
-    #[arg(long, default_value = "organizations", env = "TEAMS_TENANT")]
-    pub tenant: String,
-    /// Save configuration without starting sign-in
+    #[arg(long)]
+    pub tenant: Option<String>,
+    /// Save configuration without sign-in or probing the desktop endpoint
     #[arg(long)]
     pub no_login: bool,
     /// Use device-code sign-in instead of browser PKCE
@@ -132,7 +138,7 @@ pub enum AuthCommand {
     Logout,
     /// Verify authentication and show the selected profile's status
     Status {
-        /// Inspect local credential state without contacting Microsoft Graph
+        /// Inspect configuration without contacting Graph or the desktop endpoint
         #[arg(long)]
         offline: bool,
     },

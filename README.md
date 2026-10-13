@@ -2,7 +2,7 @@
 
 Microsoft Teams from your terminal—human-first and agent-first.
 
-`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs. It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. It signs in as you with delegated OAuth, protects refresh credentials in your operating system's credential store, emits readable terminal output on a TTY, and defaults to structured JSON when piped.
+`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs, with an optional experimental desktop backend for connection diagnostics. It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. The default Graph backend signs in as you with delegated OAuth and protects refresh credentials in your operating system's credential store. Output is readable text on a TTY and structured JSON when piped.
 
 For humans, no arguments open guided onboarding on first use and the TUI afterward. For agents, no command ever waits for an undeclared prompt: `teams schema` works offline, collection sizes are caller-bounded, writes declare their effects, errors have stable kinds and exit codes, and stdout contains data only.
 
@@ -121,7 +121,64 @@ TEAMS_READ_ONLY=true teams messages send --chat CHAT_ID --body "Blocked"
 
 Like the other tools in the suite, the config file is selected with `--profile`, overridden by `TEAMS_*` environment variables, and inspectable without exposing credentials through `teams config show` and `teams config path`.
 
-## Boundaries
+## Experimental desktop diagnostics
+
+Use a desktop profile to inspect an existing Teams debugging endpoint on macOS,
+Windows, or WSL:
+
+```console
+teams init --profile local --backend desktop --read-only --no-login
+teams --profile local doctor --offline
+teams --profile local doctor
+teams --profile local auth status
+# Match a separately enabled endpoint on another port:
+teams init --profile local --backend desktop --desktop-port 19222 --no-login
+```
+
+Desktop currently supports configuration and connection metadata only. Chats,
+messages, identity, subscriptions, sends, and live TUI data return `unsupported`.
+Demo/snapshot TUI modes remain available. Desktop profiles are always read-only,
+including when `TEAMS_READ_ONLY=false`. Existing profiles without a backend field
+continue to use Graph; Graph remains the default for `init`.
+
+The endpoint must already be enabled through an explicit Teams debugging launch.
+These commands never launch, restart, quit, or sign into Teams, and never enable
+debugging. `init --no-login` saves configuration without probing; ordinary desktop
+initialization probes the existing endpoint. A normal Teams launch usually has no
+endpoint, which `doctor` reports as `no_listener`.
+
+macOS checks listener binding and installed Teams process ancestry before reading
+loopback metadata. Windows uses a fixed PowerShell helper with JSON stdin/stdout;
+WSL invokes that Windows helper through executable interop, so NAT mode needs no
+networking changes. Windows requires the installed MSTeams package and
+`powershell.exe` on PATH. Both paths refuse non-loopback listeners and unrelated
+owners. The Windows reader also verifies the Teams process belongs to the invoking
+Windows user. Requests are limited to `GET /json/version` and `GET /json/list`.
+Results omit titles, full URLs, target IDs, WebSocket URLs and private origins.
+
+Endpoint discovery does not verify sign-in: `signed_in` stays `null`, `verified`
+and `session_verified` stay `false`, and `endpoint_available` describes metadata
+access only. `doctor.healthy` means the requested diagnostic checks passed; it does
+not imply that desktop messaging works. Offline commands do not contact the
+endpoint. Desktop profiles ignore Graph OAuth environment settings and credentials;
+`auth login`/`logout` return `unsupported` because Teams owns its session.
+A CLI profile selects connection configuration, not a Teams account. There is no
+automatic fallback to Graph.
+
+The helper timeout is 45 seconds. Cancellation stops the local helper, but WSL can
+retain a Windows-side helper process until its own bounded request completes.
+Microsoft treats [WebView2 flags](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags)
+as development diagnostics and advises against relying on them in production.
+This backend is experimental; actual CDP attachment and chat access remain unverified.
+
+Windows CI runs synthetic tests against the production PowerShell reader. To run
+them elsewhere with an installed PowerShell:
+
+```console
+TEAMS_TEST_POWERSHELL=/path/to/pwsh cargo test --test desktop_bridge -- --ignored
+```
+
+## Graph boundaries
 
 - Microsoft 365 work or school accounts only. The relevant Teams Graph endpoints do not support personal Microsoft accounts.
 - A work account can authenticate successfully before Microsoft Teams is licensed or provisioned; `teams doctor` distinguishes identity access from Teams availability.
@@ -131,7 +188,7 @@ Like the other tools in the suite, the config file is selected with `--profile`,
 
 ## CLI Spec
 
-`teams schema` is offline, unauthenticated, and follows [CLI Spec v0.3](https://clispec.dev/): flat invocable command paths, declared effects and cardinality, bounded collections, stable error kinds and exit codes, stdout/stderr separation, and safe noninteractive behavior.
+`teams schema` is offline, unauthenticated, and follows [CLI Spec v0.3](https://clispec.dev/): flat invocable command paths, declared effects and cardinality, bounded collections, stable error kinds and exit codes, stdout/stderr separation, and safe noninteractive behavior. Its backend capabilities and per-command backend extensions distinguish Graph operations from experimental desktop diagnostics.
 
 ## Releasing
 

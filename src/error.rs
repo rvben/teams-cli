@@ -20,6 +20,10 @@ pub enum AppError {
     #[error("{0}")]
     NonInteractive(String),
     #[error("{0}")]
+    Unsupported(String),
+    #[error("{0}")]
+    Desktop(String),
+    #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Unexpected(String),
@@ -88,6 +92,19 @@ pub const READ_ONLY: ErrorContract = ErrorContract {
     description: "The active profile blocks remote write operations",
 };
 
+pub const UNSUPPORTED: ErrorContract = ErrorContract {
+    kind: "unsupported",
+    exit_code: 2,
+    retryable: false,
+    description: "The selected backend or platform does not support this operation",
+};
+pub const DESKTOP: ErrorContract = ErrorContract {
+    kind: "desktop_error",
+    exit_code: 5,
+    retryable: false,
+    description: "Desktop connection diagnostics could not complete",
+};
+
 pub const ALL: &[ErrorContract] = &[
     INVALID_INPUT,
     AUTH,
@@ -98,6 +115,8 @@ pub const ALL: &[ErrorContract] = &[
     API,
     NON_INTERACTIVE,
     UNEXPECTED,
+    UNSUPPORTED,
+    DESKTOP,
 ];
 
 impl AppError {
@@ -111,6 +130,8 @@ impl AppError {
             Self::RateLimit(_) => RATE_LIMIT,
             Self::Api(_) => API,
             Self::NonInteractive(_) => NON_INTERACTIVE,
+            Self::Unsupported(_) => UNSUPPORTED,
+            Self::Desktop(_) => DESKTOP,
             Self::Io(_) | Self::Unexpected(_) => UNEXPECTED,
         }
     }

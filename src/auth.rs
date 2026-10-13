@@ -128,6 +128,7 @@ fn secret_service_is_unavailable(_error: &keyring::Error) -> bool {
 }
 
 pub async fn access_token(profile_name: &str, profile: &Profile) -> Result<String, AppError> {
+    profile.require_graph()?;
     if let Ok(token) = std::env::var("TEAMS_ACCESS_TOKEN") {
         return Ok(token);
     }
@@ -167,6 +168,7 @@ pub async fn login(
     channel_history: bool,
     out: &Output,
 ) -> Result<TokenBundle, AppError> {
+    profile.require_graph()?;
     let scopes = scopes(channel_history);
     let bundle = if device_code {
         device_login(profile, scopes, out).await?

@@ -9,18 +9,52 @@ use crate::error::AppError;
 /// The maintained, multitenant public-client registration shipped with teams-cli.
 pub const DEFAULT_CLIENT_ID: &str = "66ebad71-1604-48fc-a086-0d4caa24988b";
 pub const DEFAULT_TENANT: &str = "organizations";
+pub const DEFAULT_DESKTOP_PORT: u16 = 9222;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    #[default]
+    Graph,
+    Desktop,
+}
+
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Graph => "graph",
+            Self::Desktop => "desktop",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(default)]
+    pub backend: BackendKind,
+    #[serde(default)]
     pub client_id: String,
     #[serde(default = "default_tenant")]
     pub tenant: String,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default = "default_desktop_port")]
+    pub desktop_port: u16,
 }
 
 impl Profile {
+    pub fn require_graph(&self) -> Result<(), AppError> {
+        if self.backend == BackendKind::Desktop {
+            Err(crate::desktop::messaging_unsupported())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn require_writable(&self) -> Result<(), AppError> {
+        if self.backend == BackendKind::Desktop {
+            return Err(crate::desktop::messaging_unsupported());
+        }
         if self.read_only {
             Err(AppError::ReadOnly(
                 "read-only mode is enabled (unset TEAMS_READ_ONLY or disable read_only in the active profile to allow writes)"
@@ -34,6 +68,10 @@ impl Profile {
 
 fn default_tenant() -> String {
     DEFAULT_TENANT.into()
+}
+
+fn default_desktop_port() -> u16 {
+    DEFAULT_DESKTOP_PORT
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -51,6 +89,7 @@ pub struct ProfileSummary {
     pub tenant: String,
     pub client_id: String,
     pub read_only: bool,
+    pub backend: BackendKind,
 }
 
 pub fn path() -> PathBuf {
@@ -99,18 +138,28 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
     let config = read_file()?;
     let name = selected_profile_name_from(requested, config.active_profile.as_deref());
     let stored = config.profiles.get(&name);
-    let client_id = std::env::var("TEAMS_CLIENT_ID")
-        .ok()
-        .or_else(|| stored.map(|profile| profile.client_id.clone()))
-        .ok_or_else(|| {
-            AppError::InvalidInput(format!(
-                "profile '{name}' is not configured; run `teams init` or set TEAMS_CLIENT_ID"
-            ))
-        })?;
-    let tenant = std::env::var("TEAMS_TENANT")
-        .ok()
-        .or_else(|| stored.map(|profile| profile.tenant.clone()))
-        .unwrap_or_else(default_tenant);
+    let backend = stored.map(|p| p.backend).unwrap_or_default();
+    let client_id = if backend == BackendKind::Desktop {
+        String::new()
+    } else {
+        std::env::var("TEAMS_CLIENT_ID")
+            .ok()
+            .or_else(|| stored.map(|profile| profile.client_id.clone()))
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!(
+                    "profile '{name}' is not configured; run `teams init` or set TEAMS_CLIENT_ID"
+                ))
+            })?
+    };
+    let tenant = if backend == BackendKind::Desktop {
+        String::new()
+    } else {
+        std::env::var("TEAMS_TENANT")
+            .ok()
+            .or_else(|| stored.map(|profile| profile.tenant.clone()))
+            .unwrap_or_else(default_tenant)
+    };
     let read_only = match std::env::var("TEAMS_READ_ONLY") {
         Ok(value) => parse_bool("TEAMS_READ_ONLY", &value)?,
         Err(std::env::VarError::NotPresent) => stored.is_some_and(|profile| profile.read_only),
@@ -120,10 +169,20 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
             )));
         }
     };
+    let desktop_port = stored
+        .map(|p| p.desktop_port)
+        .unwrap_or(DEFAULT_DESKTOP_PORT);
+    if backend == BackendKind::Desktop && desktop_port < 1024 {
+        return Err(AppError::InvalidInput(
+            "desktop_port must be between 1024 and 65535".into(),
+        ));
+    }
     let profile = Profile {
+        backend,
         client_id,
         tenant,
-        read_only,
+        read_only: read_only || backend == BackendKind::Desktop,
+        desktop_port,
     };
     Ok((name, profile))
 }
@@ -137,6 +196,17 @@ pub fn selected_profile_name(requested: Option<&str>) -> Result<String, AppError
         requested,
         config.active_profile.as_deref(),
     ))
+}
+
+/// Resolve backend selection without consulting OAuth configuration or credentials.
+pub fn selected_backend(requested: Option<&str>) -> Result<BackendKind, AppError> {
+    let config = read_file()?;
+    let name = selected_profile_name_from(requested, config.active_profile.as_deref());
+    Ok(config
+        .profiles
+        .get(&name)
+        .map(|p| p.backend)
+        .unwrap_or_default())
 }
 
 fn selected_profile_name_from(requested: Option<&str>, active: Option<&str>) -> String {
@@ -181,9 +251,18 @@ pub fn profile_summaries() -> Result<Vec<ProfileSummary>, AppError> {
         .map(|(name, profile)| ProfileSummary {
             name: name.clone(),
             active: config.active_profile.as_deref() == Some(name.as_str()),
-            tenant: profile.tenant.clone(),
-            client_id: profile.client_id.clone(),
-            read_only: profile.read_only,
+            tenant: if profile.backend == BackendKind::Desktop {
+                String::new()
+            } else {
+                profile.tenant.clone()
+            },
+            client_id: if profile.backend == BackendKind::Desktop {
+                String::new()
+            } else {
+                profile.client_id.clone()
+            },
+            read_only: profile.read_only || profile.backend == BackendKind::Desktop,
+            backend: profile.backend,
         })
         .collect())
 }

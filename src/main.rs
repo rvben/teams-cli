@@ -5,13 +5,15 @@ use serde::Serialize;
 use serde_json::Value;
 
 use teams_cli::auth;
+use teams_cli::backend::TeamsBackend;
 use teams_cli::cli::{
     AuthCommand, ChannelsCommand, ChatsCommand, Cli, Command, ConfigCommand, InitArgs,
     MessagesCommand, OffsetPageArgs, PageArgs, ProfileCommand, TuiArgs,
 };
-use teams_cli::config::{self, Profile};
+use teams_cli::config::{self, BackendKind, Profile};
+use teams_cli::desktop::{self, DesktopClient};
 use teams_cli::error::AppError;
-use teams_cli::graph::{self, GraphClient, Page};
+use teams_cli::graph::{self, Page};
 use teams_cli::output::{Output, OutputFormat, print_error, structured_from_args};
 use teams_cli::{schema, tui};
 
@@ -56,8 +58,10 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
         Some(command) => command,
         None if io::stdin().is_terminal() && io::stdout().is_terminal() && !config::exists() => {
             Command::Init(InitArgs {
+                backend: BackendKind::Graph,
+                desktop_port: None,
                 client_id: None,
-                tenant: "organizations".into(),
+                tenant: None,
                 no_login: false,
                 device_code: false,
                 channel_history: false,
@@ -76,6 +80,20 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
             ));
         }
     };
+    if requires_messaging(&command)
+        && config::selected_backend(profile_arg)? == BackendKind::Desktop
+    {
+        return Err(desktop::messaging_unsupported());
+    }
+    if matches!(
+        command,
+        Command::Auth {
+            command: AuthCommand::Login { .. } | AuthCommand::Logout
+        }
+    ) && config::selected_backend(profile_arg)? == BackendKind::Desktop
+    {
+        return Err(AppError::Unsupported("desktop authentication is managed in Teams; sign in or out in the app. Use `teams auth status` for connection diagnostics".into()));
+    }
     match command {
         Command::Init(args) => init(profile_arg.unwrap_or("default"), args, out).await,
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
@@ -141,10 +159,9 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                     "message body cannot be empty".into(),
                 ));
             }
-            let (name, profile) = config::load(profile_arg)?;
+            let (_, profile) = config::load(profile_arg)?;
             profile.require_writable()?;
-            let token = auth::access_token(&name, &profile).await?;
-            let client = GraphClient::new(token);
+            let client = client(profile_arg).await?;
             let value = client
                 .send(chat.as_deref(), team.as_deref(), channel.as_deref(), &body)
                 .await?;
@@ -182,7 +199,50 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     }
 }
 
+fn requires_messaging(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Whoami
+            | Command::List(_)
+            | Command::Channels { .. }
+            | Command::Chats { .. }
+            | Command::Messages { .. }
+    ) || matches!(command, Command::Tui(args) if !args.demo && !args.snapshot)
+}
+
 async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), AppError> {
+    if args.backend == BackendKind::Desktop {
+        if args.client_id.is_some()
+            || args.device_code
+            || args.channel_history
+            || args.tenant.is_some()
+        {
+            return Err(AppError::InvalidInput("desktop profiles do not use OAuth client, tenant, device-code or channel-history options".into()));
+        }
+        let profile = Profile {
+            backend: BackendKind::Desktop,
+            client_id: String::new(),
+            tenant: String::new(),
+            read_only: true,
+            desktop_port: args.desktop_port.unwrap_or(config::DEFAULT_DESKTOP_PORT),
+        };
+        let path = config::save(profile_name, profile.clone())?;
+        let connection = if args.no_login {
+            None
+        } else {
+            Some(DesktopClient::new(profile.desktop_port)?.probe().await?)
+        };
+        let value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
+            "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
+            "read_only":true,"desktop_port":profile.desktop_port,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
+            "session_verified":false,"connection":connection});
+        return out.value(&value, || format!("Saved desktop profile '{profile_name}'. Connection diagnostics only; sign-in and chat access are unverified.\nConfig: {}\nNext: `teams --profile {profile_name} doctor`", path.display()));
+    }
+    if args.desktop_port.is_some() {
+        return Err(AppError::InvalidInput(
+            "--desktop-port requires --backend desktop".into(),
+        ));
+    }
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     if interactive && !out.json() {
         eprintln!("\n  teams\n  Microsoft Teams, without leaving your flow.\n");
@@ -192,7 +252,12 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
     }
     let client_id = args
         .client_id
+        .or_else(|| std::env::var("TEAMS_CLIENT_ID").ok())
         .unwrap_or_else(|| config::DEFAULT_CLIENT_ID.into());
+    let tenant = args
+        .tenant
+        .or_else(|| std::env::var("TEAMS_TENANT").ok())
+        .unwrap_or_else(|| config::DEFAULT_TENANT.into());
     if client_id.trim().is_empty() {
         return Err(AppError::InvalidInput("client ID cannot be empty".into()));
     }
@@ -204,9 +269,11 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
     let path = config::save(
         profile_name,
         Profile {
+            backend: BackendKind::Graph,
             client_id: client_id.clone(),
-            tenant: args.tenant.clone(),
+            tenant: tenant.clone(),
             read_only: args.read_only,
+            desktop_port: config::DEFAULT_DESKTOP_PORT,
         },
     )?;
     let mut signed_in = false;
@@ -225,6 +292,7 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
     #[derive(Serialize)]
     struct InitResult<'a> {
         profile: &'a str,
+        backend: &'a str,
         config_path: String,
         signed_in: bool,
         client_id: &'a str,
@@ -234,10 +302,11 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
     }
     let result = InitResult {
         profile: profile_name,
+        backend: "graph",
         config_path: path.display().to_string(),
         signed_in,
         client_id: &client_id,
-        tenant: &args.tenant,
+        tenant: &tenant,
         channel_history_requested: args.channel_history,
         read_only: args.read_only,
     };
@@ -263,6 +332,8 @@ fn config_command(
             let (name, profile) = config::load(profile_arg)?;
             let value = serde_json::json!({
                 "profile": name,
+                "backend": profile.backend,
+                "desktop_port": if profile.backend == BackendKind::Desktop { Some(profile.desktop_port) } else { None },
                 "client_id": profile.client_id,
                 "tenant": profile.tenant,
                 "read_only": profile.read_only,
@@ -270,12 +341,14 @@ fn config_command(
             });
             out.value(&value, || {
                 format!(
-                    "Profile: {}\nTenant: {}\nClient ID: {}\nRead only: {}\nConfig: {}",
+                    "Profile: {}\nBackend: {}\nTenant: {}\nClient ID: {}\nRead only: {}\nConfig: {}{}",
                     value["profile"].as_str().unwrap_or_default(),
+                    profile.backend.as_str(),
                     value["tenant"].as_str().unwrap_or_default(),
                     value["client_id"].as_str().unwrap_or_default(),
                     yes_no(value["read_only"].as_bool().unwrap_or(false)),
                     config::path().display(),
+                    if profile.backend == BackendKind::Desktop { format!("\nDesktop port: {}", profile.desktop_port) } else { String::new() },
                 )
             })
         }
@@ -287,6 +360,26 @@ async fn auth_command(
     command: AuthCommand,
     out: Output,
 ) -> Result<(), AppError> {
+    if config::selected_backend(profile_arg)? == BackendKind::Desktop {
+        let AuthCommand::Status { offline } = command else {
+            return Err(AppError::Unsupported(
+                "desktop authentication is managed in Teams".into(),
+            ));
+        };
+        let (name, profile) = config::load(profile_arg)?;
+        let connection = if offline {
+            None
+        } else {
+            Some(DesktopClient::new(profile.desktop_port)?.probe().await?)
+        };
+        let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"configured":true,
+            "signed_in":null,"verified":false,"session_verified":false,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
+            "identity":null,"authentication":"teams_desktop_session_unverified","offline":offline,
+            "config_path":config::path(),"read_only":true,"desktop_port":profile.desktop_port,
+            "granted_scopes":null,"channel_history":null,"connection":connection});
+        return out.value(&value, || format!("Profile: {name}\nBackend: desktop (experimental)\nEndpoint: {}\nSigned in: unknown\nSession verified: no\nRead only: yes",
+            connection.as_ref().map(|c| c.status.detail()).unwrap_or("not checked (offline)")));
+    }
     match command {
         AuthCommand::Login {
             device_code,
@@ -323,7 +416,7 @@ async fn auth_command(
             } else {
                 None
             };
-            let value = serde_json::json!({"profile":name,"configured":configured.is_some(),"signed_in":signed_in,"verified":identity.is_some(),"identity":identity,"config_path":config::path(),"read_only":configured.as_ref().is_some_and(|(_, profile)| profile.read_only),"granted_scopes":scopes,"channel_history":channel_history});
+            let value = serde_json::json!({"profile":name,"backend":"graph","configured":configured.is_some(),"signed_in":signed_in,"verified":identity.is_some(),"identity":identity,"config_path":config::path(),"read_only":configured.as_ref().is_some_and(|(_, profile)| profile.read_only),"granted_scopes":scopes,"channel_history":channel_history});
             out.value(&value, || {
                 format!(
                     "Profile: {name}\nConfigured: {}\nSigned in: {}\nRead only: {}\nChannel history: {}\nConfig: {}",
@@ -352,9 +445,10 @@ fn profile_command(command: ProfileCommand, yes: bool, out: Output) -> Result<()
                             .iter()
                             .map(|profile| {
                                 format!(
-                                    "{} {}  {}",
+                                    "{} {}  {}  {}",
                                     if profile.active { "*" } else { " " },
                                     profile.name,
+                                    profile.backend.as_str(),
                                     profile.tenant
                                 )
                             })
@@ -377,7 +471,9 @@ fn profile_command(command: ProfileCommand, yes: bool, out: Output) -> Result<()
                     "profile removal requires --yes".into(),
                 ));
             }
-            auth::logout(&name)?;
+            if config::selected_backend(Some(&name))? == BackendKind::Graph {
+                auth::logout(&name)?;
+            }
             if !config::remove_profile(&name)? {
                 return Err(AppError::InvalidInput(format!(
                     "profile '{name}' is not configured"
@@ -391,10 +487,8 @@ fn profile_command(command: ProfileCommand, yes: bool, out: Output) -> Result<()
     }
 }
 
-async fn client(profile_arg: Option<&str>) -> Result<GraphClient, AppError> {
-    let (name, profile) = config::load(profile_arg)?;
-    let token = auth::access_token(&name, &profile).await?;
-    Ok(GraphClient::new(token))
+async fn client(profile_arg: Option<&str>) -> Result<TeamsBackend, AppError> {
+    TeamsBackend::connect(profile_arg).await
 }
 
 fn render_page(page: &mut Page, args: &PageArgs, out: Output) -> Result<(), AppError> {
@@ -482,8 +576,10 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
                     init(
                         &profile_name,
                         InitArgs {
+                            backend: BackendKind::Graph,
+                            desktop_port: None,
                             client_id: None,
-                            tenant: config::DEFAULT_TENANT.into(),
+                            tenant: None,
                             no_login: false,
                             device_code: false,
                             channel_history: false,
@@ -602,6 +698,9 @@ struct Check {
 }
 
 async fn doctor(profile_arg: Option<&str>, offline: bool, out: Output) -> Result<(), AppError> {
+    if config::selected_backend(profile_arg)? == BackendKind::Desktop {
+        return desktop_doctor(profile_arg, offline, out).await;
+    }
     let mut checks = Vec::new();
     let configured = config::configured_profile(profile_arg);
     checks.push(Check {
@@ -714,11 +813,95 @@ async fn doctor(profile_arg: Option<&str>, offline: bool, out: Output) -> Result
         detail: teams_detail,
     });
     let healthy = checks.iter().all(|check| check.status != "fail");
-    let value = serde_json::json!({"checks":checks,"healthy":healthy,"offline":offline});
+    let value =
+        serde_json::json!({"backend":"graph","checks":checks,"healthy":healthy,"offline":offline});
     out.value(&value, || {
         checks
             .iter()
             .map(|check| format!("{:<18} {:<4}  {}", check.name, check.status, check.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+async fn desktop_doctor(
+    profile_arg: Option<&str>,
+    offline: bool,
+    out: Output,
+) -> Result<(), AppError> {
+    let (name, profile) = config::load(profile_arg)?;
+    let prerequisites = desktop::local_prerequisites();
+    let mut checks = vec![
+        Check {
+            name: "configuration",
+            status: "pass",
+            detail: config::path().display().to_string(),
+        },
+        Check {
+            name: "write_safety",
+            status: "pass",
+            detail: "desktop diagnostics are read-only".into(),
+        },
+        Check {
+            name: "desktop_transport",
+            status: if prerequisites.is_ok() {
+                "pass"
+            } else {
+                "fail"
+            },
+            detail: prerequisites
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|e| e.to_string()),
+        },
+    ];
+    let connection = if !offline && prerequisites.is_ok() {
+        match DesktopClient::new(profile.desktop_port)?.probe().await {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                checks.push(Check {
+                    name: "desktop_probe",
+                    status: "fail",
+                    detail: error.to_string(),
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+    checks.push(Check {
+        name: "desktop_endpoint",
+        status: if offline {
+            "skip"
+        } else if connection.as_ref().is_some_and(|c| c.endpoint_available()) {
+            "pass"
+        } else {
+            "fail"
+        },
+        detail: connection
+            .as_ref()
+            .map(|c| c.status.detail())
+            .unwrap_or(if offline {
+                "endpoint check skipped (offline)"
+            } else {
+                "endpoint check unavailable"
+            })
+            .into(),
+    });
+    checks.push(Check {
+        name: "session_access",
+        status: "unverified",
+        detail: "sign-in, chat and message access have not been implemented or verified".into(),
+    });
+    let healthy = checks.iter().all(|c| c.status != "fail");
+    let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"healthy":healthy,"offline":offline,
+        "endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),"session_verified":false,"signed_in":null,
+        "desktop_port":profile.desktop_port,"connection":connection,"checks":checks});
+    out.value(&value, || {
+        checks
+            .iter()
+            .map(|c| format!("{:<18} {:<10} {}", c.name, c.status, c.detail))
             .collect::<Vec<_>>()
             .join("\n")
     })
@@ -730,9 +913,10 @@ fn capabilities(out: Output) -> Result<(), AppError> {
         "unsupported":["personal Microsoft accounts","user calls and screen sharing","private Teams protocols","tenant administration"],
         "account_types":["Microsoft 365 work or school"],
         "api":"Microsoft Graph v1.0",
+        "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Supported\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nNot supported\n  Personal Microsoft accounts; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Existing endpoint diagnostics only. Sign-in and chat access are unverified.\n\nNot supported\n  Desktop messaging; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
 }
 
 fn read_body(body: &str) -> Result<String, AppError> {
