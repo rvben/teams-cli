@@ -1,16 +1,16 @@
 // Sends one plain-text chat message through the Teams window's own GraphQL client, exactly as
 // its Send button does; Teams performs the request with its own sign-in. Evaluated as
-// `(script)(params)`, with params built by the CLI as a JSON literal. Returns only ids,
+// `(script)(params, select)`, with JSON params and the fixed cache selector. Returns only ids,
 // timestamps and Teams' status label, never message contents.
 // `{probe: true}` only reports whether this page hosts the client and sends nothing.
-async p=>{const fiber=e=>{const k=e&&Object.keys(e).find(k=>k.startsWith('__reactFiber$'));return k&&e[k]},
+async(p,select)=>{const fiber=e=>{const k=e&&Object.keys(e).find(k=>k.startsWith('__reactFiber$'));return k&&e[k]},
 client=(()=>{for(const s of['[contenteditable="true"]','#app [data-tid]','#app *']){let n=0;
 for(let f=fiber(document.querySelector(s));f&&n<5000;f=f.return,n++){const v=f.type&&f.type._context&&f.memoizedProps&&f.memoizedProps.value;
 if(v&&v.defaultClient&&typeof v.defaultClient.mutate=='function')return v.defaultClient}}})();
 if(p.probe)return{main:!!client};if(!client)return{error:'layout'};
 const req=q=>new Promise((r,j)=>{q.onsuccess=()=>r(q.result);q.onerror=()=>j(q.error)}),
-d=(await indexedDB.databases()).find(x=>x.name.includes(':conversation-manager:'));if(!d)return{error:'layout'};
-const db=await req(indexedDB.open(d.name));try{if(!await req(db.transaction('conversations').objectStore('conversations').get(p.chat)))return{error:'not_found'}}finally{db.close()}
+cache=select(await indexedDB.databases());if(cache.error)return{error:cache.error};
+const db=await req(indexedDB.open(cache.conversation));try{if(!await req(db.transaction('conversations').objectStore('conversations').get(p.chat)))return{error:'not_found'}}finally{db.close()}
 const N=v=>({kind:'Name',value:v}),V=v=>({kind:'Variable',name:N(v)}),T=(t,r)=>r?{kind:'NonNullType',type:{kind:'NamedType',name:N(t)}}:{kind:'NamedType',name:N(t)},
 vars=[['convId','ID',1],['message','SendMessageInput',1],['action','SendMessageAction',1],['originalConvId','ID'],['correlationId','ID'],
 ['offlineActionOptions','OfflineActionOptions'],['includeRepliesSummary','Boolean',0,{kind:'BooleanValue',value:false}]],

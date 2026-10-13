@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 const READ_SCRIPT: &str = include_str!("../desktop.js");
 const SEND_SCRIPT: &str = include_str!("../desktop_send.js");
+const CACHE_SCRIPT: &str = include_str!("../desktop_cache.js");
 
 pub struct Session<S> {
     system: S,
@@ -33,7 +34,7 @@ impl<S: System> Session<S> {
     /// Answers a read request with `{"error": code}` or `{"result": <evaluate result>}`.
     pub async fn read(&mut self, request: &Value) -> Result<Value, AppError> {
         let (port, params) = read_params(request)?;
-        let expression = format!("({READ_SCRIPT})({params}).then(JSON.stringify)");
+        let expression = format!("({READ_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)");
         if let Some((connected, page)) = &mut self.page
             && *connected == port
             && let Ok(result) = page.evaluate(&expression).await
@@ -82,7 +83,9 @@ impl<S: System> Session<S> {
         };
         Ok(
             match page
-                .evaluate(&format!("({SEND_SCRIPT})({params}).then(JSON.stringify)"))
+                .evaluate(&format!(
+                    "({SEND_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)"
+                ))
                 .await
             {
                 Ok(result) => json!({"result": result}),

@@ -270,12 +270,22 @@ fn suite_exit_codes_and_error_kinds_are_stable() {
 #[test]
 fn doctor_reports_failing_checks_and_exits_unhealthy() {
     let temp = tempfile::tempdir().unwrap();
+    // The keyring is keyed by profile, independently of XDG_CONFIG_HOME.
+    let profile = format!("doctor-fixture-{:032x}", rand::random::<u128>());
     let teams = || {
         let mut command = Command::cargo_bin("teams").unwrap();
         command
             .env("XDG_CONFIG_HOME", temp.path())
-            .env_remove("TEAMS_PROFILE")
-            .env_remove("TEAMS_ACCESS_TOKEN");
+            .args(["--profile", &profile]);
+        for variable in [
+            "TEAMS_PROFILE",
+            "TEAMS_ACCESS_TOKEN",
+            "TEAMS_CLIENT_ID",
+            "TEAMS_TENANT",
+            "TEAMS_READ_ONLY",
+        ] {
+            command.env_remove(variable);
+        }
         command
     };
     teams().args(["init", "--no-login"]).assert().success();

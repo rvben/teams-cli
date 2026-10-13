@@ -317,7 +317,7 @@ fn message_text(message: &Value) -> String {
     let text = if str_at(message, &["body", "contentType"]) == Some("html") {
         html_to_text(content)
     } else {
-        decode_entities(content).trim().to_string()
+        content.trim().to_string()
     };
     let attachments = message["attachments"].as_array().map_or(0, Vec::len);
     if !text.is_empty() {
@@ -595,6 +595,24 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_entities_are_literal_in_conversations_and_previews() {
+        let content = "Use &amp; and &#65; literally";
+        let message = json!({"from": {"user": {"displayName": "Ann"}},
+            "body": {"contentType": "text", "content": content}});
+        let entries = conversation(std::slice::from_ref(&message), &view(), None);
+        assert!(entries.contains(&Entry::Text(content.into())));
+        let chat = json!({"id": "chat", "chatType": "oneOnOne", "lastMessagePreview": message});
+        assert_eq!(
+            ChatRow::new(&chat, &view(), None).preview.as_deref(),
+            Some(content)
+        );
+        assert_eq!(
+            message_text(&json!({"body": {"contentType": "html", "content": content}})),
+            "Use & and A literally"
+        );
+    }
+
+    #[test]
     fn times_are_relative_to_the_local_day() {
         let view = view();
         let at = |s: &str| view.local(&json!(s)).unwrap();
@@ -696,7 +714,7 @@ mod tests {
             messages(&page, &view(), "older"),
             "Older messages available. Continue with --cursor 'older'\n\n\
              ── Yesterday ──\nYou  09:00\n  first\n\n\
-             ── Today ──\nANN  14:00\n  a & b\n  and more\nANN  14:30\n  (message deleted)"
+             ── Today ──\nANN  14:00\n  a &amp; b\n  and more\nANN  14:30\n  (message deleted)"
         );
     }
 

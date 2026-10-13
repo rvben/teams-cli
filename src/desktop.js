@@ -1,17 +1,18 @@
 // Projects the Teams page's own IndexedDB cache; raw records never leave the page.
-// Evaluated as `(script)(params)`, with params built by the CLI as a JSON literal.
-async p=>{const all=await indexedDB.databases(),req=q=>new Promise((r,j)=>{q.onsuccess=()=>r(q.result);q.onerror=()=>j(q.error)}),
-open=k=>{const d=all.find(x=>x.name.includes(':'+k+':'));if(!d)throw Error('layout');return req(indexedDB.open(d.name))},
+// Evaluated with JSON params and the fixed account-cache selector.
+async(p,select)=>{const cache=select(await indexedDB.databases());if(cache.error)return{error:cache.error};
+const req=q=>new Promise((r,j)=>{q.onsuccess=()=>r(q.result);q.onerror=()=>j(q.error)}),
+open=k=>{const name=cache[k];if(!name)throw Error('layout');return req(indexedDB.open(name))},
 iso=t=>t?new Date(+t).toISOString():null,uid=m=>(m||'').replace(/^.*\//,'').replace(/^8:orgid:/,''),sys=t=>/^(ThreadActivity|Event|Control)\//.test(t||''),
 page=rows=>{rows.sort((a,b)=>b.t-a.t||(a.id<b.id?-1:a.id>b.id?1:0));const c=p.after;if(c)rows=rows.filter(r=>r.t<c.t||r.t==c.t&&r.id>c.id);
 const items=rows.slice(0,p.limit),last=items[items.length-1];return{items,next:rows.length>p.limit?{t:last.t,id:last.id}:null}},
 prof=async ids=>{const n={};let d;try{d=await open('profiles');const s=d.transaction('profiles').objectStore('profiles');
 await Promise.all(ids.map(async i=>{const r=await req(s.get('8:orgid:'+i));if(r&&r.displayName)n[i]=r.displayName}))}catch(e){}finally{d&&d.close()}return n},
 chain=async(d,id)=>(await req(d.transaction('replychains').objectStore('replychains').getAll(IDBKeyRange.bound([id],[id,[]])))).flatMap(rc=>Object.values(rc.messageMap||{}));
-const cdb=await open('conversation-manager'),me=cdb.name.split(':')[4],cs=cdb.transaction('conversations').objectStore('conversations');let pg;
+const cdb=await open('conversation'),me=cache.account,cs=cdb.transaction('conversations').objectStore('conversations');let pg;
 try{if(p.query=='chats')pg=page((await req(cs.getAll())).filter(c=>c.type=='Chat'||c.type=='Meeting'||c.type=='StreamOfNotes').map(c=>({t:c.lastMessageTimeUtc||0,id:c.id,c})));
 else if(!await req(cs.get(p.chat)))return{error:'not_found'}}finally{cdb.close()}
-const rdb=await open('replychain-manager');try{if(pg){
+const rdb=await open('replies');try{if(pg){
 const cs=pg.items.map(({c})=>{const lm=c.lastMessage||{},one=/@unq\.gbl\.spaces$/.test(c.id),nm={},h=+((c.properties||{}).consumptionhorizon||'').split(';')[0],
 mem=new Set((c.members||[]).map(m=>uid(m.id)).concat(one?c.id.slice(3).split('@')[0].split('_'):[]));if(lm.imdisplayname)nm[uid(lm.from)]=lm.imdisplayname;
 return{c,one,mem,nm,v:{id:c.id,topic:(c.threadProperties||{}).topic||null,chatType:c.type=='Meeting'?'meeting':one||c.type=='StreamOfNotes'?'oneOnOne':'group',

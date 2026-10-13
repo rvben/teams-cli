@@ -26,6 +26,9 @@ cargo install --path .
 maturin build
 ```
 
+Development checks (`make check` or `cargo test --all-targets`) also need Python 3
+and Node.js 20 or newer for release-smoke and synthetic desktop-script fixtures.
+
 ## Explore before configuring Microsoft 365
 
 ```console
@@ -238,16 +241,23 @@ limited to `GET /json/version` and `GET /json/list`, and their results omit titl
 full URLs, target IDs, WebSocket URLs and private origins. Chat reads then attach to
 the first Teams-origin page over the same verified loopback port and keep that
 connection open; if it drops, the listener is verified again before the next read.
+Related cache databases are selected for the same account. If a window exposes
+several conversation-account caches, reads and sends refuse with a desktop error;
+selecting among those accounts is not supported yet.
 
 On first use under WSL, the helper is downloaded from the matching GitHub release,
 checked against the release's `SHA256SUMS`, and cached in
-`~/.cache/teams-cli/windows-helper/<version>/`. `doctor` reports whether it is
-installed and never downloads it. Set `TEAMS_DESKTOP_HELPER` to use another
+`~/.cache/teams-cli/windows-helper/<version>/`. `doctor --offline` reports whether
+it is installed without downloading it. Online probes install a compatible release
+helper when needed. Set `TEAMS_DESKTOP_HELPER` to use another
 `teams.exe`, or run `make windows-helper` (needs
 [cargo-xwin](https://github.com/rust-cross/cargo-xwin)) to build one for a
 development checkout. If the download is blocked, fetch the
 `x86_64-pc-windows-msvc` archive from the release page, unpack `teams.exe` and point
 `TEAMS_DESKTOP_HELPER` at it.
+The already published `0.1.9-alpha.1` binary predates this helper protocol. Source
+checkouts still carrying that version use `make windows-helper` or an explicit
+compatible helper; they do not download that incompatible release.
 
 The CLI and the helper agree on a protocol number, and any helper that speaks the CLI's
 protocol is accepted, whatever its version. When they differ, the error names both

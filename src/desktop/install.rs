@@ -25,6 +25,10 @@ impl HelperState {
         match self {
             Self::Override(path) => format!("{OVERRIDE}={}", path.display()),
             Self::Installed(path) => format!("installed at {}", path.display()),
+            Self::Missing(_) if !release_has_helper(VERSION) => format!(
+                "not installed; v{VERSION} predates desktop helpers; {}",
+                development_remedy()
+            ),
             Self::Missing(_) => format!(
                 "not installed; teams-cli {VERSION} for Windows downloads from the GitHub release on first use"
             ),
@@ -46,6 +50,9 @@ pub fn state() -> Result<HelperState, AppError> {
 
 /// How to get a helper that speaks this CLI's protocol, for whichever helper is in use.
 pub fn remedy() -> String {
+    if !release_has_helper(VERSION) {
+        return development_remedy();
+    }
     match state() {
         Ok(HelperState::Override(_)) => format!(
             "point {OVERRIDE} at a teams.exe that speaks protocol {PROTOCOL}, such as teams-cli {VERSION} for Windows, or unset it to use the matching release"
@@ -63,7 +70,23 @@ pub fn remedy() -> String {
 
 /// The helper's path, downloading and installing it if needed.
 pub async fn ensure() -> Result<PathBuf, AppError> {
-    let path = match state()? {
+    ensure_state(state()?, VERSION).await
+}
+
+// This already-published alpha is diagnostics-only. Development checkouts still
+// carrying its version need a built helper, not its incompatible release binary.
+fn release_has_helper(version: &str) -> bool {
+    version != "0.1.9-alpha.1"
+}
+
+fn development_remedy() -> String {
+    format!(
+        "run `make windows-helper` in the source checkout or set {OVERRIDE} to a teams.exe that speaks protocol {PROTOCOL}"
+    )
+}
+
+async fn ensure_state(state: HelperState, version: &str) -> Result<PathBuf, AppError> {
+    let path = match state {
         HelperState::Override(path) if path.is_file() => return Ok(path),
         HelperState::Override(path) => {
             return Err(AppError::Desktop(format!(
@@ -74,10 +97,16 @@ pub async fn ensure() -> Result<PathBuf, AppError> {
         HelperState::Installed(path) => return Ok(path),
         HelperState::Missing(path) => path,
     };
-    let asset = format!("teams-cli-v{VERSION}-x86_64-pc-windows-msvc.tar.gz");
-    let release = format!("{}/releases/tag/v{VERSION}", env!("CARGO_PKG_REPOSITORY"));
+    if !release_has_helper(version) {
+        return Err(AppError::Desktop(format!(
+            "v{version} was published before desktop helpers; automatic helper download is unavailable for this source version; {}",
+            development_remedy()
+        )));
+    }
+    let asset = format!("teams-cli-v{version}-x86_64-pc-windows-msvc.tar.gz");
+    let release = format!("{}/releases/tag/v{version}", env!("CARGO_PKG_REPOSITORY"));
     let base = format!(
-        "{}/releases/download/v{VERSION}",
+        "{}/releases/download/v{version}",
         env!("CARGO_PKG_REPOSITORY")
     );
     // Whatever went wrong, the same archive can be fetched and pointed at by hand.
@@ -98,7 +127,7 @@ pub async fn ensure() -> Result<PathBuf, AppError> {
         .await
         .map_err(by_hand)?;
     let expected = checksum(&String::from_utf8_lossy(&sums), &asset)
-        .ok_or_else(|| by_hand(format!("SHA256SUMS of v{VERSION} does not list {asset}")))?;
+        .ok_or_else(|| by_hand(format!("SHA256SUMS of v{version} does not list {asset}")))?;
     if hex(&Sha256::digest(&archive)) != expected {
         return Err(AppError::Desktop(format!(
             "{asset} does not match its published checksum; nothing was installed"
@@ -219,6 +248,28 @@ fn install(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_release_needs_a_built_helper_but_accepts_explicit_or_cached_builds() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("teams.exe");
+        let error = ensure_state(HelperState::Missing(path.clone()), "0.1.9-alpha.1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("published before desktop helpers")
+                && error.contains("make windows-helper")
+        );
+        assert!(!path.exists());
+        std::fs::write(&path, b"MZ fixture").unwrap();
+        for state in [
+            HelperState::Override(path.clone()),
+            HelperState::Installed(path.clone()),
+        ] {
+            assert_eq!(ensure_state(state, "0.1.9-alpha.1").await.unwrap(), path);
+        }
+    }
 
     fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(

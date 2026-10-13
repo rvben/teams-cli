@@ -39,6 +39,10 @@ pub fn messaging_unsupported() -> AppError {
     AppError::Unsupported("the experimental desktop backend reads chats and chat messages and sends plain-text chat messages only (Windows/WSL); teams, channels and identity need a Graph profile".into())
 }
 
+fn account_selection_error() -> AppError {
+    AppError::Desktop("Multiple Teams account caches are available in this window; desktop account selection is not supported yet".into())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeStatus {
@@ -330,6 +334,7 @@ fn send_request(port: u16, chat: &str, body: &str) -> Result<Value, AppError> {
 fn send_error(code: &str) -> AppError {
     match code {
         "not_found" => AppError::NotFound("chat not found in the Teams desktop cache".into()),
+        "account_ambiguous" => account_selection_error(),
         "unconfirmed" => AppError::Unconfirmed(
             "Teams did not confirm the message; it may still be delivered. Check the chat before sending again".into(),
         ),
@@ -433,6 +438,9 @@ fn read_page(reply: &Value) -> Result<Page, AppError> {
     let invalid = || AppError::Desktop("the Teams page returned an invalid chat response".into());
     if let Some(code) = reply.get("error").and_then(Value::as_str) {
         let status = serde_json::from_value::<ProbeStatus>(json!(code)).ok();
+        if code == "account_ambiguous" {
+            return Err(account_selection_error());
+        }
         return Err(AppError::Desktop(match (status, code) {
             (Some(status), _) => status.detail().into(),
             (None, "no_target") => {
@@ -463,6 +471,9 @@ fn read_page(reply: &Value) -> Result<Page, AppError> {
         return Err(AppError::NotFound(
             "chat not found in the Teams desktop cache".into(),
         ));
+    }
+    if value["error"] == "account_ambiguous" {
+        return Err(account_selection_error());
     }
     let items = value["items"].as_array().ok_or_else(invalid)?.clone();
     let next_cursor = match &value["next"] {
@@ -943,7 +954,12 @@ mod tests {
             json!({"operation": "send", "port": 9222, "chat_id": NOTES,
                    "body": "hi", "client_message_id": "<id>"})
         );
-        let scripts = [include_str!("desktop.js"), include_str!("desktop_send.js")].map(|script| {
+        let scripts = [
+            include_str!("desktop.js"),
+            include_str!("desktop_send.js"),
+            include_str!("desktop_cache.js"),
+        ]
+        .map(|script| {
             use sha2::Digest;
             // Line endings depend on the checkout, not on the script.
             let digest = sha2::Sha256::digest(script.replace('\r', ""));
@@ -952,7 +968,7 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         });
-        assert_eq!(scripts, ["3ee7c6f94e71", "1ab6c9523718"]);
+        assert_eq!(scripts, ["9f76a3e5b60e", "b9d1fd2a4447", "3e837cc21336"]);
     }
 
     #[test]
@@ -1110,6 +1126,17 @@ mod tests {
             Err(AppError::NotFound(_))
         ));
         let layout = json!({"result":{"exceptionDetails":{"exception":{"description":"Error: layout\n    at x"}}}});
+        for ambiguous in [
+            json!({"error": "account_ambiguous"}),
+            reply(json!({"error": "account_ambiguous"})),
+        ] {
+            assert!(
+                matches!(read_page(&ambiguous), Err(AppError::Desktop(m)) if m.contains("account selection"))
+            );
+            assert!(
+                matches!(sent_message(&ambiguous, CHAT), Err(AppError::Desktop(m)) if m.contains("account selection"))
+            );
+        }
         assert!(matches!(read_page(&layout), Err(AppError::Desktop(m)) if m.contains("layout")));
         for reply in [
             json!({"error": "no_target"}),
