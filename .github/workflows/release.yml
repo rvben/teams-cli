@@ -98,8 +98,8 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          smoke="${RUNNER_TEMP}/teams-binary-smoke"
-          mkdir -p "$smoke"
+          smoke="$(mktemp -d)"
+          trap 'rm -rf "$smoke"' EXIT
           tar -xzf "dist/teams-cli-v${RELEASE_VERSION}-${{ matrix.target }}.tar.gz" -C "$smoke"
           python scripts/smoke-release.py "$smoke/${{ matrix.binary }}" "$RELEASE_VERSION"
       - name: Attest build provenance
