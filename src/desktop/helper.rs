@@ -305,6 +305,15 @@ done
             );
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A process forked by another test while the script was open for writing holds
+            // that handle until it execs, and executing the script meanwhile fails with
+            // "text file busy". Wait that out here, so the test's own start never sees it.
+            while matches!(
+                std::process::Command::new(&path).status(),
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+            ) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             path
         }
 
