@@ -128,3 +128,49 @@ uses the package version unless an explicit `version` is supplied, builds the
 real artifacts, and exercises registry validation without publishing packages,
 creating a GitHub release, generating attestations, or updating downstream
 packaging.
+
+## Browser-client validation
+
+The optional `--desktop-client browser` route runs an isolated Chrome/Chromium/Edge
+profile on macOS or Linux, including WSL2 with a Linux browser. A visible initial
+sign-in and subsequent headless operation use the same persistent profile. Native
+Teams and the WSL Windows helper retain their existing behavior.
+
+Before claiming live browser compatibility, validate signed-in personal and
+work/school cache reads, a single explicitly approved send with exact readback,
+visible-to-headless session persistence, expired-sign-in recovery, and normal
+shutdown on each intended platform. Linux process/socket tests and browser lifecycle
+smoke tests establish plumbing behavior, not signed-in Teams compatibility.
+
+Repeat the unsigned-in real-browser lifecycle test with a test installation:
+
+```sh
+TEAMS_DESKTOP_BROWSER=/absolute/path/to/test/chromium cargo test --locked --test desktop browser_lifecycle_with_disposable_profile -- --ignored
+```
+
+The test uses a disposable profile, preserves the normal browser profile, exercises
+idempotent connect and mode-change refusal, and closes the managed browser on exit.
+On macOS, use Chrome for Testing for this short-lived validation.
+
+Automatic browser login opens visibly, waits for a successful chat read, closes
+only the verified managed browser, and restarts headless with the same profile.
+The headless chat read must also succeed. Test `desktop login` and browser `init`
+with real sign-in, MFA, an empty chat list, expiry, and interrupted/timeout recovery
+before claiming this automatic flow is validated on a platform.
+
+
+## Core browser release checks
+
+`browser-core` is an opt-in, build-pinned personal-account route. It requires
+matching Chrome for Testing / chrome-headless-shell executables and a separate
+private profile. A startup verifies the retained data client with a fresh chat
+query before allowing cache reads or sends. Unknown bootstrap hashes and missing
+readiness markers refuse operations; there is no automatic full-UI fallback.
+
+Release validation should cover actual CLI connect/read/login/disconnect, incoming
+updates, a separately approved send and exact readback, and footprint after those
+operations. Pure browser prototype evidence is insufficient for CLI integration.
+Run macOS and Linux checks; compile Windows native paths too. Do not claim Linux
+signed-in compatibility, work/school core support, a fixed RAM limit, or long-running
+reliability from the short personal-account macOS validation. Prototype reports,
+profiles, public bundle copies and memory snapshots remain local and uncommitted.

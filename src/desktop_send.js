@@ -4,7 +4,8 @@
 // selector. Returns only ids, timestamps and Teams' status label, never message contents.
 // `{probe: true}` only reports whether this page hosts the client and sends nothing.
 async(p,select)=>{const fiber=e=>{const k=e&&Object.keys(e).find(k=>k.startsWith('__reactFiber$'));return k&&e[k]},
-client=(()=>{for(const s of['[contenteditable="true"]','#app [data-tid]','#app *']){let n=0;
+core=globalThis.__teamsCliCore?.ready===true?globalThis.__teamsCliCore:null,
+client=core?.client||(()=>{for(const s of['[contenteditable="true"]','#app [data-tid]','#app *']){let n=0;
 for(let f=fiber(document.querySelector(s));f&&n<5000;f=f.return,n++){const v=f.type&&f.type._context&&f.memoizedProps&&f.memoizedProps.value;
 if(v&&v.defaultClient&&typeof v.defaultClient.mutate=='function')return v.defaultClient}}})();
 if(p.probe)return{main:!!client};if(!client)return{error:'layout'};
@@ -15,10 +16,13 @@ const N=v=>({kind:'Name',value:v}),V=v=>({kind:'Variable',name:N(v)}),T=(t,r)=>r
 vars=[['convId','ID',1],['message','SendMessageInput',1],['action','SendMessageAction',1],['originalConvId','ID'],['correlationId','ID'],
 ['offlineActionOptions','OfflineActionOptions'],['includeRepliesSummary','Boolean',0,{kind:'BooleanValue',value:false}]],
 field=v=>({kind:'Field',name:N(v)}),
+coreVar=['withChatNetworkFallback','Boolean'],
+sendVars=core?vars.slice(0,6).concat([coreVar]):vars.slice(0,6),
+allVars=core?vars.concat([coreVar]):vars,
 mutation={kind:'Document',definitions:[{kind:'OperationDefinition',operation:'mutation',name:N('autoSendMessage'),
-variableDefinitions:vars.map(([n,t,r,dv])=>({kind:'VariableDefinition',variable:V(n),type:T(t,r),defaultValue:dv,directives:[]})),
+variableDefinitions:allVars.map(([n,t,r,dv])=>({kind:'VariableDefinition',variable:V(n),type:T(t,r),defaultValue:dv,directives:[]})),
 directives:[{kind:'Directive',name:N('offlineAction'),arguments:[]},{kind:'Directive',name:N('cache'),arguments:[]}],
-selectionSet:{kind:'SelectionSet',selections:[{...field('sendMessage'),arguments:vars.slice(0,6).map(([n])=>({kind:'Argument',name:N(n),value:V(n)})),
+selectionSet:{kind:'SelectionSet',selections:[{...field('sendMessage'),arguments:sendVars.map(([n])=>({kind:'Argument',name:N(n),value:V(n)})),
 directives:[],selectionSet:{kind:'SelectionSet',selections:['id','clientMessageId','originalArrivalTime','status','messageType'].map(field)}}]}}]},
 esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
 text=s=>esc(s).replace(/\r?\n/g,'<br>'),
@@ -41,6 +45,7 @@ inMeetingPrivateChatContext:null},
 variables={action:'Create',convId:p.chat,originalConvId:p.chat,correlationId:crypto.randomUUID(),searchSessionId:'',
 sendFromChannel_ToBeRefactored:false,includeRepliesSummary:true,isBilateralChat:false,message,
 offlineActionOptions:{queueId:'queue_'+p.chat,actionId:'send_'+p.clientMessageId,actionType:'send',pendingUploadIds:[]}};
+if(core)variables.withChatNetworkFallback=true;
 // From here on Teams may already have the message, so every failure is reported as unconfirmed.
 try{const r=await Promise.race([client.mutate({mutation,variables}),new Promise(r=>setTimeout(r,20000))]),
 m=r&&r.data&&r.data.sendMessage;if(!m||!m.id)return{error:'unconfirmed'};

@@ -39,6 +39,30 @@ pub enum DesktopAccount {
     WorkSchool,
 }
 
+/// Browser sessions use a dedicated profile rather than the installed Teams app.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopClientKind {
+    #[default]
+    Native,
+    Browser,
+    BrowserCore,
+}
+
+impl DesktopClientKind {
+    pub fn is_browser(self) -> bool {
+        matches!(self, Self::Browser | Self::BrowserCore)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Browser => "browser",
+            Self::BrowserCore => "browser-core",
+        }
+    }
+}
+
 impl DesktopAccount {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -48,7 +72,7 @@ impl DesktopAccount {
         }
     }
 
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     pub(crate) fn from_request(value: &serde_json::Value) -> Result<Self, AppError> {
         match value.as_str() {
             None if value.is_null() => Ok(Self::Auto),
@@ -79,6 +103,8 @@ pub struct Profile {
     pub desktop_port: u16,
     #[serde(default)]
     pub desktop_account: DesktopAccount,
+    #[serde(default)]
+    pub desktop_client: DesktopClientKind,
 }
 
 impl Profile {
@@ -175,6 +201,13 @@ fn write_file(path: &std::path::Path, config: &ConfigFile) -> Result<(), AppErro
     Ok(())
 }
 
+/// Resolve desktop lifecycle settings while still allowing an unconfigured explicit client.
+pub fn connection_profile(requested: Option<&str>) -> Result<Option<Profile>, AppError> {
+    let config = read_file()?;
+    let name = selected_profile_name_from(requested, config.active_profile.as_deref());
+    Ok(config.profiles.get(&name).cloned())
+}
+
 pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
     let config = read_file()?;
     let name = selected_profile_name_from(requested, config.active_profile.as_deref());
@@ -233,6 +266,7 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
         allow_send: backend == BackendKind::Desktop && !read_only,
         desktop_port,
         desktop_account: stored.map(|p| p.desktop_account).unwrap_or_default(),
+        desktop_client: stored.map(|p| p.desktop_client).unwrap_or_default(),
     };
     Ok((name, profile))
 }

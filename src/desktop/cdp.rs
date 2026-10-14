@@ -1,9 +1,9 @@
-//! Minimal DevTools protocol client: one page socket, one `Runtime.evaluate` at a time.
+//! Minimal DevTools protocol client: one verified page socket, one request at a time.
 use super::MAX_READ;
 use crate::error::AppError;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
@@ -16,16 +16,53 @@ const EVALUATE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Cdp {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
+    events: VecDeque<Value>,
 }
 
 impl Cdp {
-    /// The socket URL is rebuilt from the verified port and a validated target id,
-    /// never taken from the endpoint's advertised `webSocketDebuggerUrl`.
-    pub async fn connect(port: u16, target: &str) -> Result<Self, AppError> {
-        let failed = || AppError::Desktop("could not connect to the Teams page".into());
+    /// Closes only an already-verified dedicated browser. The control id is validated
+    /// separately; never follow a host supplied by endpoint metadata.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) async fn close_browser(port: u16, target: &str) -> Result<(), AppError> {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_READ))
             .max_frame_size(Some(MAX_READ));
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/{target}");
+        let (mut socket, _) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_async_with_config(url, Some(config), false),
+        )
+        .await
+        .map_err(|_| AppError::Desktop("browser close connection timed out".into()))?
+        .map_err(|_| AppError::Desktop("could not connect to the verified browser".into()))?;
+        tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            socket.send(Message::text(
+                json!({"id":1,"method":"Browser.close"}).to_string(),
+            )),
+        )
+        .await
+        .map_err(|_| AppError::Desktop("browser close timed out".into()))?
+        .map_err(|_| AppError::Desktop("could not request browser shutdown".into()))
+    }
+
+    /// The socket URL is rebuilt from the verified port and a validated target id,
+    /// never taken from the endpoint's advertised `webSocketDebuggerUrl`.
+    pub async fn connect(port: u16, target: &str) -> Result<Self, AppError> {
+        Self::connect_limit(port, target, MAX_READ).await
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) async fn connect_bootstrap(port: u16, target: &str) -> Result<Self, AppError> {
+        // Pinned public bootstrap sources exceed ordinary cache-read limits.
+        Self::connect_limit(port, target, 32 * 1024 * 1024).await
+    }
+
+    async fn connect_limit(port: u16, target: &str, limit: usize) -> Result<Self, AppError> {
+        let failed = || AppError::Desktop("could not connect to the Teams page".into());
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(limit))
+            .max_frame_size(Some(limit));
         let url = format!("ws://127.0.0.1:{port}/devtools/page/{target}");
         let (socket, _) = tokio::time::timeout(
             CONNECT_TIMEOUT,
@@ -34,16 +71,36 @@ impl Cdp {
         .await
         .map_err(|_| failed())?
         .map_err(|_| failed())?;
-        Ok(Self { socket, next_id: 0 })
+        Ok(Self {
+            socket,
+            next_id: 0,
+            events: VecDeque::new(),
+        })
     }
 
     /// Returns the `Runtime.evaluate` result object, including any `exceptionDetails`.
     pub async fn evaluate(&mut self, expression: &str) -> Result<Value, AppError> {
+        self.request(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression, "awaitPromise": true, "returnByValue": true
+            }),
+            EVALUATE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Private protocol requests on the same verified page; never accepts a socket URL.
+    pub(super) async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, AppError> {
         self.next_id += 1;
         let id = self.next_id;
-        let request = json!({"id": id, "method": "Runtime.evaluate", "params": {
-            "expression": expression, "awaitPromise": true, "returnByValue": true}});
-        tokio::time::timeout(EVALUATE_TIMEOUT, async {
+        let request = json!({"id": id, "method": method, "params": params});
+        tokio::time::timeout(timeout, async {
             let failed = || AppError::Desktop("the Teams page connection failed".into());
             self.socket
                 .send(Message::text(request.to_string()))
@@ -58,6 +115,7 @@ impl Cdp {
                     continue;
                 };
                 if reply["id"] != id {
+                    self.queue_event(reply)?;
                     continue;
                 }
                 return match reply.get("result") {
@@ -71,6 +129,49 @@ impl Cdp {
         })
         .await
         .map_err(|_| AppError::Desktop("the Teams page did not answer in time".into()))?
+    }
+
+    fn queue_event(&mut self, value: Value) -> Result<(), AppError> {
+        if value["method"] == "Fetch.requestPaused" {
+            if self.events.len() >= 128 {
+                return Err(AppError::Desktop(
+                    "too many paused bootstrap requests".into(),
+                ));
+            }
+            self.events.push_back(value);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) async fn next_event(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Value>, AppError> {
+        if let Some(value) = self.events.pop_front() {
+            return Ok(Some(value));
+        }
+        match tokio::time::timeout(timeout, async {
+            while let Some(message) = self.socket.next().await {
+                let Message::Text(text) =
+                    message.map_err(|_| AppError::Desktop("bootstrap socket closed".into()))?
+                else {
+                    continue;
+                };
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    self.queue_event(value)?;
+                    if let Some(value) = self.events.pop_front() {
+                        return Ok(Some(value));
+                    }
+                }
+            }
+            Err(AppError::Desktop("bootstrap socket closed".into()))
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
     }
 }
 

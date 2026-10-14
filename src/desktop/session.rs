@@ -1,7 +1,7 @@
 //! A verified page connection kept for the life of the process, so only the first read
 //! pays for verification and the socket handshake. Sends never reuse it: each one verifies
 //! afresh and evaluates exactly once.
-use super::{ConnectionMetadata, ProbeStatus, cdp::Cdp, chat_id, valid_body, valid_id};
+use super::{ConnectionMetadata, ProbeStatus, avatars, cdp::Cdp, chat_id, valid_body, valid_id};
 use crate::config::DesktopAccount;
 use crate::error::AppError;
 use serde_json::{Value, json};
@@ -17,6 +17,9 @@ const READ_JSON: &str = r#"(value => JSON.stringify(value, (_key, item) =>
 /// Platform-specific verification before any session access. Raw target URLs remain
 /// internal; only sanitized connection metadata can be returned to the caller.
 pub trait Verifier: Send + Sync {
+    fn core_only(&self, _port: u16) -> bool {
+        false
+    }
     fn verify(
         &self,
         port: u16,
@@ -42,13 +45,19 @@ impl<S: Verifier> Session<S> {
     /// Answers a read request with `{"error": code}` or `{"result": <evaluate result>}`.
     pub async fn read(&mut self, request: &Value) -> Result<Value, AppError> {
         let (port, params) = read_params(request)?;
+        let core = self.system.core_only(port);
         let account = DesktopAccount::from_request(&request["account_type"])?;
         if let Some((connected, page, personal, scope)) = &mut self.page
             && *connected == port
             && *scope == account
-            && let Ok(result) = page.evaluate(&read_expression(&params, *personal)).await
+            && let Ok(mut result) = page
+                .evaluate(&core_guard(&read_expression(&params, *personal), core))
+                .await
             && !origin_changed(&result)
         {
+            if params["query"] == "chats" {
+                avatars::enrich(page, &mut result, *personal).await;
+            }
             return Ok(json!({"result": result}));
         }
         // No page yet, another port, or a failed socket: verify again before any read.
@@ -70,12 +79,18 @@ impl<S: Verifier> Session<S> {
             return Ok(json!({"error": "read_failed"}));
         };
         match page
-            .evaluate(&read_expression(&params, target.personal))
+            .evaluate(&core_guard(
+                &read_expression(&params, target.personal),
+                core,
+            ))
             .await
         {
-            Ok(result) => {
+            Ok(mut result) => {
                 if origin_changed(&result) {
                     return Ok(json!({"error": "no_target"}));
+                }
+                if params["query"] == "chats" {
+                    avatars::enrich(&mut page, &mut result, target.personal).await;
                 }
                 self.page = Some((port, page, target.personal, account));
                 Ok(json!({"result": result}))
@@ -104,9 +119,12 @@ impl<S: Verifier> Session<S> {
         };
         Ok(
             match page
-                .evaluate(&scoped_expression(
-                    &format!("({SEND_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)"),
-                    personal,
+                .evaluate(&core_guard(
+                    &scoped_expression(
+                        &format!("({SEND_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)"),
+                        personal,
+                    ),
+                    self.system.core_only(port),
                 ))
                 .await
             {
@@ -134,7 +152,10 @@ impl<S: Verifier> Session<S> {
                 continue;
             };
             let main = page
-                .evaluate(&scoped_expression(&probe, target.personal))
+                .evaluate(&core_guard(
+                    &scoped_expression(&probe, target.personal),
+                    self.system.core_only(port),
+                ))
                 .await
                 .is_ok_and(|result| result["result"]["value"].as_str() == Some(r#"{"main":true}"#));
             if main {
@@ -142,6 +163,16 @@ impl<S: Verifier> Session<S> {
             }
         }
         Err(json!({"error": "layout"}))
+    }
+}
+
+fn core_guard(expression: &str, core: bool) -> String {
+    if core {
+        format!(
+            "(window.__teamsCliCore?.ready===true?({expression}):JSON.stringify({{error:'core_not_ready'}}))"
+        )
+    } else {
+        expression.to_owned()
     }
 }
 
@@ -304,6 +335,27 @@ fn selected_pages(targets: &[Value], account: DesktopAccount) -> Result<Vec<Team
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn core_reads_are_guarded_even_when_a_cached_page_navigates_to_full_ui() {
+        let expression = super::core_guard("cache_read()", true);
+        let output = std::process::Command::new("node")
+            .args(["-e", r#"
+                const assert=require('node:assert/strict'), vm=require('node:vm');
+                let reads=0;const window={},context={window,cache_read(){reads++;return 42}};
+                assert.equal(vm.runInNewContext(process.argv[1],context),JSON.stringify({error:'core_not_ready'}));
+                assert.equal(reads,0);
+                window.__teamsCliCore={ready:true};assert.equal(vm.runInNewContext(process.argv[1],context),42);
+                assert.equal(reads,1);
+                delete window.__teamsCliCore;vm.runInNewContext(process.argv[1],context);assert.equal(reads,1);
+            "#, &expression])
+            .output().expect("Node.js is required for desktop script checks");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     use super::*;
     use crate::desktop::{
         MAX_BODY, cdp::tests::devtools_server, owner::tests::FakeSystem, read_request,

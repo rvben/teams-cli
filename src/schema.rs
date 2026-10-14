@@ -29,7 +29,7 @@ fn debugging_setup() -> Value {
         vec![
             described(
                 field("shell", "string"),
-                "zsh, wsl or powershell: where the commands run",
+                "zsh, bash, wsl or powershell: where the commands run",
             ),
             field("open", "string"),
             field("close", "string"),
@@ -157,8 +157,8 @@ fn command_errors(name: &str) -> &'static [&'static str] {
             "desktop_error",
         ],
         "messages status" => &["unsupported", "desktop_error"],
-        "desktop status" | "desktop recover" => &["desktop_error", "unsupported"],
-        "desktop connect" | "desktop disconnect" => {
+        "desktop status" => &["desktop_error", "unsupported"],
+        "desktop login" | "desktop connect" | "desktop disconnect" | "desktop recover" => {
             &["desktop_error", "unsupported", "confirmation_required"]
         }
         "tui" => &["tty_required"],
@@ -215,6 +215,10 @@ fn example(name: &str) -> Value {
             None,
         ),
         "desktop status" => (&["desktop", "status", "--port", "9222"], None),
+        "desktop login" => (
+            &["desktop", "login", "--desktop-client", "browser", "--yes"],
+            None,
+        ),
         "desktop connect" => (&["desktop", "connect", "--port", "9222", "--yes"], None),
         "desktop disconnect" => (&["desktop", "disconnect", "--port", "9222", "--yes"], None),
         "desktop recover" => (&["desktop", "recover", "--port", "9222"], None),
@@ -256,16 +260,19 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     field("read_only", "boolean"),
                     nullable_field("desktop_port", "integer"),
                     nullable_field("desktop_account", "string"),
+                    nullable_field("desktop_client", "string"),
                     nullable_field("endpoint_available", "boolean"),
                     nullable_field("connection", "object"),
                     field("session_verified", "boolean"),
                     nullable_field("teams_restarted", "boolean"),
+                    nullable_field("browser_started", "boolean"),
                     nullable_field("chat_list_empty", "boolean"),
                 ],
             );
             value["args"] = json!([
                 {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics, chats and opt-in chat sending"},
                 {"name":"--desktop-port","type":"integer","description":"Existing loopback endpoint port (desktop only; default 9222)","x-minimum":1024,"x-maximum":65535},
+                {"name":"--desktop-client","type":"string","enum":["native","browser","browser-core"],"default":"native","description":"Native Teams or a dedicated Chrome/Edge profile (macOS/Linux/WSL2); browser connects run headless unless --visible"},
                 {"name":"--desktop-account","type":"string","enum":["auto","personal","work-school"],"default":"auto","description":"Select the Teams account surface; multiple cached accounts within it remain unsupported"},
                 arg(
                     "--client-id",
@@ -396,6 +403,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 field("backend", "string"),
                 nullable_field("desktop_port", "integer"),
                 nullable_field("desktop_account", "string"),
+                nullable_field("desktop_client", "string"),
                 field("client_id", "string"),
                 field("tenant", "string"),
                 field("read_only", "boolean"),
@@ -453,8 +461,13 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 described(field("lastUpdatedDateTime", "string"), "RFC 3339"),
                 json!({"name": "members", "type": "array", "items": {"type": "object", "fields": [
                     field("userId", "string"),
-                    nullable_field("displayName", "string")
+                    nullable_field("displayName", "string"),
+                    described(field("avatarData", "string"), "Optional desktop-only raster data URI, from a photo already loaded by the selected Teams page; absent when unavailable")
                 ]}}),
+                described(
+                    field("avatarData", "string"),
+                    "Optional desktop-only one-to-one chat avatar as a raster data URI; member photos may be available for groups",
+                ),
                 object_field(
                     "viewpoint",
                     true,
@@ -609,23 +622,28 @@ pub fn generate(command_filter: Option<&str>) -> Value {
     commands.push(status);
     for (name, description, effects) in [
         (
+            "desktop login",
+            "Sign in visibly, verify chats, then restart headless with the same dedicated profile; browser only, requires confirmation",
+            "non_idempotent",
+        ),
+        (
             "desktop status",
             "Inspect endpoint metadata and managed-session state; does not verify sign-in",
             "read_only",
         ),
         (
             "desktop connect",
-            "Explicitly restart Teams with debugging; preserve settings and never adopt an existing endpoint",
+            "Open a dedicated browser, or restart native Teams with debugging; requires confirmation",
             "non_idempotent",
         ),
         (
             "desktop disconnect",
-            "Explicitly restart this managed Teams process normally; preserve unrelated processes and settings",
+            "Close the verified dedicated browser, or restart managed native Teams normally; requires confirmation",
             "non_idempotent",
         ),
         (
             "desktop recover",
-            "Restore interrupted setup settings without restarting Teams or accessing the endpoint",
+            "Restore interrupted native settings; browser recovery may close a verified dedicated browser and requires confirmation",
             "idempotent",
         ),
     ] {
@@ -639,10 +657,21 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 field("session_verified", "boolean"),
                 field("management", "object"),
                 nullable_field("connection", "object"),
+                nullable_field("browser_profile", "string"),
             ],
         );
-        value["args"] = json!([{"name":"--port","type":"integer","x-minimum":1024,"x-maximum":65535,"description":"Override selected profile port"}]);
-        if matches!(name, "desktop connect" | "desktop disconnect") {
+        value["args"] = json!([{"name":"--desktop-client","type":"string","enum":["native","browser","browser-core"],"description":"Override the configured desktop client"},{"name":"--port","type":"integer","x-minimum":1024,"x-maximum":65535,"description":"Override selected profile port"}]);
+        if name == "desktop connect" {
+            value["args"].as_array_mut().expect("args").push(arg(
+                "--visible",
+                "boolean",
+                "Open the browser visibly for sign-in; browser client only",
+            ));
+        }
+        if matches!(
+            name,
+            "desktop login" | "desktop connect" | "desktop disconnect" | "desktop recover"
+        ) {
             value["confirmation_bypass_arg"] = json!("--yes");
         }
         commands.push(value);
@@ -658,23 +687,23 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         }
         command["extensions"] = json!({"backends": match command["name"].as_str().unwrap_or_default() {
             "auth login" | "auth logout" | "whoami" | "list" | "channels list" => vec!["graph"],
-            "desktop status" | "desktop connect" | "desktop disconnect" | "desktop recover" | "messages status" => vec!["desktop"],
+            "desktop status" | "desktop login" | "desktop connect" | "desktop disconnect" | "desktop recover" | "messages status" => vec!["desktop"],
             _ => vec!["graph", "desktop"],
         }});
         match command["name"].as_str().unwrap_or_default() {
             "tui" => {
                 command["extensions"]["desktop"] = json!(
-                    "macOS/Windows/WSL; chats and chat messages from the Teams client's local cache; sending needs a profile created with --allow-send"
+                    "macOS/Windows/WSL (browser client also on Linux); chats and chat messages from the Teams client's local cache; sending needs a profile created with --allow-send"
                 )
             }
             "chats list" | "messages list" => {
                 command["extensions"]["desktop"] = json!(
-                    "macOS/Windows/WSL; chats, not channels; read from the Teams client's local cache; pages carry source \"desktop_cache\""
+                    "macOS/Windows/WSL (browser client also on Linux); chats, not channels; read from the Teams client's local cache; pages carry source \"desktop_cache\""
                 )
             }
             "messages send" => {
                 command["extensions"]["desktop"] = json!(
-                    "macOS/Windows/WSL; plain-text chat messages through the running Teams window; needs a profile created with `init --allow-send`; prompts on a terminal and needs --yes otherwise; results carry source \"desktop\", clientMessageId and Teams' status"
+                    "macOS/Windows/WSL (browser client also on Linux); plain-text chat messages through the running Teams window; needs a profile created with `init --allow-send`; prompts on a terminal and needs --yes otherwise; results carry source \"desktop\", clientMessageId and Teams' status"
                 )
             }
             _ => {}
@@ -731,12 +760,12 @@ pub fn generate(command_filter: Option<&str>) -> Value {
 pub fn backend_capabilities() -> Value {
     json!({
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
-        "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl"],
+        "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl","linux"],"clients":{"native":["macos","windows","wsl"],"browser":["macos","linux","wsl"],"browser-core":["macos","linux","wsl"]},"browser_validation":"experimental; core personal messaging validated on macOS only","browser_core":{"account_types":["personal"],"bootstrap":"build-pinned; unknown builds refused","browser_versions":"matching Chrome for Testing and chrome-headless-shell","live_validation":["macos-personal"]},
             "account_types":["Microsoft 365 work or school","personal Microsoft accounts"],"account_selection":"account_type_then_single_account_only",
-            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","managed connect/status/disconnect/recover","delivery reconciliation by client message ID","chats (macos, windows, wsl)","chat messages (macos, windows, wsl)","send plain-text chat messages (macos, windows, wsl; opt-in)","TUI (macos, windows, wsl)"],
-            "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","automatic Teams launch or restart"],
-            "requires":"existing Teams-owned loopback debugging endpoint; WSL requires Windows executable interop",
-            "transport":{"macos":"native_loopback","windows":"windows_native","wsl":"windows_helper_stdio"},
+            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","managed connect/status/disconnect/recover","delivery reconciliation by client message ID","chats (macos, windows, wsl; browser also on linux)","chat messages (macos, windows, wsl; browser also on linux)","send plain-text chat messages (macos, windows, wsl; browser also on linux; opt-in)","TUI (macos, windows, wsl; browser also on linux)"],
+            "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","unconfirmed Teams launch or restart"],
+            "requires":"native: Teams-owned loopback debugging endpoint (WSL needs Windows interop); browser: installed Chrome/Chromium/Edge with a dedicated profile and visible initial sign-in",
+            "transport":{"macos":"native_loopback","windows":"windows_native","wsl":"windows_helper_stdio","browser":"dedicated_chromium_loopback"},
             "chat_source":"desktop_cache","session_verified":false,"default_port":crate::config::DEFAULT_DESKTOP_PORT}
     })
 }

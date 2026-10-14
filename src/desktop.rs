@@ -4,7 +4,9 @@
 //!
 //! On Windows the CLI verifies the endpoint and reads in-process. Under WSL it drives the
 //! Windows build of itself as a long-lived helper (`teams.exe desktop-helper`).
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+mod avatars;
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 mod cdp;
 pub mod connection;
 pub mod helper;
@@ -14,19 +16,23 @@ pub mod install;
 mod macos;
 #[cfg(any(windows, test))]
 mod owner;
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 pub mod session;
 #[cfg(windows)]
 pub mod windows;
 
-use crate::config::DesktopAccount;
+use crate::config::{DesktopAccount, DesktopClientKind, Profile};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod browser;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod browser_core;
 use crate::{error::AppError, graph::Page};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 use std::time::Duration;
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 const MAX_METADATA: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
 /// Teams' own limit for one chat message.
@@ -98,7 +104,7 @@ pub struct ConnectionMetadata {
 }
 
 impl ConnectionMetadata {
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     fn empty(port: u16) -> Self {
         Self {
             port,
@@ -120,6 +126,9 @@ impl ConnectionMetadata {
 pub struct DesktopClient {
     port: u16,
     account: DesktopAccount,
+    kind: DesktopClientKind,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    browser: tokio::sync::Mutex<session::Session<browser::BrowserSystem>>,
     /// The verified page connection, reused across reads.
     #[cfg(windows)]
     session: tokio::sync::Mutex<session::Session<windows::WindowsSystem>>,
@@ -153,6 +162,11 @@ impl DesktopClient {
         Ok(Self {
             port,
             account,
+            kind: DesktopClientKind::Native,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            browser: tokio::sync::Mutex::new(session::Session::new(browser::BrowserSystem {
+                core: false,
+            })),
             #[cfg(windows)]
             session: tokio::sync::Mutex::new(session::Session::new(windows::WindowsSystem)),
             #[cfg(target_os = "macos")]
@@ -162,9 +176,72 @@ impl DesktopClient {
         })
     }
 
+    pub fn from_profile(profile: &Profile) -> Result<Self, AppError> {
+        Self::with_client(
+            profile.desktop_port,
+            profile.desktop_account,
+            profile.desktop_client,
+        )
+    }
+
+    pub fn with_client(
+        port: u16,
+        account: DesktopAccount,
+        kind: DesktopClientKind,
+    ) -> Result<Self, AppError> {
+        let mut client = Self::with_account(port, account)?;
+        if kind.is_browser() && !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return Err(AppError::Unsupported(
+                "the browser desktop client currently requires macOS or Linux (including WSL2)"
+                    .into(),
+            ));
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if kind == DesktopClientKind::BrowserCore {
+            if account != DesktopAccount::Personal {
+                return Err(AppError::Unsupported("browser-core currently requires --desktop-account personal; work/school core startup is not validated".into()));
+            }
+            client.browser =
+                tokio::sync::Mutex::new(session::Session::new(browser::BrowserSystem {
+                    core: true,
+                }));
+        }
+        client.kind = kind;
+        Ok(client)
+    }
+
+    pub fn debugging_setup(&self) -> Option<DebuggingSetup> {
+        if self.kind.is_browser() {
+            let mut setup = DebuggingSetup::for_shell("bash", self.port);
+            setup.open = format!(
+                "teams desktop connect --desktop-client {} --port {}",
+                self.kind.as_str(),
+                self.port
+            );
+            setup.close = format!(
+                "teams desktop disconnect --desktop-client {} --port {}",
+                self.kind.as_str(),
+                self.port
+            );
+            Some(setup)
+        } else {
+            DebuggingSetup::new(self.port)
+        }
+    }
+
+    pub fn prerequisites(&self) -> Result<&'static str, AppError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.kind.is_browser() {
+            browser::prerequisites()?;
+            return Ok("browser_loopback");
+        }
+        local_prerequisites()
+    }
+
     /// Only offered by the TUI after a verified no-listener probe on WSL.
     pub async fn needs_debugging_restart(&self) -> bool {
-        platform().ok() == Some("wsl_windows_helper")
+        self.kind == DesktopClientKind::Native
+            && platform().ok() == Some("wsl_windows_helper")
             && self
                 .probe()
                 .await
@@ -184,6 +261,10 @@ impl DesktopClient {
     }
 
     pub async fn probe(&self) -> Result<ConnectionMetadata, AppError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.kind.is_browser() {
+            return self.browser.lock().await.probe(self.port).await;
+        }
         platform()?;
         #[cfg(any(windows, target_os = "macos"))]
         return self.session.lock().await.probe(self.port).await;
@@ -198,6 +279,26 @@ impl DesktopClient {
             serde_json::from_value(metadata)
                 .map_err(|_| AppError::Desktop("Windows helper returned invalid metadata".into()))
         }
+    }
+
+    /// Authenticate in a visible dedicated window, then verify the same profile headless.
+    pub async fn login(&self) -> Result<Value, AppError> {
+        if !self.kind.is_browser() {
+            return Err(AppError::InvalidInput(
+                "desktop login requires --desktop-client browser".into(),
+            ));
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        return browser::login(
+            self.port,
+            self.account,
+            self.kind == DesktopClientKind::BrowserCore,
+        )
+        .await;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        Err(AppError::Unsupported(
+            "browser login requires macOS or Linux (including WSL2)".into(),
+        ))
     }
 
     pub async fn chats(&self, limit: u16, cursor: Option<&str>) -> Result<Page, AppError> {
@@ -221,6 +322,14 @@ impl DesktopClient {
     ) -> Result<Page, AppError> {
         let mut request = read_request(self.port, chat, limit, cursor)?;
         request["account_type"] = json!(self.account);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.kind.is_browser() {
+            return read_page(&self.browser.lock().await.read(&request).await?).map_err(|e| {
+                e.with_hint(
+                    "For browser sign-in, run `teams desktop login --desktop-client browser`",
+                )
+            });
+        }
         platform()?;
         #[cfg(any(windows, target_os = "macos"))]
         let reply = self.session.lock().await.read(&request).await?;
@@ -249,6 +358,11 @@ impl DesktopClient {
         }
         request["client_message_id"] = json!(id);
         request["account_type"] = json!(self.account);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.kind.is_browser() {
+            let reply = self.browser.lock().await.send(&request).await?;
+            return self.send_result(&reply, chat, id);
+        }
         platform()?;
         #[cfg(any(windows, target_os = "macos"))]
         let reply = self.session.lock().await.send(&request).await?;
@@ -259,7 +373,11 @@ impl DesktopClient {
             .await
             .call_once(json!({"op": "send", "request": request}))
             .await?;
-        sent_message(&reply, chat).map_err(|error| match error {
+        self.send_result(&reply, chat, id)
+    }
+
+    fn send_result(&self, reply: &Value, chat: &str, id: &str) -> Result<Value, AppError> {
+        sent_message(reply, chat).map_err(|error| match error {
             AppError::Unconfirmed(message) => AppError::UnconfirmedSend {
                 message,
                 chat_id: chat.into(),
@@ -283,6 +401,16 @@ impl DesktopClient {
 
     /// Whether the Teams window that sends messages is reachable; sends nothing.
     pub async fn send_check(&self) -> Result<(), AppError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.kind.is_browser() {
+            let reply = self
+                .browser
+                .lock()
+                .await
+                .send_check(self.port, self.account)
+                .await?;
+            return check_send_reply(&reply);
+        }
         platform()?;
         #[cfg(any(windows, target_os = "macos"))]
         let reply = self
@@ -298,10 +426,14 @@ impl DesktopClient {
             .await
             .call(json!({"op": "send_check", "port": self.port, "account_type": self.account}))
             .await?;
-        match reply["error"].as_str() {
-            None if reply["ok"] == true => Ok(()),
-            code => Err(send_error(code.unwrap_or_default())),
-        }
+        check_send_reply(&reply)
+    }
+}
+
+fn check_send_reply(reply: &Value) -> Result<(), AppError> {
+    match reply["error"].as_str() {
+        None if reply["ok"] == true => Ok(()),
+        code => Err(send_error(code.unwrap_or_default())),
     }
 }
 
@@ -591,6 +723,12 @@ impl DebuggingSetup {
     }
 
     pub fn text(&self) -> String {
+        if self.shell == "bash" {
+            return format!(
+                "Open a dedicated headless Teams browser:\n  {}\nFor first sign-in, add --visible, sign in in that window, then disconnect and reconnect headless. Close the dedicated browser:\n  {}\nThe sign-in profile is retained. While its debugging port is open, local programs can read chats and send as you.",
+                self.open, self.close
+            );
+        }
         let shell = match self.shell {
             "wsl" => "this WSL shell",
             "zsh" => "Terminal (zsh or bash)",
@@ -665,7 +803,7 @@ pub fn local_prerequisites() -> Result<&'static str, AppError> {
 
 /// Reads endpoint metadata into `metadata` for an already-verified listener and returns
 /// the raw targets, which stay in-process.
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 async fn fill_metadata(metadata: &mut ConnectionMetadata) -> Vec<Value> {
     let Ok((version, targets)) = read_metadata(metadata.port).await else {
         metadata.status = ProbeStatus::MetadataProbeFailed;
@@ -688,7 +826,7 @@ async fn fill_metadata(metadata: &mut ConnectionMetadata) -> Vec<Value> {
     targets
 }
 
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 async fn read_metadata(port: u16) -> Result<(Value, Vec<Value>), AppError> {
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -736,7 +874,7 @@ async fn read_metadata(port: u16) -> Result<(Value, Vec<Value>), AppError> {
     ))
 }
 
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn sanitize_target(target: &Value) -> TargetMetadata {
     let uri = target
         .get("url")
@@ -847,7 +985,7 @@ mod tests {
                 .collect::<String>()
         });
         // Timestamp normalization keeps the protocol-3 request/result shapes.
-        assert_eq!(scripts, ["32ca0293d2d5", "f70826f76ef1", "3e837cc21336"]);
+        assert_eq!(scripts, ["32ca0293d2d5", "baa0bc29c44b", "3e837cc21336"]);
     }
 
     #[test]

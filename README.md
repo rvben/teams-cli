@@ -2,7 +2,7 @@
 
 Microsoft Teams from your terminal—human-first and agent-first.
 
-`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs, with an optional experimental desktop backend that reads chats from, and can send chat messages through, a running Teams client on macOS, Windows or WSL. It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. The default Graph backend signs in as you with delegated OAuth and protects refresh credentials in your operating system's credential store. Output is readable text on a TTY and structured JSON when piped.
+`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs, with an optional experimental desktop backend that reads chats from, and can send chat messages through, a running Teams client on macOS, Windows or WSL. A dedicated browser client also provides an experimental route on native Linux; see [browser setup](#dedicated-browser-client-experimental). It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. The default Graph backend signs in as you with delegated OAuth and protects refresh credentials in your operating system's credential store. Output is readable text on a TTY and structured JSON when piped.
 
 For humans, no arguments open guided onboarding on first use and the TUI afterward. For agents, no command ever waits for an undeclared prompt: `teams schema` works offline, collection sizes are caller-bounded, writes declare their effects, errors have stable kinds and exit codes, and stdout contains data only.
 
@@ -207,6 +207,15 @@ ids returned by `chats list`; personal chats are accessed through the desktop ba
 The chat with yourself is listed too, with the id `48:notes`, so
 you can try sending there first.
 
+Desktop chat results may also include optional `avatarData` raster data URIs on
+members and one-to-one chats. Photos come only from image resources already loaded
+by that account's Teams page; the CLI never fetches a photo URL. Missing, stale,
+ambiguous, or unsupported photos leave the fields absent, so clients should show
+initials as a fallback. Reads allow at most 16 photos, 256 KiB per photo, 1 MiB of
+avatar data in total, and a one-second budget. A photo failure never fails a chat
+read. Personal photo reads have been checked on macOS; work/school and other
+platforms still need photo-specific runtime validation.
+
 Desktop profiles are read-only unless created with `init --allow-send`;
 `TEAMS_READ_ONLY=true` still blocks sending, but `TEAMS_READ_ONLY=false` cannot unlock a
 desktop profile. With the opt-in, `messages send --chat` sends one plain-text message
@@ -343,6 +352,97 @@ as development diagnostics and advises against relying on them in production.
 This backend is experimental: chat reading depends on the Teams client's internal
 cache layout and sending on its internal send interface, and an unrecognised layout
 fails with `desktop_error` rather than guessing.
+
+### Dedicated browser client (experimental)
+
+On native Linux, macOS, or WSL2, the desktop backend can use an installed Chrome,
+Chromium, or Edge browser instead of the native Teams app. WSL2 uses a Linux browser;
+visible sign-in requires WSLg or another graphical display. The existing Windows
+helper route remains the default for native desktop profiles.
+
+Create a separate read-only profile and sign in in the window that opens:
+
+```console
+teams init --profile browser --backend desktop --desktop-client browser --desktop-account work-school --yes
+# The window closes automatically after a successful chat read.
+# Teams then runs headless with the same saved sign-in:
+teams --profile browser
+# To renew sign-in or complete MFA later:
+teams --profile browser desktop login --yes
+```
+
+Login waits up to five minutes for a readable chat cache, then restarts headless
+and verifies another read before reporting success. An empty chat list is valid.
+A sign-in timeout leaves the visible window open; finish signing in and retry
+`desktop login`. Interrupting login preserves the browser and its saved profile.
+On WSL2, the visible step needs WSLg or another graphical display.
+
+Use `--desktop-account personal` for a personal Microsoft account. Sending still
+requires an explicit `init --allow-send` and the existing send confirmation.
+`init --no-login` only saves configuration. `desktop connect --visible` remains
+available for manually managed sign-in; `desktop connect` starts headless.
+
+The browser uses its own profile under the local data directory at
+`teams-cli/browser/<port>/profile`; it never copies or opens your normal browser
+profile. Different ports use different browser profiles. Disconnect closes this
+browser and keeps its sign-in data. To switch between visible and headless operation,
+disconnect first. `desktop recover` closes a verified managed browser or clears a
+stale record when no listener remains. Unverifiable processes are left untouched.
+
+The CLI checks that every listener is loopback-only and belongs to the recorded
+browser process, running as you with the expected executable, debugging port and
+dedicated profile. Only HTTPS Teams pages are used for reads or sends. While the
+port is open, other programs running as you can access that browser session.
+
+Browser discovery supports common system installations. For another installation,
+set `TEAMS_DESKTOP_BROWSER` to the absolute path of the actual browser executable,
+not a shell launcher. Snap/Flatpak installations are not automatically supported.
+The optional `TEAMS_DESKTOP_BROWSER_DATA_DIR` sets an absolute browser data directory
+(each port gets a separate subdirectory). Keep the same browser executable and data
+directory settings while managing a session. Headless mode removes the visible window; Teams still consumes browser CPU and RAM.
+
+This route is experimental. Browser lifecycle and ownership checks can be tested
+without signing in, but live Teams Web reads, sends, session persistence and MFA
+recovery still require validation on a signed-in machine. Existing native Teams
+validation does not establish browser-client compatibility.
+
+### Low-memory browser client (experimental)
+
+`--desktop-client browser-core` keeps the authenticated Teams data runtime without
+starting the main UI. It currently requires `--desktop-account personal` and the
+exact Teams Personal bootstrap build validated by this CLI. Unknown builds fail
+with `desktop_error`; the CLI does not fall back to old cache data or the full UI.
+Use `--desktop-client browser` on a separate port for the full web client.
+
+Install matching versions of **Chrome for Testing** and **chrome-headless-shell**,
+then point the CLI to both actual executables:
+
+```console
+export TEAMS_DESKTOP_BROWSER=/absolute/path/to/chrome
+export TEAMS_DESKTOP_HEADLESS_BROWSER=/absolute/path/to/chrome-headless-shell
+teams init --profile core --backend desktop --desktop-client browser-core --desktop-account personal --desktop-port 9333 --yes
+# Sign in visibly; the CLI verifies the core client before continuing headless.
+teams --profile core chats list
+teams --profile core desktop disconnect --yes
+```
+
+The two browser versions must match exactly. Downloads are managed by you; the CLI
+does not download or alter your browser installation. Linux/WSL2 use Linux binaries
+and need a display for sign-in. A port has one browser mode; disconnect with its
+original mode before changing it. Use a separate port/profile for core mode.
+
+On macOS, both dedicated test browsers use mock-keychain encryption because the
+headless shell uses it. This profile contains sensitive login state and remains in
+a private directory; it never opens your ordinary browser profile.
+
+The integrated CLI measured about **307 MiB after collection and 322 MiB idle**
+of summed browser process physical footprint on macOS with a personal account.
+Signed-in reads, visible-to-headless login, sending/readback and incoming updates
+from a second verified client passed. This is approximate process accounting, not a guaranteed RAM cap or a
+Linux measurement. Startup peaks, large accounts, overnight use, reconnect/MFA and
+Linux/WSL2 signed-in operation still need validation. Size-oriented V8 settings may
+trade CPU for memory. Avatar fields may be absent because UI photos are not loaded.
+Sending still requires `init --allow-send` and the existing send confirmation.
 
 ## Graph boundaries
 

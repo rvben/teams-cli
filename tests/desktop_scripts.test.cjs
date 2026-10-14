@@ -29,7 +29,7 @@ function cursor(records) {
   return q;
 }
 
-function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = false } = {}) {
+function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = false, core = false } = {}) {
   const databases = new Map([
     [name('conversation-manager', 'account-a'), [conversation]],
     [name('replychain-manager', 'account-b'), [{ chat, messageMap: { b: { ...message, content: 'Wrong account' } } }]],
@@ -63,14 +63,15 @@ function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = fal
       },
     },
     IDBKeyRange: { bound: a => ({ chat: a[0] }) },
-    document: { querySelector: () => element },
+    document: { querySelector: () => { assert.ok(!core, 'core send must not inspect React'); return element; } },
     crypto: { randomUUID: () => 'fixture-correlation-id' },
     setTimeout: callback => { if (timeout) queueMicrotask(callback); },
   });
+  if (core) context.__teamsCliCore = { ready: true, client };
   const select = vm.runInContext(source('desktop_cache.js'), context);
   const read = vm.runInContext(source('desktop.js'), context);
   const send = vm.runInContext(source('desktop_send.js'), context);
-  return { databases, opened, mutations, inspections: () => inspections,
+  return { context, client, databases, opened, mutations, inspections: () => inspections,
     read: params => read({ query: 'messages', chat, limit: 50, after: null, personal: false, ...params }, select),
     send: params => send({ chat, content: 'fixture', clientMessageId: '123456789012345678', ...params }, select) };
 }
@@ -295,4 +296,59 @@ test('message projection preserves exact send correlation and raw delivery statu
   const result = await f.read();
   assert.equal(result.items[0].clientMessageId, '100000000000000001');
   assert.equal(result.items[0].status, 'Queued');
+});
+
+// The UI-free runtime must use its retained client, with the cache-miss fallback,
+// while still issuing exactly one mutation and returning only send metadata.
+test('core sends use the retained client and enable chat network fallback once', async () => {
+  const f = fixture({ core: true });
+  const result = await f.send();
+  assert.equal(result.id, '1700000000001');
+  assert.equal(f.mutations.length, 1);
+  const mutation = f.mutations[0];
+  assert.equal(mutation.variables.withChatNetworkFallback, true);
+  const operation = mutation.mutation.definitions[0];
+  assert.ok(operation.variableDefinitions.some(v => v.variable.name.value === 'withChatNetworkFallback'));
+  assert.ok(operation.selectionSet.selections[0].arguments.some(v => v.name.value === 'withChatNetworkFallback'));
+});
+
+
+test('core readiness requires client setup, send dependencies and a fresh query', async () => {
+  const f = personalFixture();
+  f.context.window = f.context;
+  let setupCalls = 0, queryCalls = 0;
+  const services = ['getAsyncMediaService','getImageProxyService','getUrlPreviewService','getFilesReferenceService','getAppBasedLinkService','getBotsPlatformService'];
+  const initialized = [];
+  f.client.getContext = () => Object.fromEntries(services.map(name => [name, async () => { initialized.push(name); return {}; }]));
+  f.client.query = async options => {
+    queryCalls++;
+    assert.equal(options.fetchPolicy, 'network-only');
+    assert.equal(options.variables.convId, '48:notes');
+    return { data: { chat: { id: '48:notes' } } };
+  };
+  const bootstrap = vm.runInContext(source('desktop_core.js'), f.context);
+  const context = { client: f.client };
+  bootstrap({ _renderingContextManager: { primaryUserContext: { context } } }, id => {
+    assert.equal(id, 630818); return { A: {} };
+  }, (client, value) => { assert.equal(client, f.client); assert.equal(value, context); setupCalls++; });
+  const state = f.context.__teamsCliCore;
+  assert.equal(state.ready, false);
+  assert.equal(await state.prepare(), true);
+  assert.equal(state.ready, true);
+  assert.equal(setupCalls, 1);
+  assert.equal(queryCalls, 1);
+  assert.deepEqual(initialized.sort(), services.sort());
+  assert.equal(f.mutations.length, 0);
+});
+
+test('persisted chat caches never establish core readiness after a query failure', async () => {
+  const f = personalFixture(); f.context.window = f.context;
+  f.client.getContext = () => new Proxy({}, { get: () => async () => ({}) });
+  f.client.query = async () => { throw new Error('fixture authentication failed'); };
+  vm.runInContext(source('desktop_core.js'), f.context)(
+    { _renderingContextManager: { primaryUserContext: { context: { client: f.client } } } },
+    () => ({ A: {} }), () => {});
+  assert.equal(await f.context.__teamsCliCore.prepare(), false);
+  assert.equal(f.context.__teamsCliCore.ready, false);
+  assert.equal(f.mutations.length, 0);
 });

@@ -510,3 +510,196 @@ fn desktop_init_never_restarts_teams_or_overwrites_a_profile_without_confirmatio
         Some("graph")
     );
 }
+
+#[test]
+fn browser_client_is_explicit_and_persisted_without_launching() {
+    let temp = tempfile::tempdir().unwrap();
+    cli(&temp)
+        .args(["init", "--desktop-client", "browser", "--no-login"])
+        .assert()
+        .code(2);
+    cli(&temp)
+        .args([
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-client",
+            "browser",
+            "--desktop-account",
+            "personal",
+            "--no-login",
+        ])
+        .assert()
+        .success();
+    let output = cli(&temp).args(["config", "show"]).output().unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["desktop_client"], "browser");
+    assert_eq!(value["read_only"], true);
+    // Lifecycle confirmation happens before opening a browser or querying its session.
+    let output = cli(&temp)
+        .args(["desktop", "connect", "--visible"])
+        .output()
+        .unwrap();
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "confirmation_required");
+    cli(&temp)
+        .args(["--yes", "desktop", "status", "--visible"])
+        .assert()
+        .code(2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn browser_refuses_a_foreign_linux_listener_before_http() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    cli(&temp)
+        .args([
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-client",
+            "browser",
+            "--desktop-port",
+            &port,
+            "--no-login",
+        ])
+        .assert()
+        .success();
+    let output = cli(&temp)
+        .env("XDG_DATA_HOME", temp.path())
+        .env("TEAMS_DESKTOP_BROWSER", std::env::current_exe().unwrap())
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["connection"]["status"], "non_teams_listener_refused");
+    assert_eq!(value["connection"]["teams_owned"], false);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+/// Run explicitly with TEAMS_DESKTOP_BROWSER set to a test Chromium executable.
+/// The browser opens an unsigned-in, disposable profile and sends no Teams messages.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[ignore = "requires a sandboxed Chromium test installation"]
+fn browser_lifecycle_with_disposable_profile() {
+    let executable = std::env::var_os("TEAMS_DESKTOP_BROWSER")
+        .expect("set TEAMS_DESKTOP_BROWSER to a test Chromium executable");
+    let temp = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let run = |action: &str, visible: bool| {
+        let mut command = cli(&temp);
+        command
+            .env("TEAMS_DESKTOP_BROWSER", &executable)
+            .env("TEAMS_DESKTOP_BROWSER_DATA_DIR", temp.path())
+            .args([
+                "--yes",
+                "desktop",
+                action,
+                "--desktop-client",
+                "browser",
+                "--port",
+                &port,
+            ]);
+        if visible {
+            command.arg("--visible");
+        }
+        command.output().unwrap()
+    };
+    // Make cleanup unconditional, including when an assertion panics.
+    struct Cleanup<'a>(&'a dyn Fn(&str, bool) -> std::process::Output);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let _ = (self.0)("recover", false);
+        }
+    }
+    let _cleanup = Cleanup(&run);
+    let first = run("connect", false);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let value: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(value["endpoint_available"], true);
+    assert_eq!(value["connection"]["teams_owned"], true);
+    let state = temp.path().join(&port).join("connection.json");
+    let before: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert!(run("connect", false).status.success());
+    let after: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(before["owner"], after["owner"]);
+    assert!(!run("connect", true).status.success());
+    assert!(run("disconnect", false).status.success());
+    assert!(!state.exists());
+    assert!(temp.path().join(&port).join("profile").is_dir());
+    assert!(run("recover", false).status.success());
+}
+
+#[test]
+fn browser_login_requires_confirmation_and_browser_selection_before_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let native = cli(&temp).args(["desktop", "login"]).output().unwrap();
+    assert!(!native.status.success());
+    let value: Value = serde_json::from_slice(&native.stderr).unwrap();
+    assert_eq!(value["error"]["kind"], "invalid_input");
+    let browser = cli(&temp)
+        .args(["desktop", "login", "--desktop-client", "browser"])
+        .output()
+        .unwrap();
+    assert!(!browser.status.success());
+    let value: Value = serde_json::from_slice(&browser.stderr).unwrap();
+    assert_eq!(value["error"]["kind"], "confirmation_required");
+}
+
+#[test]
+fn core_client_is_explicit_and_requires_personal_account_before_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    cli(&temp)
+        .args([
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-client",
+            "browser-core",
+            "--desktop-account",
+            "personal",
+            "--no-login",
+        ])
+        .assert()
+        .success();
+    let output = cli(&temp).args(["config", "show"]).output().unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["desktop_client"], "browser_core");
+    assert_eq!(value["read_only"], true);
+    let output = cli(&temp).args(["desktop", "connect"]).output().unwrap();
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["kind"], "confirmation_required");
+    let invalid = tempfile::tempdir().unwrap();
+    cli(&invalid)
+        .args([
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-client",
+            "browser-core",
+            "--desktop-account",
+            "work-school",
+            "--no-login",
+        ])
+        .assert()
+        .success();
+    let output = cli(&invalid)
+        .args(["--yes", "desktop", "connect"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["kind"], "unsupported");
+}

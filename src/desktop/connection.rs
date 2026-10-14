@@ -44,6 +44,27 @@ fn failure(code: &str) -> AppError {
 
 /// Includes metadata only. An available endpoint does not establish sign-in.
 pub async fn manage(client: &DesktopClient, action: Action) -> Result<Value, AppError> {
+    manage_visible(client, action, false).await
+}
+
+pub async fn manage_visible(
+    client: &DesktopClient,
+    action: Action,
+    visible: bool,
+) -> Result<Value, AppError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if client.kind.is_browser() {
+        return super::browser::manage(
+            client.port,
+            client.account,
+            action,
+            visible,
+            client.kind == crate::config::DesktopClientKind::BrowserCore,
+        )
+        .await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = visible;
     super::platform()?;
     let token = format!("{:032x}", rand::random::<u128>());
     if matches!(action, Action::Recover) {

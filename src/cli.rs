@@ -107,6 +107,9 @@ pub struct InitArgs {
     /// Select the personal or work/school Teams surface; auto refuses mixed surfaces
     #[arg(long, value_enum)]
     pub desktop_account: Option<crate::config::DesktopAccount>,
+    /// Use the native Teams app or a dedicated Chrome/Edge browser profile
+    #[arg(long, value_enum)]
+    pub desktop_client: Option<crate::config::DesktopClientKind>,
     /// Override the maintained teams-cli public-client application ID
     #[arg(long)]
     pub client_id: Option<String>,
@@ -262,16 +265,24 @@ pub struct TuiArgs {
 pub enum DesktopCommand {
     /// Inspect endpoint metadata and managed-session recovery state
     Status(DesktopArgs),
-    /// Restart Teams with debugging enabled, preserving existing settings
+    /// Open a debugging session (native Teams restart or dedicated browser launch)
     Connect(DesktopArgs),
-    /// Close this CLI's debugging session by restarting Teams normally
+    /// Sign in visibly, then automatically continue headless (browser only)
+    Login(DesktopArgs),
+    /// Close the dedicated browser, or restart native Teams normally
     Disconnect(DesktopArgs),
-    /// Restore settings after interrupted setup, without restarting Teams
+    /// Recover interrupted native settings or close a managed browser session
     Recover(DesktopArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct DesktopArgs {
+    /// Override the configured desktop client
+    #[arg(long, value_enum)]
+    pub desktop_client: Option<crate::config::DesktopClientKind>,
+    /// Open the browser visibly for sign-in (browser connect only)
+    #[arg(long)]
+    pub visible: bool,
     /// Override the selected profile's desktop port
     #[arg(long, value_parser = clap::value_parser!(u16).range(1024..))]
     pub port: Option<u16>,

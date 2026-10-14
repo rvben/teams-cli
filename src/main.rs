@@ -61,6 +61,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                 backend: BackendKind::Graph,
                 desktop_port: None,
                 desktop_account: None,
+                desktop_client: None,
                 client_id: None,
                 tenant: None,
                 no_login: false,
@@ -297,12 +298,13 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             allow_send: args.allow_send,
             desktop_port: args.desktop_port.unwrap_or(config::DEFAULT_DESKTOP_PORT),
             desktop_account: args.desktop_account.unwrap_or_default(),
+            desktop_client: args.desktop_client.unwrap_or_default(),
         };
         let port = profile.desktop_port;
         let output = |path: &std::path::Path, extra: serde_json::Value| {
             let mut value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
                 "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
-                "read_only":read_only,"desktop_port":port,"desktop_account":profile.desktop_account});
+                "read_only":read_only,"desktop_port":port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client});
             if let (Some(value), serde_json::Value::Object(extra)) = (value.as_object_mut(), extra)
             {
                 value.extend(extra);
@@ -314,7 +316,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             let value = output(
                 &path,
                 serde_json::json!({"endpoint_available":null,"session_verified":false,
-                "teams_restarted":null,"chat_list_empty":null,"connection":null}),
+                "teams_restarted":null,"browser_started":null,"chat_list_empty":null,"connection":null}),
             );
             return out.value(&value, || {
                 format!("Saved desktop profile '{profile_name}' without contacting Teams.\nConfig: {}\nNext: `teams --profile {profile_name} init --backend desktop` to connect", path.display())
@@ -322,7 +324,27 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
         }
         // The profile is saved only once a chat read works, so a failed init leaves any
         // existing profile of this name untouched.
-        let client = DesktopClient::with_account(port, profile.desktop_account)?;
+        let client = DesktopClient::from_profile(&profile)?;
+        if profile.desktop_client.is_browser() {
+            confirm_browser_connection(yes)?;
+            eprintln!(
+                "Sign in in the Teams browser window. It will close automatically once chats are readable, then continue headless."
+            );
+            client
+                .login()
+                .await
+                .map_err(|error| error.with_hint("No profile was saved."))?;
+            let chats = client.chats(1, None).await?;
+            let connection = client.probe().await?;
+            let path = config::save(profile_name, profile.clone())?;
+            let value = output(
+                &path,
+                serde_json::json!({"endpoint_available":true,
+                "session_verified":true,"teams_restarted":false,"browser_started":true,
+                "chat_list_empty":chats.items.is_empty(),"connection":connection}),
+            );
+            return out.value(&value, || format!("Connected desktop profile '{profile_name}'; browser is running headless.\nConfig: {}\nNext: `teams --profile {profile_name}` opens your inbox", path.display()));
+        }
         let mut connection = client.probe().await?;
         let needs_restart = !connection.endpoint_available();
         if needs_restart {
@@ -332,13 +354,17 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
                     connection.status.detail()
                 )));
             }
-            confirm_teams_restart(
-                yes,
-                Some(
-                    "Teams is not running with its debugging port open. Opening it restarts Teams, and while it is open any program running as you can read your chats and send as you. `teams desktop disconnect` closes it again.",
-                ),
-                " No profile was saved and Teams was not restarted; run init again when Teams can restart.",
-            )?;
+            if profile.desktop_client.is_browser() {
+                confirm_browser_connection(yes)?;
+            } else {
+                confirm_teams_restart(
+                    yes,
+                    Some(
+                        "Teams is not running with its debugging port open. Opening it restarts Teams, and while it is open any program running as you can read your chats and send as you. `teams desktop disconnect` closes it again.",
+                    ),
+                    " No profile was saved and Teams was not restarted; run init again when Teams can restart.",
+                )?;
+            }
             desktop::connection::manage(&client, desktop::connection::Action::Connect).await?;
         }
         let verified = async {
@@ -354,7 +380,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
         let (chats, path) = match verified {
             Ok(verified) => verified,
             Err(err) if needs_restart => return Err(err.with_hint(&format!(
-                "No profile was saved, and Teams' debugging port is still open; `teams desktop disconnect --port {port}` closes it."
+                "No profile was saved, and the debugging port is still open; `teams desktop disconnect --desktop-client {} --port {port}` closes it.", profile.desktop_client.as_str()
             ))),
             Err(err) => return Err(err.with_hint("No profile was saved.")),
         };
@@ -362,12 +388,13 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
         let value = output(
             &path,
             serde_json::json!({"endpoint_available":connection.endpoint_available(),
-            "session_verified":true,"teams_restarted":needs_restart,"chat_list_empty":chat_list_empty,
+            "session_verified":true,"teams_restarted":needs_restart && profile.desktop_client == config::DesktopClientKind::Native,
+            "browser_started":if profile.desktop_client.is_browser() { Some(needs_restart) } else { None },"chat_list_empty":chat_list_empty,
             "connection":connection}),
         );
         return out.value(&value, || {
             let restarted = if needs_restart {
-                format!(" Teams was restarted with its debugging port open; `teams --profile {profile_name} desktop disconnect` closes it.")
+                format!(" The Teams client was opened with its debugging port enabled; `teams --profile {profile_name} desktop disconnect` closes it.")
             } else {
                 String::new()
             };
@@ -384,9 +411,13 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             format!("Connected desktop profile '{profile_name}' ({access}): {reads}.{restarted}\nConfig: {}\nNext: `teams --profile {profile_name}` opens your inbox", path.display())
         });
     }
-    if args.desktop_port.is_some() || args.desktop_account.is_some() || args.allow_send {
+    if args.desktop_port.is_some()
+        || args.desktop_account.is_some()
+        || args.desktop_client.is_some()
+        || args.allow_send
+    {
         return Err(AppError::InvalidInput(
-            "--desktop-port, --desktop-account and --allow-send require --backend desktop".into(),
+            "--desktop-port, --desktop-account, --desktop-client and --allow-send require --backend desktop".into(),
         ));
     }
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
@@ -425,6 +456,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             allow_send: false,
             desktop_port: config::DEFAULT_DESKTOP_PORT,
             desktop_account: Default::default(),
+            desktop_client: Default::default(),
         },
     )?;
     let mut signed_in = false;
@@ -486,6 +518,7 @@ fn config_command(
                 "backend": profile.backend,
                 "desktop_port": if profile.backend == BackendKind::Desktop { Some(profile.desktop_port) } else { None },
                 "desktop_account": if profile.backend == BackendKind::Desktop { Some(profile.desktop_account) } else { None },
+                "desktop_client": if profile.backend == BackendKind::Desktop { Some(profile.desktop_client) } else { None },
                 "client_id": profile.client_id,
                 "tenant": profile.tenant,
                 "read_only": profile.read_only,
@@ -522,16 +555,12 @@ async fn auth_command(
         let connection = if offline {
             None
         } else {
-            Some(
-                DesktopClient::with_account(profile.desktop_port, profile.desktop_account)?
-                    .probe()
-                    .await?,
-            )
+            Some(DesktopClient::from_profile(&profile)?.probe().await?)
         };
         let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"configured":true,
             "signed_in":null,"verified":false,"session_verified":false,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
             "identity":null,"authentication":"teams_desktop_session_unverified","offline":offline,
-            "config_path":config::path(),"read_only":profile.read_only,"desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,
+            "config_path":config::path(),"read_only":profile.read_only,"desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client,
             "granted_scopes":null,"channel_history":null,"connection":connection});
         return out.value(&value, || format!("Profile: {name}\nBackend: desktop (experimental)\nEndpoint: {}\nSigned in: unknown\nSession verified: no\nRead only: {}",
             connection.as_ref().map(|c| c.status.detail()).unwrap_or("not checked (offline)"), yes_no(profile.read_only)));
@@ -758,6 +787,7 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
                     backend: BackendKind::Graph,
                     desktop_port: None,
                     desktop_account: None,
+                    desktop_client: None,
                     client_id: None,
                     tenant: None,
                     no_login: false,
@@ -996,7 +1026,7 @@ async fn desktop_doctor(
     out: Output,
 ) -> Result<(), AppError> {
     let (name, profile) = config::load(profile_arg)?;
-    let prerequisites = desktop::local_prerequisites();
+    let prerequisites = DesktopClient::from_profile(&profile)?.prerequisites();
     let mut checks = vec![
         Check {
             name: "configuration",
@@ -1026,14 +1056,17 @@ async fn desktop_doctor(
                 .unwrap_or_else(|e| e.to_string()),
         },
     ];
-    if let Some((status, detail)) = desktop::helper_check() {
+    if let Some((status, detail)) = (profile.desktop_client == config::DesktopClientKind::Native)
+        .then(desktop::helper_check)
+        .flatten()
+    {
         checks.push(Check {
             name: "desktop_helper",
             status,
             detail,
         });
     }
-    let desktop = DesktopClient::with_account(profile.desktop_port, profile.desktop_account)?;
+    let desktop = DesktopClient::from_profile(&profile)?;
     let connection = if !offline && prerequisites.is_ok() {
         match desktop.probe().await {
             Ok(metadata) => Some(metadata),
@@ -1094,10 +1127,17 @@ async fn desktop_doctor(
                 .into(),
     });
     let healthy = is_healthy(&checks);
-    let setup = debugging_setup(connection.as_ref(), profile.desktop_port);
+    let setup = if profile.desktop_client.is_browser() {
+        connection
+            .as_ref()
+            .filter(|c| c.status == desktop::ProbeStatus::NoListener)
+            .and_then(|_| desktop.debugging_setup())
+    } else {
+        debugging_setup(connection.as_ref(), profile.desktop_port)
+    };
     let value = serde_json::json!({"profile":name,"backend":"desktop","experimental":true,"healthy":healthy,"offline":offline,
         "endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),"session_verified":false,"signed_in":null,
-        "desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,"connection":connection,"debugging_setup":setup,"checks":checks});
+        "desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client,"connection":connection,"debugging_setup":setup,"checks":checks});
     doctor_report(&value, &checks, setup.map(|s| s.text()), out)
 }
 
@@ -1154,12 +1194,12 @@ fn capabilities(out: Output) -> Result<(), AppError> {
     let value = serde_json::json!({
         "supported":["delegated work/school sign-in","identity","joined teams","channels","chats","chat messages","channel messages","send messages","TUI"],
         "unsupported":["personal Microsoft accounts through Graph","user calls and screen sharing","private Teams protocols","tenant administration"],
-        "account_types":["Microsoft 365 work or school","personal Microsoft accounts (desktop on macOS/Windows/WSL)"],
+        "account_types":["Microsoft 365 work or school","personal Microsoft accounts (desktop; browser client also on Linux)"],
         "api":"Microsoft Graph v1.0",
         "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL)\n  Endpoint diagnostics. Personal and work/school accounts support chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI uses the same backend on all three platforms.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL; browser client on macOS/Linux/WSL2)\n  Endpoint diagnostics. Personal and work/school accounts support chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI uses the same backend. The browser client uses a dedicated profile, with visible sign-in and headless operation.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
 }
 
 /// Desktop sends act through the user's own Teams window, so each one is confirmed at the
@@ -1241,6 +1281,27 @@ fn confirm_teams_restart(yes: bool, note: Option<&str>, on_refusal: &str) -> Res
     Ok(())
 }
 
+fn confirm_browser_connection(yes: bool) -> Result<(), AppError> {
+    if yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return Err(AppError::ConfirmationRequired("Managing the Teams browser needs confirmation; pass --yes when not running in a terminal".into()));
+    }
+    eprint!(
+        "Open or close the dedicated Teams browser? Closing it ends any call in that window. Its debugging port permits local programs to read chats and send as you. [y/N] "
+    );
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim().eq_ignore_ascii_case("y") {
+        Ok(())
+    } else {
+        Err(AppError::ConfirmationRequired(
+            "Browser connection cancelled".into(),
+        ))
+    }
+}
+
 async fn desktop_connection(
     profile: Option<&str>,
     command: DesktopCommand,
@@ -1248,21 +1309,62 @@ async fn desktop_connection(
     out: Output,
 ) -> Result<(), AppError> {
     use desktop::connection::{self, Action};
+    let login = matches!(&command, DesktopCommand::Login(_));
     let (action, args) = match command {
         DesktopCommand::Status(args) => (Action::Status, args),
-        DesktopCommand::Connect(args) => (Action::Connect, args),
+        DesktopCommand::Connect(args) | DesktopCommand::Login(args) => (Action::Connect, args),
         DesktopCommand::Disconnect(args) => (Action::Disconnect, args),
         DesktopCommand::Recover(args) => (Action::Recover, args),
     };
-    if matches!(action, Action::Connect | Action::Disconnect) {
-        confirm_teams_restart(yes, None, "")?;
+    let selected = config::connection_profile(profile)?;
+    let kind = args.desktop_client.unwrap_or_else(|| {
+        selected
+            .as_ref()
+            .map(|p| p.desktop_client)
+            .unwrap_or_default()
+    });
+    let port = args.port.unwrap_or_else(|| {
+        selected
+            .as_ref()
+            .map(|p| p.desktop_port)
+            .unwrap_or(config::DEFAULT_DESKTOP_PORT)
+    });
+    let account = selected
+        .as_ref()
+        .map(|p| p.desktop_account)
+        .unwrap_or_default();
+    if login && !kind.is_browser() {
+        return Err(AppError::InvalidInput(
+            "desktop login requires --desktop-client browser".into(),
+        ));
     }
-    let port = match args.port {
-        Some(port) => port,
-        None => config::load(profile)?.1.desktop_port,
+    if args.visible && (login || !kind.is_browser() || !matches!(action, Action::Connect)) {
+        return Err(AppError::InvalidInput(
+            "--visible requires desktop connect --desktop-client browser".into(),
+        ));
+    }
+    if matches!(action, Action::Connect | Action::Disconnect)
+        || (kind.is_browser() && matches!(action, Action::Recover))
+    {
+        if kind.is_browser() {
+            confirm_browser_connection(yes)?;
+        } else {
+            confirm_teams_restart(yes, None, "")?;
+        }
+    }
+    let client = DesktopClient::with_client(port, account, kind)?;
+    let value = if login {
+        eprintln!(
+            "Sign in in the Teams browser window. It will close automatically once chats are readable, then continue headless."
+        );
+        client.login().await?
+    } else {
+        connection::manage_visible(&client, action, args.visible).await?
     };
-    let value = connection::manage(&DesktopClient::new(port)?, action).await?;
     out.value(&value, || {
+        if login {
+            return "Teams sign-in verified; the browser is running headless.".into();
+        }
         format!(
             "Desktop endpoint: {}. Managed session: {}. Recovery needed: {}.",
             if value["endpoint_available"] == true {

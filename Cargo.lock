@@ -3188,6 +3188,7 @@ dependencies = [
  "jiff",
  "jsonschema",
  "keyring",
+ "libc",
  "open",
  "predicates",
  "rand 0.9.5",
