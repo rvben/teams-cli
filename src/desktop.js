@@ -14,7 +14,9 @@ async (p, select) => {
     q.onupgradeneeded = () => q.transaction.abort();
     return req(q);
   };
-  const iso = t => t ? new Date(+t).toISOString() : null;
+  // Missing cache timestamps can be -1. Keep sort keys valid for CLI cursors.
+  const time = t => Number.isFinite(+t) && +t > 0 && +t <= 8640000000000000 ? Math.trunc(+t) : 0;
+  const iso = t => time(t) ? new Date(time(t)).toISOString() : null;
   // Work identities match Graph's object IDs. Personal/Skype MRIs keep their namespace.
   const uid = m => typeof m === 'string' ? m.replace(/^.*\//, '').replace(/^8:orgid:/, '') : '';
   const system = t => /^(ThreadActivity|Event|Control)\//.test(t || '');
@@ -72,7 +74,7 @@ async (p, select) => {
     if (p.query == 'chats') {
       pg = page((await req(store.getAll()))
         .filter(c => c.type == 'Chat' || c.type == 'Meeting' || c.type == 'StreamOfNotes')
-        .map(c => ({ t: c.lastMessageTimeUtc || 0, id: c.id, c })));
+        .map(c => ({ t: time(c.lastMessageTimeUtc), id: c.id, c })));
     } else if (!await req(store.get(p.chat))) return { error: 'not_found' };
   } finally { cdb.close(); }
   const rdb = await open('replies');
@@ -126,7 +128,7 @@ async (p, select) => {
     for (const m of await chain(rdb, p.chat)) {
       if (system(m.messageType) || seen.has(m.id)) continue;
       seen.add(m.id);
-      rows.push({ t: m.originalArrivalTime || 0, id: m.id, value: {
+      rows.push({ t: time(m.originalArrivalTime), id: m.id, value: {
         id: m.id, createdDateTime: iso(m.originalArrivalTime),
         from: { user: { id: uid(m.creator), displayName: m.imDisplayName || null } },
         body: { contentType: /^RichText/.test(m.messageType) ? 'html' : 'text', content: m.content || '' },

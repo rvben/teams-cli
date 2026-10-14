@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Replace unpaired UTF-16 characters in projected desktop text so malformed cached previews cannot break a chat page.
+- Normalize missing and sentinel cache timestamps so older chats and messages retain valid pagination cursors.
 - Preserve personal identity namespaces and leave missing or conflicting viewer mappings unknown while keeping account caches isolated.
 - resolve desktop review regressions ([09fb74d](https://github.com/rvben/teams-cli/commit/09fb74de579f16116da420ba7cf75db5ef16acdf))
 - **desktop**: find powershell.exe in the standard Windows location when PATH omits it ([0406340](https://github.com/rvben/teams-cli/commit/04063402778cb0dbbe3e5cf16699081bd3082918))

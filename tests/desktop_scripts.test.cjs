@@ -193,6 +193,37 @@ test('chat members use the same account profile database', async () => {
   assert.ok(f.opened.every(database => database.endsWith(':account-a')));
 });
 
+for (const query of ['chats', 'messages']) {
+  test(`${query} paginate through missing and sentinel timestamps with valid cursors`, async () => {
+    const f = fixture();
+    const times = [-1, 0, undefined, 'invalid', Infinity, 8640000000000001, 1700000000000];
+    const ids = times.map((_, i) => query === 'chats' ? `19:${i}@thread.v2` : String(i));
+    if (query === 'chats') {
+      f.databases.set(name('conversation-manager', 'account-a'), times.map((t, i) => ({
+        ...conversation, id: ids[i], lastMessageTimeUtc: t,
+      })));
+    } else {
+      f.databases.set(name('replychain-manager', 'account-a'), [{ chat, messageMap:
+        Object.fromEntries(times.map((t, i) => [i, { ...message, id: ids[i], originalArrivalTime: t }])) }]);
+    }
+    let after = null;
+    const seen = [];
+    for (let page = 0; page < times.length; page++) {
+      const result = await f.read({ query, limit: 1, after });
+      assert.equal(result.items.length, 1);
+      const item = result.items[0];
+      seen.push(item.id);
+      assert.equal(item[query === 'chats' ? 'lastUpdatedDateTime' : 'createdDateTime'],
+        page === 0 ? '2023-11-14T22:13:20.000Z' : null);
+      after = result.next;
+      if (after) assert.ok(Number.isInteger(after.t) && after.t >= 0);
+    }
+    assert.equal(after, null);
+    assert.deepEqual(seen, [ids.at(-1), ...ids.slice(0, -1)]);
+    assert.equal(new Set(seen).size, times.length);
+  });
+}
+
 test('a missing account database never falls back to another account', async () => {
   const f = fixture({ foreignOnly: true });
   await assert.rejects(f.read(), /layout/);

@@ -839,7 +839,8 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         });
-        assert_eq!(scripts, ["b6a79262f320", "b9d1fd2a4447", "3e837cc21336"]);
+        // Timestamp normalization keeps the protocol-3 request/result shapes.
+        assert_eq!(scripts, ["2dbfdf8d154b", "b9d1fd2a4447", "3e837cc21336"]);
     }
 
     #[test]
