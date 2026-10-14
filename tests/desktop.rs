@@ -438,3 +438,31 @@ fn backend_options_and_schema_describe_only_implemented_capabilities() {
             .any(|c| c["name"] == "desktop_endpoint" && c["status"] == "skip")
     );
 }
+
+#[test]
+fn lifecycle_restart_requires_confirmation_before_any_endpoint_or_app_access() {
+    let temp = tempfile::tempdir().unwrap();
+    for command in ["connect", "disconnect"] {
+        let output = cli(&temp)
+            .args(["desktop", command, "--port", "19222"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "confirmation_required");
+    }
+    let output = cli(&temp)
+        .args([
+            "messages",
+            "status",
+            "--chat",
+            "48:notes",
+            "--client-message-id",
+            "wrong",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+}

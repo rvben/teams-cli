@@ -27,8 +27,12 @@ Cargo and Python package versions are kept synchronized as one release unit.
 
 The `0.1.11` candidate builds on the desktop implementation validated in
 `0.1.10-alpha.1`, adding direct Enter-to-send with multiline paste handling and a
-confirmed Teams debugging restart from the WSL TUI. It also clarifies setup and
-support boundaries. It supports cached chat reads and opt-in plain-text sends
+confirmed Teams debugging restart from the WSL TUI. Managed desktop connection
+commands preserve prior settings, share Windows/WSL recovery state and check
+process ownership before disconnecting. Send results distinguish submission,
+queueing and delivery; possibly-sent TUI drafts require an explicit second-copy
+confirmation. Exact client-ID checks inspect the newest 50 cached messages and
+leave missing or unspecified delivery evidence unknown. It supports cached chat reads and opt-in plain-text sends
 through Teams on macOS, Windows and WSL. The Windows helper speaks protocol 3.
 Personal Microsoft accounts use the desktop backend; Graph remains limited to
 work/school accounts.
@@ -70,8 +74,20 @@ artifacts. Work/school WSL2 coverage is a separate user report.
 The work/school report did not capture the exact CLI or Teams version. Keep it
 separate from instrumented evidence. The user also reported Windows working;
 individual native Windows TUI interactions were not instrumented.
-The newer TUI send/paste and WSL restart flows have automated regression coverage;
-the alpha's live results do not establish live validation of those newer flows.
+The `0.1.11` reliability candidate has separate instrumented validation: managed
+connect, repeated connect without restarting, disconnect and settings preservation
+on macOS and native Windows; a multiline Mac TUI paste that did not send until
+Enter and appeared exactly once; and a WSL terminal fixture for lost responses,
+guarded resend, exact-ID reconciliation and the structured uncertainty contract.
+The fixture made no real Teams calls. Windows state-machine fixtures cover
+interrupted setup, external setting changes, conflicting owners, changed
+processes, existing debugging flags and repeated disconnects. These checks use
+isolated records and simulated platform effects.
+
+The tested personal Teams cache omitted delivery status even when the exact
+message was present. Readback therefore reported `found: true` and delivery
+`unknown`; cache presence alone is not a delivery receipt. Each real send was
+issued once, with its checkpoint and exact correlation ID retained privately.
 
 Instrumented checks also covered cache pagination, read-only refusal, explicit
 account-surface selection and ambiguity refusal, malformed cached text and

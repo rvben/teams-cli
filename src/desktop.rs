@@ -6,6 +6,7 @@
 //! Windows build of itself as a long-lived helper (`teams.exe desktop-helper`).
 #[cfg(any(target_os = "macos", windows, test))]
 mod cdp;
+pub mod connection;
 pub mod helper;
 #[cfg(not(windows))]
 pub mod install;
@@ -177,44 +178,9 @@ impl DesktopClient {
                 "Connection changed; press r to retry before restarting Teams".into(),
             ));
         }
-        let setup = DebuggingSetup::for_shell("powershell", self.port);
-        let mut command = tokio::process::Command::new("powershell.exe");
-        command
-            .args(["-NoProfile", "-NonInteractive", "-Command"])
-            .arg(format!("$ErrorActionPreference = 'Stop'; {}", setup.open))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let status = tokio::time::timeout(std::time::Duration::from_secs(30), command.status())
+        connection::manage(self, connection::Action::Connect)
             .await
-            .map_err(|_| {
-                AppError::Desktop("Teams restart timed out; press r to retry the connection".into())
-            })?
-            .map_err(|_| {
-                AppError::Desktop(
-                    "Could not run PowerShell; check Windows executable interop, then press r"
-                        .into(),
-                )
-            })?;
-        if !status.success() {
-            return Err(AppError::Desktop(
-                "Could not restart Teams; press r to retry the connection".into(),
-            ));
-        }
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let probe = self.probe().await?;
-            if probe.endpoint_available() {
-                return Ok(());
-            }
-            if probe.status != ProbeStatus::NoListener {
-                return Err(AppError::Desktop(probe.status.detail().into()));
-            }
-        }
-        Err(AppError::Desktop(
-            "Teams is still starting; wait a moment, then press r to retry".into(),
-        ))
+            .map(|_| ())
     }
 
     pub async fn probe(&self) -> Result<ConnectionMetadata, AppError> {
@@ -271,7 +237,17 @@ impl DesktopClient {
     /// Sends one plain-text chat message as the signed-in Teams user. Never retried: a lost
     /// answer is reported as unconfirmed, because Teams may already have the message.
     pub async fn send(&self, chat: &str, body: &str) -> Result<Value, AppError> {
+        self.send_with_id(chat, body, &crate::delivery::client_message_id())
+            .await
+    }
+
+    /// Uses one preallocated correlation ID. This is not an idempotency/retry key.
+    pub async fn send_with_id(&self, chat: &str, body: &str, id: &str) -> Result<Value, AppError> {
         let mut request = send_request(self.port, chat, body)?;
+        if !crate::delivery::valid_client_message_id(id) {
+            return Err(AppError::InvalidInput("invalid client message ID".into()));
+        }
+        request["client_message_id"] = json!(id);
         request["account_type"] = json!(self.account);
         platform()?;
         #[cfg(any(windows, target_os = "macos"))]
@@ -283,7 +259,26 @@ impl DesktopClient {
             .await
             .call_once(json!({"op": "send", "request": request}))
             .await?;
-        sent_message(&reply, chat)
+        sent_message(&reply, chat).map_err(|error| match error {
+            AppError::Unconfirmed(message) => AppError::UnconfirmedSend {
+                message,
+                chat_id: chat.into(),
+                client_message_id: id.into(),
+            },
+            other => other,
+        })
+    }
+
+    /// Checks only the newest 50 cached messages; absence is not proof of failure.
+    pub async fn delivery(&self, chat: &str, id: &str) -> Result<Value, AppError> {
+        check_chat(chat)?;
+        if !crate::delivery::valid_client_message_id(id) {
+            return Err(AppError::InvalidInput(
+                "client message ID must contain 18 digits".into(),
+            ));
+        }
+        let page = self.messages(chat, 50, None).await?;
+        Ok(crate::delivery::reconcile(chat, id, &page.items))
     }
 
     /// Whether the Teams window that sends messages is reachable; sends nothing.
@@ -442,7 +437,7 @@ fn sent_message(reply: &Value, chat: &str) -> Result<Value, AppError> {
         .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
         .or_else(|| arrival.as_str().and_then(|t| t.parse().ok()))
         .map(|t| t.to_string());
-    Ok(json!({
+    let mut message = json!({
         "id": id,
         "chatId": chat,
         "createdDateTime": created,
@@ -450,7 +445,9 @@ fn sent_message(reply: &Value, chat: &str) -> Result<Value, AppError> {
         "clientMessageId": label("clientMessageId"),
         "status": label("status"),
         "source": "desktop",
-    }))
+    });
+    message["delivery_state"] = json!(crate::delivery::State::from_message(&message));
+    Ok(message)
 }
 
 /// Cursors are opaque to callers: base64 of the last item's sort key.
@@ -565,7 +562,7 @@ pub fn platform() -> Result<&'static str, AppError> {
 }
 
 /// Commands for manual setup and the confirmed WSL TUI restart. macOS uses
-/// process-only environment; Windows/WSL set and clear the user's WebView2 variable.
+/// process-only environment; Windows/WSL preserve and restore the user's WebView2 variable.
 #[derive(Debug, Serialize)]
 pub struct DebuggingSetup {
     /// `zsh` on macOS, `wsl` for a WSL shell, `powershell` on Windows.
@@ -586,32 +583,10 @@ impl DebuggingSetup {
     }
 
     fn for_shell(shell: &'static str, port: u16) -> Self {
-        if shell == "zsh" {
-            let quit = r#"/usr/bin/osascript -e 'tell application id "com.microsoft.teams2" to quit' && /bin/sleep 2"#;
-            return Self {
-                shell,
-                open: format!(
-                    r#"{quit} && /usr/bin/open -b com.microsoft.teams2 --env 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port={port} --remote-debugging-address=127.0.0.1'"#
-                ),
-                close: format!(
-                    r#"{quit} && /usr/bin/open -b com.microsoft.teams2 --env WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="#
-                ),
-            };
-        }
-        // Only double quotes inside, so the WSL form can wrap it in single quotes.
-        let command = |value: &str| {
-            let code = format!(
-                r#"[Environment]::SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", {value}, "User"); Get-Process ms-teams -ErrorAction SilentlyContinue | Stop-Process; Start-Sleep 2; Start-Process "shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams""#
-            );
-            match shell {
-                "wsl" => format!("powershell.exe -NoProfile -Command '{code}'"),
-                _ => code,
-            }
-        };
         Self {
             shell,
-            open: command(&format!(r#""--remote-debugging-port={port}""#)),
-            close: command("$null"),
+            open: format!("teams desktop connect --port {port}"),
+            close: format!("teams desktop disconnect --port {port}"),
         }
     }
 
@@ -622,7 +597,7 @@ impl DebuggingSetup {
             _ => "PowerShell",
         };
         format!(
-            "To open Teams' debugging port, run this in {shell}. It restarts Teams, which ends any call in progress:\n  {}\nTo close it again:\n  {}\nWhile the port is open, any program running as you can read your chats and send as you.",
+            "To open Teams' debugging port, run this in {shell}. It restarts Teams, which ends any call in progress:\n  {}\nTo close it again:\n  {}\nManaged setup preserves existing settings. `teams desktop recover` restores settings after an interrupted setup. While the port is open, any program running as you can read your chats and send as you.",
             self.open, self.close
         )
     }
@@ -816,38 +791,14 @@ mod tests {
     }
 
     #[test]
-    fn debugging_setup_sets_and_clears_the_variable_and_restarts_teams() {
-        let wsl = DebuggingSetup::for_shell("wsl", 9333);
-        assert_eq!(
-            wsl.open,
-            r#"powershell.exe -NoProfile -Command '[Environment]::SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--remote-debugging-port=9333", "User"); Get-Process ms-teams -ErrorAction SilentlyContinue | Stop-Process; Start-Sleep 2; Start-Process "shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams"'"#
-        );
-        assert!(
-            wsl.close
-                .contains(r#""WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", $null, "User")"#)
-        );
-        // The WSL form is wrapped in single quotes, so nothing inside may close them.
-        for command in [&wsl.open, &wsl.close] {
-            let inner = &command["powershell.exe -NoProfile -Command '".len()..command.len() - 1];
-            assert!(!inner.contains('\''), "{command}");
+    fn debugging_setup_uses_managed_commands_on_every_shell() {
+        for shell in ["wsl", "powershell", "zsh"] {
+            let setup = DebuggingSetup::for_shell(shell, 9333);
+            assert_eq!(setup.open, "teams desktop connect --port 9333");
+            assert_eq!(setup.close, "teams desktop disconnect --port 9333");
+            assert!(setup.text().contains("teams desktop recover"));
+            assert!(setup.text().contains("any program running as you"));
         }
-        let native = DebuggingSetup::for_shell("powershell", 9333);
-        assert!(
-            native
-                .open
-                .starts_with("[Environment]::SetEnvironmentVariable(")
-        );
-        assert!(native.text().contains("in PowerShell"));
-        assert!(wsl.text().contains("in this WSL shell"));
-        assert!(wsl.text().contains("any program running as you"));
-        let mac = DebuggingSetup::for_shell("zsh", 9333);
-        assert!(mac.open.contains("--env 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333 --remote-debugging-address=127.0.0.1'"));
-        assert!(
-            mac.close
-                .ends_with("--env WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=")
-        );
-        assert!(mac.text().contains("Terminal (zsh or bash)"));
-        assert!(!mac.open.contains("launchctl"));
     }
 
     /// Helpers and CLIs of different versions talk to each other whenever their protocol
@@ -896,7 +847,7 @@ mod tests {
                 .collect::<String>()
         });
         // Timestamp normalization keeps the protocol-3 request/result shapes.
-        assert_eq!(scripts, ["2dbfdf8d154b", "b9d1fd2a4447", "3e837cc21336"]);
+        assert_eq!(scripts, ["32ca0293d2d5", "b9d1fd2a4447", "3e837cc21336"]);
     }
 
     #[test]

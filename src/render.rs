@@ -358,7 +358,12 @@ pub fn html_to_text(html: &str) -> String {
         match (name.as_str(), closing) {
             ("style" | "script", false) if !tag.ends_with('/') => skip += 1,
             ("style" | "script", true) => skip = skip.saturating_sub(1),
-            ("br", _) => newline(&mut out, quote),
+            ("br", _) => {
+                newline(&mut out, quote);
+                // Teams formats its HTML with CRLF after <br>. That whitespace
+                // is not another visible line break; consecutive <br>s still are.
+                rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+            }
             ("p" | "div" | "tr" | "h1" | "h2" | "h3" | "pre" | "ul" | "ol", _) => {
                 block(&mut out, quote)
             }
@@ -591,6 +596,10 @@ mod tests {
             "> Ann\n> old point\n\nHi @Bob, 5 < 6 & 😀\n• one\n• two\n🙂[image]\na\n\nb\nc"
         );
         assert_eq!(html_to_text("<p></p><p>  </p>"), "");
+        assert_eq!(
+            html_to_text("<p>line one<br />\r\nline two</p>"),
+            "line one\nline two"
+        );
         assert_eq!(decode_entities("a &bogus; &#65; &"), "a &bogus; A &");
     }
 

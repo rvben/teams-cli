@@ -82,3 +82,18 @@ impl TeamsBackend {
         }
     }
 }
+
+impl TeamsBackend {
+    pub async fn send_with_id(&self, chat: &str, body: &str, id: &str) -> Result<Value, AppError> {
+        match self {
+            Self::Desktop(client) => client.send_with_id(chat, body, id).await,
+            Self::Graph(client) => client.send(Some(chat), None, None, body).await,
+        }
+    }
+    pub async fn delivery(&self, chat: &str, id: &str) -> Result<Value, AppError> {
+        match self {
+            Self::Desktop(client) => client.delivery(chat, id).await,
+            Self::Graph(_) => Err(AppError::Unsupported("delivery reconciliation by client message ID is available on desktop profiles only; check the conversation before resending".into())),
+        }
+    }
+}

@@ -7,8 +7,8 @@ use serde_json::Value;
 use teams_cli::auth;
 use teams_cli::backend::TeamsBackend;
 use teams_cli::cli::{
-    AuthCommand, ChannelsCommand, ChatsCommand, Cli, Command, ConfigCommand, InitArgs,
-    MessagesCommand, OffsetPageArgs, PageArgs, ProfileCommand, TuiArgs,
+    AuthCommand, ChannelsCommand, ChatsCommand, Cli, Command, ConfigCommand, DesktopCommand,
+    InitArgs, MessagesCommand, OffsetPageArgs, PageArgs, ProfileCommand, TuiArgs,
 };
 use teams_cli::config::{self, BackendKind, Profile};
 use teams_cli::desktop::{self, DesktopClient};
@@ -98,6 +98,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     }
     match command {
         Command::DesktopHelper => desktop::serve_helper().await,
+        Command::Desktop { command } => desktop_connection(profile_arg, command, yes, out).await,
         Command::Init(args) => init(profile_arg.unwrap_or("default"), args, out).await,
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
         Command::Profile { command } => profile_command(command, yes, out),
@@ -125,6 +126,30 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
             let client = client(profile_arg).await?;
             let mut result = client.chats(page.limit, page.cursor.as_deref()).await?;
             render_conversation(&mut result, &page, out, render::chats)
+        }
+        Command::Messages {
+            command:
+                MessagesCommand::Status {
+                    chat,
+                    client_message_id,
+                },
+        } => {
+            desktop::check_chat(&chat)?;
+            if !teams_cli::delivery::valid_client_message_id(&client_message_id) {
+                return Err(AppError::InvalidInput(
+                    "client message ID must contain 18 digits".into(),
+                ));
+            }
+            if config::selected_backend(profile_arg)? != BackendKind::Desktop {
+                return Err(AppError::Unsupported(
+                    "client message ID delivery checks require a desktop profile".into(),
+                ));
+            }
+            let value = client(profile_arg)
+                .await?
+                .delivery(&chat, &client_message_id)
+                .await?;
+            out.value(&value, || format!("Delivery: {}. Checked newest 50 cached messages; an absent result does not prove failure.", value["delivery_state"].as_str().unwrap_or("unknown")))
         }
         Command::Messages {
             command:
@@ -188,10 +213,19 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                 .send(chat.as_deref(), team.as_deref(), channel.as_deref(), &body)
                 .await?;
             out.value(&value, || {
-                format!(
-                    "Sent message {}",
-                    string_at(&value, "/id").unwrap_or("successfully")
-                )
+                if value["source"] == "desktop" {
+                    format!(
+                        "{} Message {} (client ID {}).",
+                        teams_cli::delivery::State::from_message(&value).notice(),
+                        value["id"].as_str().unwrap_or("unknown"),
+                        value["clientMessageId"].as_str().unwrap_or("unknown")
+                    )
+                } else {
+                    format!(
+                        "Sent message {}",
+                        string_at(&value, "/id").unwrap_or("successfully")
+                    )
+                }
             })
         }
         Command::Tui(args) => tui_command(profile_arg, args).await,
@@ -1113,4 +1147,54 @@ fn identity_text(value: &Value) -> String {
             .or_else(|| string_at(value, "/mail"))
             .unwrap_or("")
     )
+}
+
+async fn desktop_connection(
+    profile: Option<&str>,
+    command: DesktopCommand,
+    yes: bool,
+    out: Output,
+) -> Result<(), AppError> {
+    use desktop::connection::{self, Action};
+    let (action, args) = match command {
+        DesktopCommand::Status(args) => (Action::Status, args),
+        DesktopCommand::Connect(args) => (Action::Connect, args),
+        DesktopCommand::Disconnect(args) => (Action::Disconnect, args),
+        DesktopCommand::Recover(args) => (Action::Recover, args),
+    };
+    if matches!(action, Action::Connect | Action::Disconnect) && !yes {
+        if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+            return Err(AppError::ConfirmationRequired(
+                "Restarting Teams needs confirmation; pass --yes when not running in a terminal"
+                    .into(),
+            ));
+        }
+        eprint!("Restart Teams? This ends any call in progress. [y/N] ");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            return Err(AppError::ConfirmationRequired(
+                "Teams restart cancelled".into(),
+            ));
+        }
+    }
+    let port = match args.port {
+        Some(port) => port,
+        None => config::load(profile)?.1.desktop_port,
+    };
+    let value = connection::manage(&DesktopClient::new(port)?, action).await?;
+    out.value(&value, || {
+        format!(
+            "Desktop endpoint: {}. Managed session: {}. Recovery needed: {}.",
+            if value["endpoint_available"] == true {
+                "available"
+            } else if value["endpoint_available"].is_null() {
+                "not checked"
+            } else {
+                "unavailable"
+            },
+            value["management"]["managed"],
+            value["management"]["needs_recovery"]
+        )
+    })
 }

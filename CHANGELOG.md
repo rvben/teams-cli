@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Preserve desktop debugging settings with managed connect/status/disconnect/recover commands, ownership checks and WSL PowerShell discovery without Windows PATH entries.
+- Distinguish queued and delivered sends, retain correlation IDs on uncertain outcomes, and require an explicit resend action for possibly-sent TUI drafts.
 - Offer a confirmed Teams restart with debugging enabled when the WSL TUI finds no endpoint, with cancellation and retry actions.
 
 ### Changed
@@ -21,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Keep multiline bracketed pastes in the TUI draft until Enter is pressed, preserve drafts after failed sends, and ignore additional input while sending.
+- Render Teams' formatting whitespace after HTML line breaks without adding an extra blank line.
 
 ## [0.1.10-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.9-alpha.1...v0.1.10-alpha.1) - 2026-10-14
 

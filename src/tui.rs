@@ -220,6 +220,11 @@ enum Outcome {
         result: Result<Page, AppError>,
     },
     Me(Result<Value, AppError>),
+    Delivery {
+        chat: String,
+        id: String,
+        result: Result<Value, AppError>,
+    },
     Sent {
         chat: String,
         result: Result<Value, AppError>,
@@ -273,6 +278,9 @@ enum Overlay {
 enum Stage {
     Editing,
     Sending,
+    Unconfirmed,
+    Checking,
+    ConfirmResend,
 }
 
 /// A draft for one chat; `cursor` is a byte offset into `text`.
@@ -345,6 +353,8 @@ struct App {
     compose: Option<Compose>,
     /// Closed, unsent drafts per chat; kept in memory only.
     drafts: HashMap<String, String>,
+    /// Correlation IDs for possibly-sent drafts; kept across closing the composer.
+    pending_sends: HashMap<String, String>,
     /// Set by `r` so its result is announced; quiet reloads say nothing.
     refreshing: bool,
     fetching_chats: bool,
@@ -386,6 +396,7 @@ impl App {
             frame: 0,
             compose: None,
             drafts: HashMap::new(),
+            pending_sends: HashMap::new(),
             refreshing: false,
             fetching_chats: false,
             synced_at: None,
@@ -749,19 +760,89 @@ impl App {
             }
             // The header simply stays without a name; chats still load.
             Outcome::Me(Err(_)) => {}
-            Outcome::Sent { chat, result } => {
-                let compose = self.compose.as_mut().filter(|c| c.chat == chat);
+            Outcome::Delivery { chat, id, result } => {
+                if self.pending_sends.get(&chat) != Some(&id) {
+                    return;
+                }
                 match result {
-                    Ok(_) => {
-                        if compose.is_some() {
+                    Ok(value)
+                        if value["found"] == true
+                            && matches!(
+                                value["delivery_state"].as_str(),
+                                Some("delivered" | "queued")
+                            ) =>
+                    {
+                        self.pending_sends.remove(&chat);
+                        self.drafts.remove(&chat);
+                        if self.compose.as_ref().is_some_and(|c| c.chat == chat) {
                             self.compose = None;
                         }
-                        self.drafts.remove(&chat);
-                        self.notice = Notice::new(Tone::Success, "Sent.");
+                        self.notice = Notice::new(
+                            Tone::Success,
+                            if value["delivery_state"] == "delivered" {
+                                "Delivered; matched the original client message ID."
+                            } else {
+                                "Found queued in Teams; delivery is not confirmed."
+                            },
+                        );
+                    }
+                    result => {
+                        if let Some(compose) = self.compose.as_mut().filter(|c| c.chat == chat) {
+                            compose.stage = Stage::Unconfirmed;
+                        }
+                        self.notice = Notice::new(Tone::Error, match result {
+                            Err(error) => error.to_string(),
+                            Ok(value) if value["found"] == true => "Found the original message in Teams' cache; delivery is still unconfirmed.".into(),
+                            Ok(_) => "Delivery remains uncertain. Checked the newest 50 cached messages; absence does not prove failure.".into(),
+                        });
+                    }
+                }
+            }
+            Outcome::Sent { chat, result } => {
+                match result {
+                    Ok(value) => {
+                        let state = crate::delivery::State::from_message(&value);
+                        if value["source"] == "desktop"
+                            && matches!(
+                                state,
+                                crate::delivery::State::Failed | crate::delivery::State::Unknown
+                            )
+                        {
+                            if let Some(compose) = self.compose.as_mut().filter(|c| c.chat == chat)
+                            {
+                                compose.stage = Stage::Unconfirmed;
+                            }
+                            self.notice = Notice::new(Tone::Error, state.notice());
+                        } else {
+                            if self.compose.as_ref().is_some_and(|c| c.chat == chat) {
+                                self.compose = None;
+                            }
+                            self.drafts.remove(&chat);
+                            self.pending_sends.remove(&chat);
+                            self.notice = Notice::new(
+                                Tone::Success,
+                                if value["source"] == "desktop" {
+                                    state.notice()
+                                } else {
+                                    "Sent."
+                                },
+                            );
+                        }
                     }
                     Err(error) => {
-                        if let Some(compose) = compose {
-                            compose.stage = Stage::Editing;
+                        let uncertain = matches!(
+                            error,
+                            AppError::Unconfirmed(_) | AppError::UnconfirmedSend { .. }
+                        );
+                        if let Some(compose) = self.compose.as_mut().filter(|c| c.chat == chat) {
+                            compose.stage = if uncertain {
+                                Stage::Unconfirmed
+                            } else {
+                                Stage::Editing
+                            };
+                        }
+                        if !uncertain {
+                            self.pending_sends.remove(&chat);
                         }
                         self.notice = Notice::new(Tone::Error, error.to_string());
                     }
@@ -954,11 +1035,16 @@ impl App {
         }
         let text = self.drafts.remove(&chat).unwrap_or_default();
         self.focus = Focus::Thread;
+        let stage = if self.pending_sends.contains_key(&chat) {
+            Stage::Unconfirmed
+        } else {
+            Stage::Editing
+        };
         self.compose = Some(Compose {
             chat,
             cursor: text.len(),
             text,
-            stage: Stage::Editing,
+            stage,
         });
     }
 
@@ -969,7 +1055,42 @@ impl App {
             return;
         };
         match compose.stage {
-            Stage::Sending => {}
+            Stage::Sending | Stage::Checking => {}
+            Stage::ConfirmResend => {
+                if key.code == KeyCode::Char('y') {
+                    self.send();
+                } else {
+                    compose.stage = Stage::Unconfirmed;
+                    self.notice = Notice::new(
+                        Tone::Quiet,
+                        "Resend cancelled; delivery is still uncertain.",
+                    );
+                }
+            }
+            Stage::Unconfirmed => match key.code {
+                KeyCode::Char('r') => self.check_delivery(),
+                KeyCode::Char('s') => {
+                    compose.stage = Stage::ConfirmResend;
+                    self.notice = Notice::new(
+                        Tone::Error,
+                        "The original may still arrive. Send a second copy? Press y to resend; any other key cancels.",
+                    );
+                }
+                KeyCode::Esc => {
+                    let compose = self.compose.take().expect("composer is open");
+                    self.drafts.insert(compose.chat, compose.text);
+                    self.notice = Notice::new(
+                        Tone::Quiet,
+                        "Possibly-sent draft kept; c reopens delivery checks.",
+                    );
+                }
+                _ => {
+                    self.notice = Notice::new(
+                        Tone::Error,
+                        "Possibly sent: r checks delivery; s explicitly resends; esc keeps the draft.",
+                    );
+                }
+            },
             Stage::Editing => match key.code {
                 KeyCode::Esc => {
                     let compose = self.compose.take().expect("composer is open");
@@ -1039,6 +1160,8 @@ impl App {
         };
         compose.stage = Stage::Sending;
         let (chat, text) = (compose.chat.clone(), compose.text.clone());
+        let id = crate::delivery::client_message_id();
+        self.pending_sends.insert(chat.clone(), id.clone());
         self.notice = Notice::new(Tone::Quiet, "Sending…");
         match &self.source {
             Source::Live {
@@ -1049,7 +1172,7 @@ impl App {
                 tokio::spawn(async move {
                     let result = async {
                         config::load(Some(&profile))?.1.require_writable()?;
-                        backend.send(Some(&chat), None, None, &text).await
+                        backend.send_with_id(&chat, &text, &id).await
                     }
                     .await;
                     let _ = sender.send(Outcome::Sent { chat, result });
@@ -1071,6 +1194,37 @@ impl App {
                     result: Ok(message),
                 });
             }
+        }
+    }
+
+    fn check_delivery(&mut self) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        let chat = compose.chat.clone();
+        let Some(id) = self.pending_sends.get(&chat).cloned() else {
+            self.notice = Notice::new(
+                Tone::Error,
+                "No correlation ID is available; inspect the chat before explicitly resending.",
+            );
+            return;
+        };
+        compose.stage = Stage::Checking;
+        self.notice = Notice::new(Tone::Quiet, "Checking the original client message ID…");
+        if let Some(backend) = self.backend() {
+            let sender = self.outcomes.0.clone();
+            tokio::spawn(async move {
+                let result = backend.delivery(&chat, &id).await;
+                let _ = sender.send(Outcome::Delivery { chat, id, result });
+            });
+        } else {
+            let messages = self
+                .threads
+                .get(&chat)
+                .map(|t| t.items.as_slice())
+                .unwrap_or_default();
+            let result = Ok(crate::delivery::reconcile(&chat, &id, messages));
+            self.apply(Outcome::Delivery { chat, id, result });
         }
     }
 
@@ -1589,6 +1743,9 @@ impl App {
             let title = match compose.stage {
                 Stage::Editing => " MESSAGE ",
                 Stage::Sending => " SENDING ",
+                Stage::Unconfirmed => " POSSIBLY SENT ",
+                Stage::Checking => " CHECKING DELIVERY ",
+                Stage::ConfirmResend => " RESEND? ",
             };
             let block = Block::default()
                 .borders(Borders::TOP)
@@ -1742,7 +1899,13 @@ impl App {
                     ("ctrl-j", "new line", 1),
                     ("esc", "close, keep draft", 0),
                 ],
-                Stage::Sending => vec![("ctrl-c", "quit", 1)],
+                Stage::Sending | Stage::Checking => vec![("ctrl-c", "quit", 1)],
+                Stage::Unconfirmed => vec![
+                    ("r", "check", 0),
+                    ("s", "resend…", 0),
+                    ("esc", "keep draft", 1),
+                ],
+                Stage::ConfirmResend => vec![("y", "send second copy", 0), ("esc", "cancel", 0)],
             }
         } else if self.overlay == Some(Overlay::Filter) {
             vec![("enter", "keep", 0), ("esc", "clear", 0), ("↑↓", "move", 1)]
@@ -2942,13 +3105,91 @@ mod tests {
                 "Check the conversation before sending again".into(),
             )),
         });
-        assert!(app.compose.as_ref().unwrap().stage == Stage::Editing);
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Unconfirmed);
         assert_eq!(app.compose.as_ref().unwrap().text, "keep this");
         assert!(app.notice.text.contains("Check the conversation"));
         assert_eq!(app.threads["19:launch@thread.v2"].items.len(), 7);
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('c'));
         assert_eq!(app.compose.as_ref().unwrap().text, "keep this");
+    }
+
+    #[test]
+    fn uncertain_send_blocks_enter_paste_and_reopening_until_explicit_resend() {
+        let mut app = demo_app();
+        app.open_selected();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "one copy");
+        let chat = app.compose.as_ref().unwrap().chat.clone();
+        let before = app.threads[&chat].items.len();
+        app.pending_sends
+            .insert(chat.clone(), "100000000000000001".into());
+        app.apply(Outcome::Sent {
+            chat: chat.clone(),
+            result: Err(AppError::Unconfirmed("may arrive".into())),
+        });
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Enter);
+        }
+        app.paste("another copy\n");
+        assert_eq!(app.compose.as_ref().unwrap().text, "one copy");
+        assert_eq!(app.threads[&chat].items.len(), before);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Unconfirmed);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Unconfirmed);
+        assert!(app.notice.text.contains("absence does not prove failure"));
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Enter); // Enter is not confirmation.
+        assert_eq!(app.threads[&chat].items.len(), before);
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.threads[&chat].items.len(), before + 1);
+        assert!(app.compose.is_none());
+        assert!(!app.pending_sends.contains_key(&chat));
+    }
+
+    #[test]
+    fn delivery_check_uses_original_id_and_queued_success_is_not_labelled_sent() {
+        let mut app = demo_app();
+        app.open_selected();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "once");
+        let chat = app.compose.as_ref().unwrap().chat.clone();
+        let id = "100000000000000001".to_string();
+        app.pending_sends.insert(chat.clone(), id.clone());
+        app.apply(Outcome::Sent {
+            chat: chat.clone(),
+            result: Err(AppError::Unconfirmed("uncertain".into())),
+        });
+        app.apply(Outcome::Delivery {
+            chat: chat.clone(),
+            id: "100000000000000002".into(),
+            result: Ok(json!({"found":true,"delivery_state":"delivered"})),
+        });
+        assert!(app.compose.is_some());
+        app.apply(Outcome::Delivery {
+            chat: chat.clone(),
+            id: id.clone(),
+            result: Ok(json!({"found":true,"delivery_state":"unknown"})),
+        });
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Unconfirmed);
+        assert!(app.notice.text.contains("Found the original message"));
+        app.apply(Outcome::Delivery {
+            chat: chat.clone(),
+            id,
+            result: Ok(json!({"found":true,"delivery_state":"delivered"})),
+        });
+        assert!(app.compose.is_none());
+        assert!(app.notice.text.contains("original client message ID"));
+        press(&mut app, KeyCode::Char('c'));
+        app.apply(Outcome::Sent {
+            chat,
+            result: Ok(json!({"id":"queued","source":"desktop","status":"Queued"})),
+        });
+        assert!(app.notice.text.starts_with("Queued in Teams"));
+        assert!(!app.notice.text.starts_with("Sent"));
     }
 
     #[test]

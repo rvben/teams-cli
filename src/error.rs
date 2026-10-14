@@ -23,6 +23,12 @@ pub enum AppError {
     ConfirmationRequired(String),
     #[error("{0}")]
     Unconfirmed(String),
+    #[error("{message} (client message ID: {client_message_id})")]
+    UnconfirmedSend {
+        message: String,
+        chat_id: String,
+        client_message_id: String,
+    },
     #[error("{0}")]
     Unsupported(String),
     #[error("{0}")]
@@ -159,7 +165,7 @@ impl AppError {
             Self::Api(_) => API,
             Self::NonInteractive(_) => NON_INTERACTIVE,
             Self::ConfirmationRequired(_) => CONFIRMATION_REQUIRED,
-            Self::Unconfirmed(_) => UNCONFIRMED,
+            Self::Unconfirmed(_) | Self::UnconfirmedSend { .. } => UNCONFIRMED,
             Self::Unsupported(_) => UNSUPPORTED,
             Self::Desktop(_) => DESKTOP,
             Self::Unhealthy(_) => UNHEALTHY,

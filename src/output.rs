@@ -64,6 +64,16 @@ pub fn print_error(error: &AppError, structured: bool) {
                 "retryable": contract.retryable,
             }
         });
+        if let AppError::UnconfirmedSend {
+            chat_id,
+            client_message_id,
+            ..
+        } = error
+        {
+            envelope["error"]["chatId"] = chat_id.as_str().into();
+            envelope["error"]["clientMessageId"] = client_message_id.as_str().into();
+            envelope["error"]["delivery_state"] = "unknown".into();
+        }
         if let AppError::RateLimit(Some(seconds)) = error {
             envelope["error"]["retry_after_seconds"] = (*seconds).into();
         }

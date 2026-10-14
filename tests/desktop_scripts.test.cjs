@@ -272,3 +272,14 @@ test('a rejected or timed-out mutation is unconfirmed and never retried', async 
     assert.equal(f.mutations.length, 1);
   }
 });
+
+
+test('message projection preserves exact send correlation and raw delivery status', async () => {
+  const f = fixture();
+  f.databases.set(name('replychain-manager', 'account-a'), [{ chat, messageMap: {
+    a: { ...message, clientMessageId: '100000000000000001', status: 'Queued' },
+  } }]);
+  const result = await f.read();
+  assert.equal(result.items[0].clientMessageId, '100000000000000001');
+  assert.equal(result.items[0].status, 'Queued');
+});

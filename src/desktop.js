@@ -130,6 +130,8 @@ async (p, select) => {
       seen.add(m.id);
       rows.push({ t: time(m.originalArrivalTime), id: m.id, value: {
         id: m.id, createdDateTime: iso(m.originalArrivalTime),
+        clientMessageId: typeof m.clientMessageId === 'string' ? m.clientMessageId : null,
+        status: typeof m.status === 'string' ? m.status : null,
         from: { user: { id: uid(m.creator), displayName: m.imDisplayName || null } },
         body: { contentType: /^RichText/.test(m.messageType) ? 'html' : 'text', content: m.content || '' },
         deleted: !!m.deletionInfo,

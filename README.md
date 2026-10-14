@@ -219,8 +219,24 @@ message may still be delivered (error kind `unconfirmed`, exit code 8), so check
 before sending again. Teams queues
 the message like any other, so a send made just before Teams closes goes out when Teams
 next starts. The result has the Graph send shape plus `"source": "desktop"`,
-`clientMessageId` and Teams' own `status`. `doctor` checks that the send path is still
-recognised without sending anything.
+`clientMessageId`, Teams' own `status` and a normalized `delivery_state`:
+`submitted`, `queued`, `delivered`, `failed` or `unknown`. A successful submission is
+not proof of delivery. `doctor` checks that the send path is still recognised
+without sending anything.
+
+An uncertain desktop send also returns `chatId` and `clientMessageId` in its JSON
+error. Check the exact ID with:
+
+```sh
+teams --profile local messages status --chat CHAT_ID --client-message-id CLIENT_MESSAGE_ID
+```
+
+This checks the newest 50 cached messages and returns metadata only. Missing cache
+records remain `unknown`, not failed or safe to retry. The ID is a correlation ID,
+not an idempotency key. In the TUI, a possibly-sent draft blocks ordinary Enter and
+paste; `r` checks delivery, `s` offers an explicit second-copy confirmation, and
+`esc` keeps the draft and uncertainty together in memory. Reopening it does not
+unlock ordinary sending. Queued results are labelled queued rather than sent.
 
 Desktop cannot create new chats. Teams, channels, identity commands, subscriptions,
 replies, mentions, attachments and edits return `unsupported` on desktop. The TUI
@@ -228,33 +244,38 @@ reads chats from the same cache and sends through the same path as `messages sen
 Existing profiles without a backend field
 continue to use Graph; Graph remains the default for `init`.
 
-The endpoint must already be enabled through an explicit Teams debugging launch.
-On macOS, quit Teams completely, then run:
+Use a managed debugging session on macOS, Windows or WSL:
 
 ```sh
-open -b com.microsoft.teams2 --env 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1'
+teams --profile local desktop connect
+teams --profile local desktop status
+teams --profile local desktop disconnect
 ```
 
-This sets the environment for that launch only. Quit Teams and launch it normally
-to close the port. `doctor` and `init` print opening and closing commands for the
-profile's port when no endpoint is found.
+Connect and disconnect ask before restarting Teams because a restart ends active
+calls; pass `--yes` for a scripted restart. `--port` overrides the selected profile's
+port. An existing verified endpoint is inspected without being adopted; disconnect
+only restarts the same Teams process recorded by a managed connect. If Teams was
+restarted independently, quit and relaunch it normally, then disconnect again to
+clear the old record. No command automatically restarts Teams on exit.
 
-On Windows, set the user environment variable
-`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`, quit Teams
-fully and start it again; remove the variable and restart Teams to close the port.
-When `doctor` or `init` finds nothing listening on Windows or WSL, it prints both
-commands, ready to paste, for the profile's port (and returns them as
-`debugging_setup` in JSON). The variable applies to every WebView2 app you start
-while it is set, not just Teams. An administrator can limit it to Teams with the
-WebView2 `AdditionalBrowserArguments` policy, a string value named `ms-teams.exe`
-under `HKLM\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`.
-While the port is open, any program running as you can read your chats and send as
-you, so close it when you are done.
-The WSL TUI offers to restart Teams with debugging enabled when no endpoint is
-listening. It asks for confirmation first because restarting ends active calls.
-It uses the Windows user variable above; exiting the TUI leaves debugging enabled.
-Remove the variable and restart Teams normally when finished.
-Other commands never launch, restart, quit, or sign into Teams, or enable debugging.
+On macOS, flags apply only to the managed launch. On Windows/WSL, setup saves the
+previous user environment value, applies flags temporarily while Teams starts, then
+restores that value. Unrelated changes to the value are preserved and reported.
+Windows and WSL share a recovery record and lock. WSL finds PowerShell in its normal
+Windows system directory even when Windows PATH entries are disabled; Windows
+executable interop must still be enabled.
+
+If setup is interrupted, run `teams --profile local desktop recover`. It restores
+pending settings without restarting Teams or requiring the Windows helper; it does
+not claim ownership of an unrecorded Teams process. Use `desktop status` to inspect
+the endpoint and saved session. Recovery cannot close an already-running debugging
+endpoint: quit Teams and relaunch it normally if its ownership was not recorded.
+
+While the port is open, any program running as you can read chats and send as you.
+The WSL TUI offers the same managed connect after explicit restart confirmation.
+`doctor` and `init` print the managed opening and closing commands when no endpoint
+is found. They do not launch Teams or verify sign-in.
 `init --no-login` saves configuration without probing; ordinary desktop
 initialization probes the existing endpoint. A normal Teams launch usually has no
 endpoint, which `doctor` reports as `no_listener`.

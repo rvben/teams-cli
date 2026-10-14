@@ -25,11 +25,11 @@ fn debugging_setup() -> Value {
     object_field(
         "debugging_setup",
         true,
-        "Commands for the user to run that open and close Teams' debugging port; only when nothing listens on the desktop port under Windows or WSL. Running them restarts Teams; the WSL TUI also offers a confirmed restart",
+        "Managed connection commands, available when no endpoint listens. Restart commands require confirmation and preserve prior settings; recover restores interrupted setup settings",
         vec![
             described(
                 field("shell", "string"),
-                "wsl or powershell: where the commands run",
+                "zsh, wsl or powershell: where the commands run",
             ),
             field("open", "string"),
             field("close", "string"),
@@ -150,6 +150,11 @@ fn command_errors(name: &str) -> &'static [&'static str] {
             "unsupported",
             "desktop_error",
         ],
+        "messages status" => &["unsupported", "desktop_error"],
+        "desktop status" | "desktop recover" => &["desktop_error", "unsupported"],
+        "desktop connect" | "desktop disconnect" => {
+            &["desktop_error", "unsupported", "confirmation_required"]
+        }
         "tui" => &["tty_required"],
         "doctor" => &["unhealthy"],
         "schema" => &["not_found"],
@@ -192,6 +197,21 @@ fn example(name: &str) -> Value {
             ],
             Some("On it."),
         ),
+        "messages status" => (
+            &[
+                "messages",
+                "status",
+                "--chat",
+                "CHAT_ID",
+                "--client-message-id",
+                "100000000000000001",
+            ],
+            None,
+        ),
+        "desktop status" => (&["desktop", "status", "--port", "9222"], None),
+        "desktop connect" => (&["desktop", "connect", "--port", "9222", "--yes"], None),
+        "desktop disconnect" => (&["desktop", "disconnect", "--port", "9222", "--yes"], None),
+        "desktop recover" => (&["desktop", "recover", "--port", "9222"], None),
         "tui" => (&["tui", "--demo", "--snapshot"], None),
         "doctor" => (&["doctor", "--offline"], None),
         "capabilities" => (&["capabilities"], None),
@@ -459,6 +479,14 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     sender(),
                     body(),
                     described(nullable_field("deleted", "boolean"), "Desktop only"),
+                    described(
+                        nullable_field("clientMessageId", "string"),
+                        "Desktop cache only; exact send correlation ID",
+                    ),
+                    described(
+                        nullable_field("status", "string"),
+                        "Desktop cache only; raw Teams status",
+                    ),
                 ],
             );
             let args = value["args"].as_array_mut().unwrap();
@@ -479,7 +507,14 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                         nullable_field("source", "string"),
                         "\"desktop\" for desktop sends",
                     ),
-                    described(nullable_field("clientMessageId", "string"), "Desktop only"),
+                    described(
+                        nullable_field("clientMessageId", "string"),
+                        "Desktop only; correlation ID, not an idempotency key",
+                    ),
+                    described(
+                        nullable_field("delivery_state", "string"),
+                        "Desktop only: submitted, queued, delivered, failed or unknown",
+                    ),
                     described(
                         nullable_field("status", "string"),
                         "Desktop only; Teams' own delivery label, e.g. Delivered",
@@ -539,6 +574,71 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         }),
         json!({"name":"completions", "description":"Generate a shell completion script", "effects":"read_only", "output_kind":"opaque", "media_type":"text/plain", "args":[arg("shell", "string", "Shell name")]}),
     ];
+    let mut status = single(
+        "messages status",
+        "Reconcile one client message ID against the newest 50 cached desktop messages; absence remains unknown",
+        "read_only",
+        vec![
+            field("chatId", "string"),
+            field("clientMessageId", "string"),
+            field("found", "boolean"),
+            nullable_field("id", "string"),
+            nullable_field("status", "string"),
+            field("delivery_state", "string"),
+            field("source", "string"),
+            field("scope", "string"),
+            field("retryable", "boolean"),
+        ],
+    );
+    status["args"] = json!([
+        required_arg("--chat", "string", "Chat ID"),
+        required_arg(
+            "--client-message-id",
+            "string",
+            "18-digit correlation ID returned by send or unconfirmed error"
+        )
+    ]);
+    commands.push(status);
+    for (name, description, effects) in [
+        (
+            "desktop status",
+            "Inspect endpoint metadata and managed-session state; does not verify sign-in",
+            "read_only",
+        ),
+        (
+            "desktop connect",
+            "Explicitly restart Teams with debugging; preserve settings and never adopt an existing endpoint",
+            "non_idempotent",
+        ),
+        (
+            "desktop disconnect",
+            "Explicitly restart this managed Teams process normally; preserve unrelated processes and settings",
+            "non_idempotent",
+        ),
+        (
+            "desktop recover",
+            "Restore interrupted setup settings without restarting Teams or accessing the endpoint",
+            "idempotent",
+        ),
+    ] {
+        let mut value = single(
+            name,
+            description,
+            effects,
+            vec![
+                field("port", "integer"),
+                nullable_field("endpoint_available", "boolean"),
+                field("session_verified", "boolean"),
+                field("management", "object"),
+                nullable_field("connection", "object"),
+            ],
+        );
+        value["args"] = json!([{"name":"--port","type":"integer","x-minimum":1024,"x-maximum":65535,"description":"Override selected profile port"}]);
+        if matches!(name, "desktop connect" | "desktop disconnect") {
+            value["confirmation_bypass_arg"] = json!("--yes");
+        }
+        commands.push(value);
+    }
     for command in &mut commands {
         let name = command["name"].as_str().unwrap_or_default().to_string();
         let mut errors = vec!["invalid_input", "unexpected_error"];
@@ -550,6 +650,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         }
         command["extensions"] = json!({"backends": match command["name"].as_str().unwrap_or_default() {
             "auth login" | "auth logout" | "whoami" | "list" | "channels list" => vec!["graph"],
+            "desktop status" | "desktop connect" | "desktop disconnect" | "desktop recover" | "messages status" => vec!["desktop"],
             _ => vec!["graph", "desktop"],
         }});
         match command["name"].as_str().unwrap_or_default() {
@@ -611,7 +712,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 "truncated":"true when more records exist",
                 "source":"\"desktop_cache\" when records come from the Teams client's local cache; absent for Graph"
             },
-            "error_envelope":"stderr carries {\"error\":{\"kind\",\"message\",\"retryable\"}} when stdout is not a terminal or --output json is given; rate_limit adds retry_after_seconds when Microsoft sends it",
+            "error_envelope":"stderr carries {\"error\":{\"kind\",\"message\",\"retryable\"}} when stdout is not a terminal or --output json is given; rate_limit adds retry_after_seconds when Microsoft sends it; uncertain desktop sends add chatId, clientMessageId and delivery_state unknown",
             "idempotency":"Sends cannot be made idempotent: neither Graph nor Teams accepts a caller-supplied key. Never resend after unconfirmed without reading the conversation first.",
             "baseline_scopes": crate::auth::BASE_SCOPES.split_whitespace().collect::<Vec<_>>(),
             "privileged_scopes":[crate::auth::CHANNEL_HISTORY_SCOPE]
@@ -624,7 +725,7 @@ pub fn backend_capabilities() -> Value {
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
         "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl"],
             "account_types":["Microsoft 365 work or school","personal Microsoft accounts"],"account_selection":"account_type_then_single_account_only",
-            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","chats (macos, windows, wsl)","chat messages (macos, windows, wsl)","send plain-text chat messages (macos, windows, wsl; opt-in)","TUI (macos, windows, wsl)"],
+            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","managed connect/status/disconnect/recover","delivery reconciliation by client message ID","chats (macos, windows, wsl)","chat messages (macos, windows, wsl)","send plain-text chat messages (macos, windows, wsl; opt-in)","TUI (macos, windows, wsl)"],
             "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","automatic Teams launch or restart"],
             "requires":"existing Teams-owned loopback debugging endpoint; WSL requires Windows executable interop",
             "transport":{"macos":"native_loopback","windows":"windows_native","wsl":"windows_helper_stdio"},

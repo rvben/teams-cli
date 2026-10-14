@@ -77,6 +77,11 @@ pub enum Command {
         #[arg(long)]
         offline: bool,
     },
+    /// Manage a recoverable Teams desktop debugging session
+    Desktop {
+        #[command(subcommand)]
+        command: DesktopCommand,
+    },
     /// Describe supported and deliberately unsupported capabilities
     Capabilities,
     /// Emit the offline CLI Spec v0.3 contract
@@ -207,6 +212,13 @@ pub struct OffsetPageArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum MessagesCommand {
+    /// Check one send's exact client ID in the newest 50 cached desktop messages
+    Status {
+        #[arg(long)]
+        chat: String,
+        #[arg(long)]
+        client_message_id: String,
+    },
     /// List messages from a chat or channel
     List {
         #[arg(long, conflicts_with = "team", required_unless_present = "team")]
@@ -244,4 +256,23 @@ pub struct TuiArgs {
     pub width: u16,
     #[arg(long, default_value_t = 30, hide = true)]
     pub height: u16,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DesktopCommand {
+    /// Inspect endpoint metadata and managed-session recovery state
+    Status(DesktopArgs),
+    /// Restart Teams with debugging enabled, preserving existing settings
+    Connect(DesktopArgs),
+    /// Close this CLI's debugging session by restarting Teams normally
+    Disconnect(DesktopArgs),
+    /// Restore settings after interrupted setup, without restarting Teams
+    Recover(DesktopArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DesktopArgs {
+    /// Override the selected profile's desktop port
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1024..))]
+    pub port: Option<u16>,
 }
