@@ -9,6 +9,10 @@ use serde_json::{Value, json};
 const READ_SCRIPT: &str = include_str!("../desktop.js");
 const SEND_SCRIPT: &str = include_str!("../desktop_send.js");
 const CACHE_SCRIPT: &str = include_str!("../desktop_cache.js");
+// Teams can cache lone UTF-16 surrogates. JSON.stringify escapes them, but Rust's
+// JSON strings require Unicode scalar values. Repair only the projected output.
+const READ_JSON: &str = r#"(value => JSON.stringify(value, (_key, item) =>
+    typeof item === 'string' ? item.toWellFormed() : item))"#;
 
 /// Platform-specific verification before any session access. Raw target URLs remain
 /// internal; only sanitized connection metadata can be returned to the caller.
@@ -145,7 +149,7 @@ fn read_expression(params: &Value, personal: bool) -> String {
     let mut params = params.clone();
     params["personal"] = json!(personal);
     scoped_expression(
-        &format!("({READ_SCRIPT})({params},({CACHE_SCRIPT})).then(JSON.stringify)"),
+        &format!("({READ_SCRIPT})({params},({CACHE_SCRIPT})).then({READ_JSON})"),
         personal,
     )
 }
@@ -308,6 +312,28 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn read_json_repairs_unpaired_utf16_and_preserves_valid_text() {
+        let output = std::process::Command::new("node")
+            .args([
+                "-e",
+                &format!(
+                    r#"const value={{items:[{{topic:'a\ud800b\udc00c',body:'🙂 é 中文',literal:'\\ud800',nested:['\ud83d\ude42','\ud800\ud800\udc00']}}]}};
+                    console.log(JSON.stringify({{raw:JSON.stringify(value),clean:({READ_JSON})(value)}}));"#
+                ),
+            ])
+            .output()
+            .expect("Node.js 20 or newer is required for desktop script tests");
+        assert!(output.status.success());
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(serde_json::from_str::<Value>(result["raw"].as_str().unwrap()).is_err());
+        let clean: Value = serde_json::from_str(result["clean"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            clean,
+            json!({"items":[{"topic":"a�b�c","body":"🙂 é 中文","literal":"\\ud800","nested":["🙂","�𐀀"]}]})
+        );
+    }
 
     #[test]
     fn current_origin_guard_blocks_other_surfaces_and_lookalikes_before_evaluation() {

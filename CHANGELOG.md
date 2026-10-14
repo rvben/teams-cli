@@ -7,20 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.9-alpha.1...v0.1.10-alpha.1) - 2026-10-14
+
 ### Added
 
 - macOS desktop chat reads, plain-text sends, and process-only debugging setup commands, sharing the Windows/WSL session backend.
 - Explicit desktop account-type selection with `init --desktop-account personal|work-school`, supported by helper protocol 3; mixed surfaces are refused by default.
 - Personal Teams desktop chat reads and plain-text sends on Windows and WSL, including personal/Skype profile names and signed-in user identity.
-
-### Fixed
-
-- Preserve personal identity namespaces and leave missing or conflicting viewer mappings unknown while keeping account caches isolated.
-
-## [0.1.10-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.9-alpha.1...v0.1.10-alpha.1) - 2026-10-13
-
-### Added
-
 - **desktop**: show the commands to open and close Teams' debugging port when doctor or init finds no endpoint ([4100faf](https://github.com/rvben/teams-cli/commit/4100fafd3eede3bb93e0ba6ee831433ebcc0cf81))
 - **desktop**: accept any helper that speaks the same protocol, report builds in --version and mismatches, and explain helper download failures ([6e0b22f](https://github.com/rvben/teams-cli/commit/6e0b22f84b0e4f749ced19303044a4e6df0cf6d6))
 - **tui**: show send mode, a live status dot and the account in the header, keeping counts visible on narrow terminals ([baaaf49](https://github.com/rvben/teams-cli/commit/baaaf494c10720c4262cf4c533db78427eae8462))
@@ -38,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Replace unpaired UTF-16 characters in projected desktop text so malformed cached previews cannot break a chat page.
+- Preserve personal identity namespaces and leave missing or conflicting viewer mappings unknown while keeping account caches isolated.
 - resolve desktop review regressions ([09fb74d](https://github.com/rvben/teams-cli/commit/09fb74de579f16116da420ba7cf75db5ef16acdf))
 - **desktop**: find powershell.exe in the standard Windows location when PATH omits it ([0406340](https://github.com/rvben/teams-cli/commit/04063402778cb0dbbe3e5cf16699081bd3082918))
 - **doctor**: exit with unhealthy when a check fails ([fe9bb66](https://github.com/rvben/teams-cli/commit/fe9bb66ecab88974704bb6b743ca59e97f8b75de))
