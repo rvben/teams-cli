@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/rvben/teams-cli/compare/v0.1.12...v0.1.13) - 2026-10-14
+
+### Fixed
+
+- **tui**: keep the canvas behind text so the terminal background never shows through ([596eb7b](https://github.com/rvben/teams-cli/commit/596eb7b6f79db174ba1f33e6eaf5eb345912504a))
+- **desktop**: send URLs as clickable links like Teams' compose box does ([4b46ca2](https://github.com/rvben/teams-cli/commit/4b46ca2bb2a3d466313ba2f7ce8172c6eb065dbd))
+
 ## [0.1.12](https://github.com/rvben/teams-cli/compare/v0.1.11...v0.1.12) - 2026-10-14
 
 ### Breaking Changes
