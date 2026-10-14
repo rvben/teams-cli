@@ -1,7 +1,7 @@
-// Sends one plain-text chat message through the Teams window's own GraphQL client, exactly as
-// its Send button does; Teams performs the request with its own sign-in. Evaluated as
-// `(script)(params, select)`, with JSON params and the fixed cache selector. Returns only ids,
-// timestamps and Teams' status label, never message contents.
+// Sends one plain-text chat message, with URLs as links, through the Teams window's own
+// GraphQL client, exactly as its Send button does; Teams performs the request with its own
+// sign-in. Evaluated as `(script)(params, select)`, with JSON params and the fixed cache
+// selector. Returns only ids, timestamps and Teams' status label, never message contents.
 // `{probe: true}` only reports whether this page hosts the client and sends nothing.
 async(p,select)=>{const fiber=e=>{const k=e&&Object.keys(e).find(k=>k.startsWith('__reactFiber$'));return k&&e[k]},
 client=(()=>{for(const s of['[contenteditable="true"]','#app [data-tid]','#app *']){let n=0;
@@ -21,8 +21,15 @@ directives:[{kind:'Directive',name:N('offlineAction'),arguments:[]},{kind:'Direc
 selectionSet:{kind:'SelectionSet',selections:[{...field('sendMessage'),arguments:vars.slice(0,6).map(([n])=>({kind:'Argument',name:N(n),value:V(n)})),
 directives:[],selectionSet:{kind:'SelectionSet',selections:['id','clientMessageId','originalArrivalTime','status','messageType'].map(field)}}]}}]},
 esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
+text=s=>esc(s).replace(/\r?\n/g,'<br>'),
+// A URL becomes a link the way Teams' compose box makes one; trailing punctuation and an
+// unbalanced `)` stay outside it, so "see https://x/a." links https://x/a.
+link=u=>{const h=esc(u);return'<a href="'+h+'" itemtype="http://schema.skype.com/HyperLink" rel="noreferrer noopener" title="'+h+'" target="_blank" itemid="'+crypto.randomUUID()+'">'+h+'</a>'},
+html=s=>s.split(/(https?:\/\/[^\s<>"]+)/i).map((x,i)=>{if(i%2==0)return text(x);let u=x.replace(/[.,;:!?']+$/,'');
+while(u.endsWith(')')&&u.split('(').length<u.split(')').length)u=u.slice(0,-1).replace(/[.,;:!?']+$/,'');
+return u.includes('://')&&!u.endsWith('//')?link(u)+text(x.slice(u.length)):text(x)}).join(''),
 now=String(Date.now()),
-message={replyChainId:null,clientMessageId:p.clientMessageId,content:'<p>'+esc(p.content).replace(/\r?\n/g,'<br>')+'</p>',
+message={replyChainId:null,clientMessageId:p.clientMessageId,content:'<p>'+html(p.content)+'</p>',
 computed:{amsReferences:[],cards:[],embeddedLinks:[],isExpanded:false,offlineAssets:[],mentions:[],onBehalfOf:[],urlPreview:null,appIdsToInstall:[],quotedMessages:[],blurHash:null},
 files:[],importance:'Standard',messageType:'RichText/Html',originalArrivalTime:null,policyViolation:null,subject:'',deeplinks:[],meeting:null,
 scheduledSendTime:null,targetedMsgRecipientId:null,forwardMessageIds:[],forwardMessageOriginalConvId:null,forwardedMessageContext:null,

@@ -256,6 +256,19 @@ test('a confirmed send runs once and preserves literal plain text by escaping HT
   assert.deepEqual(f.opened, [name('conversation-manager', 'account-a')]);
 });
 
+test('URLs are sent as Teams links, leaving trailing punctuation and other text escaped', async () => {
+  const f = fixture();
+  const link = (url) =>
+    `<a href="${url}" itemtype="http://schema.skype.com/HyperLink" rel="noreferrer noopener" title="${url}" target="_blank" itemid="fixture-correlation-id">${url}</a>`;
+  await f.send({
+    content: 'MR: https://x.test/a?b=1&c=2.\n(see https://x.test/wiki/A_(b)) <https://x.test/z> https://.',
+  });
+  assert.equal(
+    f.mutations[0].variables.message.content,
+    `<p>MR: ${link('https://x.test/a?b=1&amp;c=2')}.<br>(see ${link('https://x.test/wiki/A_(b)')}) &lt;${link('https://x.test/z')}&gt; https://.</p>`,
+  );
+});
+
 test('missing chats never reach the send client', async () => {
   const f = fixture();
   assert.equal((await f.send({ chat: '19:absent@thread.v2' })).error, 'not_found');
