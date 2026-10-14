@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/rvben/teams-cli/compare/v0.1.11...v0.1.12) - 2026-10-14
+
+### Breaking Changes
+
+- **desktop**: open the debugging port after confirmation and verify a chat read during init ([3eb2110](https://github.com/rvben/teams-cli/commit/3eb211042ac5eed3995a73307dd56270c06d61bb))
+
 ## [0.1.11](https://github.com/rvben/teams-cli/compare/v0.1.10-alpha.1...v0.1.11) - 2026-10-14
 
 ### Added
