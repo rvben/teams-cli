@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/rvben/teams-cli/compare/v0.1.13...v0.2.0) - 2026-10-14
+
+### Added
+
+- **desktop**: add managed browser clients and cached avatars ([319c494](https://github.com/rvben/teams-cli/commit/319c494b18c9dff98d26b2d069d4347a39d02e6b))
+
 ## [0.1.13](https://github.com/rvben/teams-cli/compare/v0.1.12...v0.1.13) - 2026-10-14
 
 ### Fixed
