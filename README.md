@@ -93,10 +93,12 @@ dragging to select text in most terminals.
 
 The TUI works with both the Graph and desktop backends. It sends only on a profile
 that allows writes (Graph without `read_only`, or desktop created with `--allow-send`),
-and only after you confirm the message with `y`; writability is checked again before
-every send. Like `messages send`, a send is never retried: if it fails, the draft is
-kept, the chat reloads so you can see whether it arrived, and nothing is resent until
-you confirm again. Drafts live in memory only.
+and pressing `enter` sends directly; writability is checked again before every send.
+Use `ctrl-j` or `alt-enter` for a new line. Multiline pastes stay in the draft until
+you press `enter` (in terminals supporting bracketed paste). Like `messages send`,
+a send is never retried: if it fails, the draft is kept, the chat reloads so you can
+see whether it arrived, and nothing is resent until you press `enter` again.
+Drafts live in memory only.
 
 The TUI is also the recovery path: an unconfigured profile, missing credential,
 expired refresh session, or Microsoft `401` opens a focused connection screen.

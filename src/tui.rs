@@ -11,8 +11,8 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -85,12 +85,22 @@ impl TerminalGuard {
     fn enter(mouse: bool) -> Result<Self, AppError> {
         enable_raw_mode()?;
         let entered = if mouse {
-            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+            execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste
+            )
         } else {
-            execute!(io::stdout(), EnterAlternateScreen)
+            execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
         };
         if let Err(error) = entered {
-            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                io::stdout(),
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -104,7 +114,7 @@ impl Drop for TerminalGuard {
         if self.mouse {
             let _ = execute!(io::stdout(), DisableMouseCapture);
         }
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
@@ -138,6 +148,10 @@ pub fn run(source: Source) -> Result<TuiExit, AppError> {
         }
         let action = match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            Event::Paste(text) => {
+                app.paste(&text);
+                Action::None
+            }
             Event::Mouse(mouse) => {
                 app.handle_mouse(mouse);
                 Action::None
@@ -249,8 +263,6 @@ enum Overlay {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Stage {
     Editing,
-    /// Enter was pressed; only `y` sends.
-    Confirming,
     Sending,
 }
 
@@ -922,14 +934,6 @@ impl App {
         };
         match compose.stage {
             Stage::Sending => {}
-            Stage::Confirming => {
-                if matches!(key.code, KeyCode::Char('y' | 'Y')) {
-                    self.send();
-                } else {
-                    compose.stage = Stage::Editing;
-                    self.notice = Notice::new(Tone::Quiet, "Not sent; keep editing.");
-                }
-            }
             Stage::Editing => match key.code {
                 KeyCode::Esc => {
                     let compose = self.compose.take().expect("composer is open");
@@ -950,7 +954,7 @@ impl App {
                             format!("Too long to send: {length} of at most {MAX_BODY} characters."),
                         );
                     } else {
-                        compose.stage = Stage::Confirming;
+                        self.send();
                     }
                 }
                 KeyCode::Backspace => {
@@ -977,6 +981,19 @@ impl App {
                 KeyCode::Char(c) if !control && c != '\0' => compose.insert(c),
                 _ => {}
             },
+        }
+    }
+
+    /// Bracketed paste is text, never a sequence of commands or send keystrokes.
+    fn paste(&mut self, text: &str) {
+        if let Some(compose) = self.compose.as_mut().filter(|c| c.stage == Stage::Editing) {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            for c in text
+                .chars()
+                .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            {
+                compose.insert(c);
+            }
         }
     }
 
@@ -1471,7 +1488,6 @@ impl App {
             body = conversation;
             let title = match compose.stage {
                 Stage::Editing => " MESSAGE ",
-                Stage::Confirming => " SEND THIS? ",
                 Stage::Sending => " SENDING ",
             };
             let block = Block::default()
@@ -1585,25 +1601,6 @@ impl App {
             frame.render_widget(Paragraph::new(prompt), status);
             let x = status.x + 9 + self.filter.width() as u16;
             frame.set_cursor_position((x.min(status.right().saturating_sub(1)), status.y));
-        } else if let Some(compose) = self
-            .compose
-            .as_ref()
-            .filter(|c| c.stage == Stage::Confirming)
-        {
-            let title = self
-                .rows
-                .iter()
-                .find(|row| row.id == compose.chat)
-                .map_or("this chat", |row| row.title.as_str());
-            let prompt =
-                format!("Send to {title} as you?  y sends  ·  any other key keeps editing");
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    render::truncate(&prompt, usize::from(status.width)),
-                    theme.accent(),
-                )),
-                status,
-            );
         } else {
             let style = match self.notice.tone {
                 Tone::Quiet => theme.muted(),
@@ -1631,7 +1628,6 @@ impl App {
                     ("ctrl-j", "new line", 1),
                     ("esc", "close, keep draft", 0),
                 ],
-                Stage::Confirming => vec![("y", "send", 0), ("any key", "keep editing", 0)],
                 Stage::Sending => vec![("ctrl-c", "quit", 1)],
             }
         } else if self.overlay == Some(Overlay::Filter) {
@@ -1739,7 +1735,7 @@ impl App {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             if self.can_send() {
-                "Nothing is sent until you confirm with y; nothing is edited or marked read."
+                "Enter sends · Ctrl-J adds a line · Esc keeps your draft."
             } else {
                 "Read-only: nothing here sends, edits or marks messages as read."
             },
@@ -2711,7 +2707,7 @@ mod tests {
     }
 
     #[test]
-    fn composing_asks_before_sending_and_the_message_appears() {
+    fn enter_sends_the_draft_and_the_message_appears() {
         let mut app = demo_app();
         app.open_selected();
         press(&mut app, KeyCode::Char('c'));
@@ -2726,20 +2722,86 @@ mod tests {
         assert!(frame_text(&mut app).contains("MESSAGE"));
 
         press(&mut app, KeyCode::Enter);
-        assert!(app.compose.as_ref().unwrap().stage == Stage::Confirming);
-        assert!(frame_text(&mut app).contains("Send to Launch room as you?"));
-        press(&mut app, KeyCode::Char('n'));
-        assert!(app.compose.as_ref().unwrap().stage == Stage::Editing);
-        assert!(app.threads["19:launch@thread.v2"].items.len() == 7);
-
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Char('y'));
         assert!(app.compose.is_none());
         assert_eq!(app.notice.text, "Sent.");
         let thread = &app.threads["19:launch@thread.v2"];
         assert_eq!(thread.items.len(), 8);
         assert_eq!(thread.items[0]["body"]["content"], "on it q r /\nshipping");
         assert!(frame_text(&mut app).contains("shipping"));
+    }
+
+    #[test]
+    fn paste_keeps_multiline_text_in_the_draft_until_enter() {
+        let mut app = demo_app();
+        app.open_selected();
+        app.paste("c accidental commands\n");
+        assert!(app.compose.is_none());
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "ab");
+        press(&mut app, KeyCode::Left);
+        app.paste("é\r\nsecond\rthird\n");
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(compose.text, "aé\nsecond\nthird\nb");
+        assert_eq!(&compose.text[..compose.cursor], "aé\nsecond\nthird\n");
+        assert_eq!(app.threads["19:launch@thread.v2"].items.len(), 7);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.compose.is_none());
+        assert_eq!(app.threads["19:launch@thread.v2"].items.len(), 8);
+    }
+
+    #[test]
+    fn sending_ignores_extra_keys_and_paste_and_failure_keeps_the_draft() {
+        let mut app = demo_app();
+        app.open_selected();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "keep this");
+        app.compose.as_mut().unwrap().stage = Stage::Sending;
+        for key in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Esc] {
+            press(&mut app, key);
+        }
+        app.paste("more\n");
+        assert_eq!(app.compose.as_ref().unwrap().text, "keep this");
+        assert_eq!(app.threads["19:launch@thread.v2"].items.len(), 7);
+        app.apply(Outcome::Sent {
+            chat: "19:launch@thread.v2".into(),
+            result: Err(AppError::Unconfirmed(
+                "Check the conversation before sending again".into(),
+            )),
+        });
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Editing);
+        assert_eq!(app.compose.as_ref().unwrap().text, "keep this");
+        assert!(app.notice.text.contains("Check the conversation"));
+        assert_eq!(app.threads["19:launch@thread.v2"].items.len(), 7);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.compose.as_ref().unwrap().text, "keep this");
+    }
+
+    #[test]
+    fn composer_rejects_oversized_drafts_and_alt_enter_inserts_a_line() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('c'));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(app.compose.as_ref().unwrap().text, "\n");
+        app.paste(&"é".repeat(MAX_BODY));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.compose.as_ref().unwrap().stage == Stage::Editing);
+        assert!(app.notice.text.contains("Too long to send"));
+    }
+
+    #[test]
+    fn composer_hints_fit_narrow_and_wide_terminals() {
+        for width in [50, 100] {
+            let mut app = demo_app();
+            app.open_selected();
+            press(&mut app, KeyCode::Char('c'));
+            let mut terminal = Terminal::new(TestBackend::new(width, 28)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            assert!(text.contains("enter send"), "{text}");
+            assert!(text.contains("esc close, keep draft"), "{text}");
+            assert!(!text.contains("SEND THIS?"));
+        }
     }
 
     #[test]
