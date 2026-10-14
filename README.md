@@ -2,7 +2,7 @@
 
 Microsoft Teams from your terminal—human-first and agent-first.
 
-`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs, with an optional experimental desktop backend that reads chats from, and can send chat messages through, a running Teams client on Windows or WSL. It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. The default Graph backend signs in as you with delegated OAuth and protects refresh credentials in your operating system's credential store. Output is readable text on a TTY and structured JSON when piped.
+`teams-cli` is a Rust CLI and TUI for everyday Microsoft Teams work through supported Microsoft Graph APIs, with an optional experimental desktop backend that reads chats from, and can send chat messages through, a running Teams client on macOS, Windows or WSL. It is designed as two equally first-class experiences over one typed core: a fast, calm terminal interface for people and a deterministic, introspectable command contract for agents. The default Graph backend signs in as you with delegated OAuth and protects refresh credentials in your operating system's credential store. Output is readable text on a TTY and structured JSON when piped.
 
 For humans, no arguments open guided onboarding on first use and the TUI afterward. For agents, no command ever waits for an undeclared prompt: `teams schema` works offline, collection sizes are caller-bounded, writes declare their effects, errors have stable kinds and exit codes, and stdout contains data only.
 
@@ -17,6 +17,18 @@ uvx teams-cli --help
 ```
 
 The PyPI distribution provides both `teams` and `teams-cli` as executable names.
+
+Install the desktop beta with an explicit version:
+
+```console
+pipx install 'teams-cli==0.1.11b1'
+# or
+cargo install teams-cli --version '0.1.11-beta.1' --locked
+# or run without installing
+uvx --from 'teams-cli==0.1.11b1' teams --help
+```
+
+The Python package version is `0.1.11b1`; the CLI reports `0.1.11-beta.1`.
 
 To work from source:
 
@@ -81,7 +93,7 @@ pane at a time, and `NO_COLOR` is respected.
 | `pgup`/`pgdn`, `g`/`G` | Page, or jump to the oldest/newest message |
 | `o` | Load older messages in the open chat |
 | `/` | Filter chats by name or last message |
-| `c` | Write a message in the open chat (`enter` to send, `ctrl-j` for a new line, `esc` to close and keep the draft) |
+| `c` | Write a message in the open chat (`enter` to review, `y` to send, `ctrl-j` for a new line, `esc` to close and keep the draft) |
 | `r` | Refresh now |
 | `?` | Show every key |
 | `q` | Quit |
@@ -187,6 +199,12 @@ teams init --profile local --backend desktop --desktop-port 19222 --desktop-acco
 teams --profile local messages send --chat '19:...@thread.v2' --body 'On my way'
 ```
 
+Personal-account read, send and readback have been tested with released binaries
+on Apple Silicon macOS, native Windows and WSL2. Work/school read, send and
+readback have also been reported working by a WSL2 user; macOS work/school cache
+reads were tested separately. See the [release validation scope](docs/releases.md#beta-validation-scope)
+for coverage and remaining limits.
+
 On macOS, Windows and WSL, `chats list` and `messages list --chat` read from the running
 Teams client's local cache: the backend evaluates one fixed, read-only script in the
 Teams page and returns projected fields (ids, topics, members, last-message previews,
@@ -216,8 +234,8 @@ next starts. The result has the Graph send shape plus `"source": "desktop"`,
 `clientMessageId` and Teams' own `status`. `doctor` checks that the send path is still
 recognised without sending anything.
 
-Teams, channels, identity, subscriptions, replies, mentions, attachments and edits
-return `unsupported` on desktop; the TUI reads chats from the same cache and sends
+Chat creation, teams, channels, identity commands, subscriptions, replies,
+mentions, attachments and edits return `unsupported` on desktop; the TUI reads chats from the same cache and sends
 through the same path as `messages send`. Existing profiles without a backend field
 continue to use Graph; Graph remains the default for `init`.
 
@@ -279,9 +297,9 @@ helper when needed. Set `TEAMS_DESKTOP_HELPER` to use another
 development checkout. If the download is blocked, fetch the
 `x86_64-pc-windows-msvc` archive from the release page, unpack `teams.exe` and point
 `TEAMS_DESKTOP_HELPER` at it.
-The already published `0.1.9-alpha.1` binary predates this helper protocol. Source
-checkouts still carrying that version use `make windows-helper` or an explicit
-compatible helper; they do not download that incompatible release.
+For older source checkouts still carrying `0.1.9-alpha.1`, use `make windows-helper`
+or an explicit compatible helper: that published binary predates protocol 3 and
+cannot serve as the helper for current source.
 
 The CLI and the helper agree on a protocol number, and any helper that speaks the CLI's
 protocol is accepted, whatever its version. When they differ, the error names both
@@ -309,7 +327,7 @@ fails with `desktop_error` rather than guessing.
 
 ## Graph boundaries
 
-- The Graph backend supports Microsoft 365 work or school accounts only. Use the experimental desktop backend on Windows or WSL for personal Microsoft accounts; the relevant Teams Graph endpoints do not support them.
+- The Graph backend supports Microsoft 365 work or school accounts only. Use the experimental desktop backend on macOS, Windows or WSL for personal Microsoft accounts; the relevant Teams Graph endpoints do not support them.
 - A work account can authenticate successfully before Microsoft Teams is licensed or provisioned; `teams doctor` distinguishes identity access from Teams availability.
 - Calling and screen sharing are not available as a delegated user CLI; Graph calling is built around bot/application scenarios.
 - No extracted desktop tokens, browser interception, or direct calls to private Teams services; the experimental desktop backend reads the local client cache and sends only through the Teams window's own client.

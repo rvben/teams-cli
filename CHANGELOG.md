@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Prepare desktop support for beta testing with explicit prerelease installation instructions, macOS setup coverage, and documented personal and work/school validation scope.
+- Clarify that desktop history is cache-bound, chat creation is unsupported, and TUI sends require confirmation.
+
 ## [0.1.10-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.9-alpha.1...v0.1.10-alpha.1) - 2026-10-14
 
 ### Added
