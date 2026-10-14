@@ -243,8 +243,9 @@ WebView2 `AdditionalBrowserArguments` policy, a string value named `ms-teams.exe
 under `HKLM\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`.
 While the port is open, any program running as you can read your chats and send as
 you, so close it when you are done.
-These commands never launch, restart, quit, or sign into Teams, and never enable
-debugging. `init --no-login` saves configuration without probing; ordinary desktop
+The WSL TUI offers to restart Teams with debugging enabled when no endpoint is
+listening. It asks for confirmation first because restarting ends active calls.
+Other commands never launch, restart, quit, or sign into Teams, or enable debugging. `init --no-login` saves configuration without probing; ordinary desktop
 initialization probes the existing endpoint. A normal Teams launch usually has no
 endpoint, which `doctor` reports as `no_listener`.
 

@@ -25,7 +25,7 @@ fn debugging_setup() -> Value {
     object_field(
         "debugging_setup",
         true,
-        "Commands for the user to run that open and close Teams' debugging port; only when nothing listens on the desktop port under Windows or WSL. Running them restarts Teams; the CLI never does",
+        "Commands for the user to run that open and close Teams' debugging port; only when nothing listens on the desktop port under Windows or WSL. Running them restarts Teams; the WSL TUI also offers a confirmed restart",
         vec![
             described(
                 field("shell", "string"),
@@ -493,7 +493,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             value["confirmation_bypass_arg"] = json!("--yes");
             value
         },
-        json!({"name":"tui", "description":"Open the keyboard-first terminal interface; Enter sends a chat message on a profile that allows writes", "effects":"non_idempotent", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
+        json!({"name":"tui", "description":"Open the keyboard-first terminal interface; offers a confirmed Teams debugging restart on WSL when no endpoint listens; Enter sends a chat message on a profile that allows writes", "effects":"non_idempotent", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
         {
             let mut value = single(
                 "doctor",

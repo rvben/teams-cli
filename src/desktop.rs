@@ -1,6 +1,6 @@
 //! Existing-endpoint diagnostics, chat reading through the Teams client's own cache, and
-//! sending plain-text chat messages through the Teams window's own client. Never launches
-//! Teams; evaluates only the fixed scripts in `desktop.js` and `desktop_send.js`.
+//! sending plain-text chat messages through the Teams window's own client. The WSL TUI
+//! can restart Teams with explicit confirmation; evaluates only the fixed scripts in `desktop.js` and `desktop_send.js`.
 //!
 //! On Windows the CLI verifies the endpoint and reads in-process. Under WSL it drives the
 //! Windows build of itself as a long-lived helper (`teams.exe desktop-helper`).
@@ -53,7 +53,7 @@ impl ProbeStatus {
     pub fn detail(self) -> &'static str {
         match self {
             Self::NoListener => {
-                "No endpoint on this port: Teams is not running with its debugging port open. `teams doctor` shows the commands to open it; the CLI never changes Teams' settings or restarts it."
+                "No endpoint on this port: Teams is not running with its debugging port open. `teams doctor` shows the commands to open it; the WSL TUI can also restart Teams after confirmation."
             }
             Self::UnsafeListenerRefused => "Refused a listener bound beyond loopback.",
             Self::NonTeamsListenerRefused => {
@@ -159,6 +159,62 @@ impl DesktopClient {
             #[cfg(not(any(windows, target_os = "macos")))]
             helper: Default::default(),
         })
+    }
+
+    /// Only offered by the TUI after a verified no-listener probe on WSL.
+    pub async fn needs_debugging_restart(&self) -> bool {
+        platform().ok() == Some("wsl_windows_helper")
+            && self
+                .probe()
+                .await
+                .is_ok_and(|probe| probe.status == ProbeStatus::NoListener)
+    }
+
+    /// Called only after the person confirms the restart in the TUI.
+    pub async fn restart_with_debugging(&self) -> Result<(), AppError> {
+        if !self.needs_debugging_restart().await {
+            return Err(AppError::Desktop(
+                "Connection changed; press r to retry before restarting Teams".into(),
+            ));
+        }
+        let setup = DebuggingSetup::for_shell("powershell", self.port);
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!("$ErrorActionPreference = 'Stop'; {}", setup.open))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), command.status())
+            .await
+            .map_err(|_| {
+                AppError::Desktop("Teams restart timed out; press r to retry the connection".into())
+            })?
+            .map_err(|_| {
+                AppError::Desktop(
+                    "Could not run PowerShell; check Windows executable interop, then press r"
+                        .into(),
+                )
+            })?;
+        if !status.success() {
+            return Err(AppError::Desktop(
+                "Could not restart Teams; press r to retry the connection".into(),
+            ));
+        }
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let probe = self.probe().await?;
+            if probe.endpoint_available() {
+                return Ok(());
+            }
+            if probe.status != ProbeStatus::NoListener {
+                return Err(AppError::Desktop(probe.status.detail().into()));
+            }
+        }
+        Err(AppError::Desktop(
+            "Teams is still starting; wait a moment, then press r to retry".into(),
+        ))
     }
 
     pub async fn probe(&self) -> Result<ConnectionMetadata, AppError> {
@@ -508,7 +564,7 @@ pub fn platform() -> Result<&'static str, AppError> {
     }
 }
 
-/// Commands for people to run themselves: the CLI never restarts Teams. macOS uses
+/// Commands for manual setup and the confirmed WSL TUI restart. macOS uses
 /// process-only environment; Windows/WSL set and clear the user's WebView2 variable.
 #[derive(Debug, Serialize)]
 pub struct DebuggingSetup {

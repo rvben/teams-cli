@@ -208,6 +208,8 @@ enum Action {
 }
 
 enum Outcome {
+    DebuggingRequired,
+    Restarted(Result<(), AppError>),
     Chats {
         more: bool,
         result: Result<Page, AppError>,
@@ -222,6 +224,13 @@ enum Outcome {
         chat: String,
         result: Result<Value, AppError>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DebuggingRestart {
+    Offered,
+    Confirming,
+    Running,
 }
 
 enum Load {
@@ -313,6 +322,7 @@ struct App {
     rows: Vec<ChatRow>,
     chat_cursor: Option<String>,
     chats_load: Load,
+    debugging_restart: Option<DebuggingRestart>,
     loading_more: bool,
     filter: String,
     /// Indices into `rows` that pass the filter, in ledger order.
@@ -358,6 +368,7 @@ impl App {
             rows: Vec::new(),
             chat_cursor: None,
             chats_load: Load::Loading,
+            debugging_restart: None,
             loading_more: false,
             filter: String::new(),
             visible: Vec::new(),
@@ -505,6 +516,8 @@ impl App {
     }
 
     fn load_chats(&mut self, more: bool) {
+        self.debugging_restart = None;
+        let initial = !more && !matches!(self.chats_load, Load::Ready);
         let cursor = if more {
             if self.loading_more || self.chat_cursor.is_none() {
                 return;
@@ -522,6 +535,13 @@ impl App {
             Some(backend) => {
                 let sender = self.outcomes.0.clone();
                 tokio::spawn(async move {
+                    if initial
+                        && let TeamsBackend::Desktop(client) = backend.as_ref()
+                        && client.needs_debugging_restart().await
+                    {
+                        let _ = sender.send(Outcome::DebuggingRequired);
+                        return;
+                    }
                     let result = backend.chats(PAGE, cursor.as_deref()).await;
                     let _ = sender.send(Outcome::Chats { more, result });
                 });
@@ -590,6 +610,22 @@ impl App {
 
     fn apply(&mut self, outcome: Outcome) {
         match outcome {
+            Outcome::DebuggingRequired => {
+                self.fetching_chats = false;
+                self.debugging_restart = Some(DebuggingRestart::Offered);
+                self.notice = Notice::new(Tone::Quiet, "Teams needs debugging enabled to connect");
+            }
+            Outcome::Restarted(result) => {
+                self.debugging_restart = None;
+                match result {
+                    Ok(()) => self.load_chats(false),
+                    Err(error) => {
+                        self.chats_load = Load::failed(&error);
+                        self.notice =
+                            Notice::new(Tone::Error, "Restart did not connect; press r to retry");
+                    }
+                }
+            }
             Outcome::Chats { more, result } => {
                 if more {
                     self.loading_more = false;
@@ -1038,10 +1074,43 @@ impl App {
         }
     }
 
+    fn restart_teams(&mut self) {
+        let Some(backend) = self.backend() else {
+            return;
+        };
+        self.debugging_restart = Some(DebuggingRestart::Running);
+        self.notice = Notice::new(
+            Tone::Quiet,
+            "Restarting Teams and waiting for the connection…",
+        );
+        let sender = self.outcomes.0.clone();
+        tokio::spawn(async move {
+            if let TeamsBackend::Desktop(client) = backend.as_ref() {
+                let _ = sender.send(Outcome::Restarted(client.restart_with_debugging().await));
+            }
+        });
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        if let Some(restart) = self.debugging_restart {
+            match (restart, key.code) {
+                (_, KeyCode::Char('q')) => return Action::Quit,
+                (DebuggingRestart::Offered, KeyCode::Enter) => {
+                    self.debugging_restart = Some(DebuggingRestart::Confirming);
+                }
+                (DebuggingRestart::Confirming, KeyCode::Char('y')) => self.restart_teams(),
+                (DebuggingRestart::Confirming, _) => {
+                    self.debugging_restart = Some(DebuggingRestart::Offered);
+                }
+                (DebuggingRestart::Offered, KeyCode::Char('r')) => self.load_chats(false),
+                (DebuggingRestart::Offered, KeyCode::Esc) => return Action::Quit,
+                _ => {}
+            }
+            return Action::None;
         }
         if self.compose.is_some() {
             self.compose_key(key);
@@ -1240,35 +1309,66 @@ impl App {
         ])
         .areas(area);
         self.draw_header(frame, header);
-        match &self.chats_load {
-            Load::Ready => {
-                if body.width >= SPLIT_WIDTH {
-                    let ledger = (body.width * 38 / 100).clamp(34, 48);
-                    let [left, right] =
-                        Layout::horizontal([Constraint::Length(ledger), Constraint::Min(30)])
-                            .areas(body);
-                    self.draw_ledger(frame, left, true);
-                    self.draw_thread(frame, right);
-                } else if self.focus == Focus::Thread {
-                    self.draw_thread(frame, body);
-                } else {
-                    self.draw_ledger(frame, body, false);
-                }
-            }
-            Load::Loading => state_panel(
+        if let Some(restart) = self.debugging_restart {
+            let (title, copy) = match restart {
+                DebuggingRestart::Offered => (
+                    "CONNECT TEAMS",
+                    "Restart Teams with debugging enabled to read your chats.",
+                ),
+                DebuggingRestart::Confirming => (
+                    "RESTART TEAMS?",
+                    "This ends any call in progress. Restart now?",
+                ),
+                DebuggingRestart::Running => (
+                    "RESTARTING TEAMS",
+                    "Waiting for Teams to open its debugging port…",
+                ),
+            };
+            state_panel(
                 frame,
                 body,
                 theme,
-                "READING CHATS",
-                vec![Line::styled(
-                    format!("{}  Asking Teams for your recent chats", self.spinner()),
-                    theme.muted(),
-                )],
-                theme.rule(),
-            ),
-            Load::Failed { message, auth } => {
-                let (title, lines) = failure_copy(theme, message, *auth);
-                state_panel(frame, body, theme, title, lines, theme.active_rule());
+                title,
+                vec![
+                    Line::styled(copy, theme.body()),
+                    Line::styled(
+                        "While enabled, programs running as you can read chats and send as you.",
+                        theme.muted(),
+                    ),
+                ],
+                theme.active_rule(),
+            );
+        } else {
+            match &self.chats_load {
+                Load::Ready => {
+                    if body.width >= SPLIT_WIDTH {
+                        let ledger = (body.width * 38 / 100).clamp(34, 48);
+                        let [left, right] =
+                            Layout::horizontal([Constraint::Length(ledger), Constraint::Min(30)])
+                                .areas(body);
+                        self.draw_ledger(frame, left, true);
+                        self.draw_thread(frame, right);
+                    } else if self.focus == Focus::Thread {
+                        self.draw_thread(frame, body);
+                    } else {
+                        self.draw_ledger(frame, body, false);
+                    }
+                }
+                Load::Loading => state_panel(
+                    frame,
+                    body,
+                    theme,
+                    "READING CHATS",
+                    vec![Line::styled(
+                        format!("{}  Asking Teams for your recent chats", self.spinner()),
+                        theme.muted(),
+                    )],
+                    theme.rule(),
+                ),
+                Load::Failed { message, auth } => {
+                    let (title, lines) = failure_copy(theme, message, *auth);
+                    state_panel(frame, body, theme, title, lines, theme.active_rule());
+                }
             }
         }
         self.draw_footer(frame, footer);
@@ -1621,7 +1721,21 @@ impl App {
     /// Key hints for the current context, dropping the least important ones
     /// first when the terminal is narrow. Lower rank means more important.
     fn hints(&self, width: usize) -> Line<'static> {
-        let mut all: Vec<(&str, &str, u8)> = if let Some(compose) = &self.compose {
+        let mut all: Vec<(&str, &str, u8)> = if let Some(restart) = self.debugging_restart {
+            match restart {
+                DebuggingRestart::Offered => vec![
+                    ("enter", "restart Teams", 0),
+                    ("r", "retry", 1),
+                    ("q", "quit", 0),
+                ],
+                DebuggingRestart::Confirming => vec![
+                    ("y", "restart Teams", 0),
+                    ("esc", "cancel", 0),
+                    ("q", "quit", 1),
+                ],
+                DebuggingRestart::Running => vec![("q", "quit", 0)],
+            }
+        } else if let Some(compose) = &self.compose {
             match compose.stage {
                 Stage::Editing => vec![
                     ("enter", "send", 0),
@@ -1659,7 +1773,8 @@ impl App {
                 ("q", "quit", 0),
             ]
         };
-        if self.compose.is_none()
+        if self.debugging_restart.is_none()
+            && self.compose.is_none()
             && self.overlay.is_none()
             && !self.sign_in_needed()
             && self.can_send()
@@ -2479,6 +2594,65 @@ fn draw_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debugging_restart_requires_confirmation_and_can_be_cancelled() {
+        let mut app = demo_app();
+        app.apply(Outcome::DebuggingRequired);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.debugging_restart == Some(DebuggingRestart::Offered));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.debugging_restart == Some(DebuggingRestart::Confirming));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.debugging_restart == Some(DebuggingRestart::Offered));
+        assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::Quit));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.debugging_restart.is_none());
+        assert!(matches!(app.chats_load, Load::Ready));
+    }
+
+    #[test]
+    fn debugging_restart_completion_recovers_or_shows_retry() {
+        let mut app = demo_app();
+        app.debugging_restart = Some(DebuggingRestart::Running);
+        app.apply(Outcome::Restarted(Err(AppError::Desktop(
+            "Restart failed".into(),
+        ))));
+        assert!(app.debugging_restart.is_none());
+        assert!(matches!(app.chats_load, Load::Failed { auth: false, .. }));
+        app.apply(Outcome::Restarted(Ok(())));
+        assert!(matches!(app.chats_load, Load::Ready));
+    }
+
+    #[test]
+    fn debugging_restart_panels_show_actions_and_consequences() {
+        for (width, height) in [(50, 14), (80, 24), (120, 30)] {
+            for state in [
+                DebuggingRestart::Offered,
+                DebuggingRestart::Confirming,
+                DebuggingRestart::Running,
+            ] {
+                let mut app = demo_app();
+                app.chats_load = Load::Loading;
+                app.debugging_restart = Some(state);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                let text = buffer_text(terminal.backend().buffer());
+                assert!(!text.contains("teams doctor"));
+                let words = text
+                    .replace('│', " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(words.contains("send as you"), "{text}");
+                assert!(text.contains("quit"), "{text}");
+                if state == DebuggingRestart::Confirming {
+                    assert!(text.contains("ends any call"), "{text}");
+                    assert!(text.contains("cancel"), "{text}");
+                }
+            }
+        }
+    }
 
     fn demo_app() -> App {
         let now: Zoned = "2026-10-13T10:15:00+02:00[Europe/Amsterdam]"
