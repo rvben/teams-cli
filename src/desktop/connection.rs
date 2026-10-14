@@ -203,6 +203,17 @@ mod mac {
         owners: Vec<String>,
     }
 
+    struct LockGuard(File);
+
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            // Another thread can spawn a child while this descriptor is open.
+            // Unlock explicitly so an inherited descriptor cannot extend the lock
+            // until that child reaches exec and closes its copy.
+            let _ = self.0.unlock();
+        }
+    }
+
     fn save(path: &std::path::Path, state: &State) -> Result<(), AppError> {
         let mut file = tempfile::NamedTempFile::new_in(path.parent().expect("state directory"))?;
         file.write_all(&serde_json::to_vec(state).map_err(|_| failure("invalid_state"))?)?;
@@ -266,6 +277,7 @@ mod mac {
             .mode(0o600)
             .open(dir.join("desktop-connection.lock"))?;
         lock.try_lock().map_err(|_| failure("busy"))?;
+        let _lock = LockGuard(lock);
         let path = dir.join("desktop-connection.json");
         let mut state: Option<State> = match std::fs::read(&path) {
             Ok(bytes) => {
@@ -378,6 +390,30 @@ mod mac {
                 previous: None,
                 owners: vec![],
             }
+        }
+        #[tokio::test]
+        async fn inherited_descriptors_do_not_extend_the_operation_lock() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("desktop-connection.lock");
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.try_lock().unwrap();
+            let inherited = file.try_clone().unwrap();
+            drop(LockGuard(file));
+            let next = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            next.try_lock()
+                .expect("the operation ended even while another descriptor survives");
+            next.unlock().unwrap();
+            drop(inherited);
         }
         #[tokio::test]
         async fn disconnect_is_idempotent_but_never_restarts_an_unmanaged_process() {

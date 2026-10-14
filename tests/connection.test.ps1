@@ -3,7 +3,7 @@
 $ErrorActionPreference = 'Stop'
 $originalProcessFlags = [Environment]::GetEnvironmentVariable('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'Process')
 $sourcePath = Join-Path $PSScriptRoot '..\src\desktop\connection.ps1'
-$source = [IO.File]::ReadAllText($sourcePath)
+$source = [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n")
 $testDir = Join-Path ([IO.Path]::GetTempPath()) ('teams-cli-fixture-' + [Guid]::NewGuid().ToString('N'))
 $source = $source.Replace("'Local\teams-cli-desktop-'", "'Local\teams-cli-fixture-$([Guid]::NewGuid().ToString('N'))-'")
 $replacements = @(
