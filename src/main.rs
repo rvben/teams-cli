@@ -99,7 +99,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     match command {
         Command::DesktopHelper => desktop::serve_helper().await,
         Command::Desktop { command } => desktop_connection(profile_arg, command, yes, out).await,
-        Command::Init(args) => init(profile_arg.unwrap_or("default"), args, out).await,
+        Command::Init(args) => init(profile_arg.unwrap_or("default"), args, yes, out).await,
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
         Command::Profile { command } => profile_command(command, yes, out),
         Command::Config { command } => config_command(profile_arg, command, out),
@@ -274,7 +274,7 @@ fn desktop_unsupported(command: &Command) -> bool {
     )
 }
 
-async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), AppError> {
+async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Result<(), AppError> {
     if args.backend == BackendKind::Desktop {
         if args.client_id.is_some()
             || args.device_code
@@ -298,24 +298,90 @@ async fn init(profile_name: &str, args: InitArgs, out: Output) -> Result<(), App
             desktop_port: args.desktop_port.unwrap_or(config::DEFAULT_DESKTOP_PORT),
             desktop_account: args.desktop_account.unwrap_or_default(),
         };
-        let path = config::save(profile_name, profile.clone())?;
-        let connection = if args.no_login {
-            None
-        } else {
-            Some(
-                DesktopClient::with_account(profile.desktop_port, profile.desktop_account)?
-                    .probe()
-                    .await?,
-            )
+        let port = profile.desktop_port;
+        let output = |path: &std::path::Path, extra: serde_json::Value| {
+            let mut value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
+                "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
+                "read_only":read_only,"desktop_port":port,"desktop_account":profile.desktop_account});
+            if let (Some(value), serde_json::Value::Object(extra)) = (value.as_object_mut(), extra)
+            {
+                value.extend(extra);
+            }
+            value
         };
-        let setup = debugging_setup(connection.as_ref(), profile.desktop_port);
-        let value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
-            "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
-            "read_only":read_only,"desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,"endpoint_available":connection.as_ref().map(|c| c.endpoint_available()),
-            "session_verified":false,"connection":connection,"debugging_setup":setup});
+        if args.no_login {
+            let path = config::save(profile_name, profile.clone())?;
+            let value = output(
+                &path,
+                serde_json::json!({"endpoint_available":null,"session_verified":false,
+                "teams_restarted":null,"chat_list_empty":null,"connection":null}),
+            );
+            return out.value(&value, || {
+                format!("Saved desktop profile '{profile_name}' without contacting Teams.\nConfig: {}\nNext: `teams --profile {profile_name} init --backend desktop` to connect", path.display())
+            });
+        }
+        // The profile is saved only once a chat read works, so a failed init leaves any
+        // existing profile of this name untouched.
+        let client = DesktopClient::with_account(port, profile.desktop_account)?;
+        let mut connection = client.probe().await?;
+        let needs_restart = !connection.endpoint_available();
+        if needs_restart {
+            if connection.status != desktop::ProbeStatus::NoListener {
+                return Err(AppError::Desktop(format!(
+                    "No profile was saved. {}",
+                    connection.status.detail()
+                )));
+            }
+            confirm_teams_restart(
+                yes,
+                Some(
+                    "Teams is not running with its debugging port open. Opening it restarts Teams, and while it is open any program running as you can read your chats and send as you. `teams desktop disconnect` closes it again.",
+                ),
+                " No profile was saved and Teams was not restarted; run init again when Teams can restart.",
+            )?;
+            desktop::connection::manage(&client, desktop::connection::Action::Connect).await?;
+        }
+        let verified = async {
+            if needs_restart {
+                connection = client.probe().await?;
+            }
+            // An open endpoint does not prove sign-in; reading a chat page does.
+            let chats = client.chats(1, None).await?;
+            let path = config::save(profile_name, profile.clone())?;
+            Ok::<_, AppError>((chats, path))
+        }
+        .await;
+        let (chats, path) = match verified {
+            Ok(verified) => verified,
+            Err(err) if needs_restart => return Err(err.with_hint(&format!(
+                "No profile was saved, and Teams' debugging port is still open; `teams desktop disconnect --port {port}` closes it."
+            ))),
+            Err(err) => return Err(err.with_hint("No profile was saved.")),
+        };
+        let chat_list_empty = chats.items.is_empty();
+        let value = output(
+            &path,
+            serde_json::json!({"endpoint_available":connection.endpoint_available(),
+            "session_verified":true,"teams_restarted":needs_restart,"chat_list_empty":chat_list_empty,
+            "connection":connection}),
+        );
         return out.value(&value, || {
-            let advice = setup.as_ref().map(|s| format!("\n\n{}", s.text())).unwrap_or_default();
-            format!("Saved desktop profile '{profile_name}'. Connection diagnostics only; sign-in and chat access are unverified.\nConfig: {}\nNext: `teams --profile {profile_name} doctor`{advice}", path.display())
+            let restarted = if needs_restart {
+                format!(" Teams was restarted with its debugging port open; `teams --profile {profile_name} desktop disconnect` closes it.")
+            } else {
+                String::new()
+            };
+            let access = if read_only {
+                "read-only; re-run init with --allow-send to send messages"
+            } else {
+                "sending allowed"
+            };
+            let reads = if chat_list_empty {
+                "the chat list is readable but empty"
+            } else {
+                "chats are readable"
+            };
+            format!("Connected desktop profile '{profile_name}' ({access}): {reads}.{restarted}\nConfig: {}\nNext: `teams --profile {profile_name}` opens your inbox", path.display())
         });
     }
     if args.desktop_port.is_some() || args.desktop_account.is_some() || args.allow_send {
@@ -700,6 +766,7 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
                     read_only: false,
                     allow_send: false,
                 },
+                false,
                 auth_output,
             )
             .await
@@ -1149,6 +1216,31 @@ fn identity_text(value: &Value) -> String {
     )
 }
 
+/// Asks before restarting Teams unless `--yes` was given; `on_refusal` is appended to
+/// the error when the restart is not confirmed.
+fn confirm_teams_restart(yes: bool, note: Option<&str>, on_refusal: &str) -> Result<(), AppError> {
+    if yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return Err(AppError::ConfirmationRequired(format!(
+            "Restarting Teams needs confirmation; pass --yes when not running in a terminal.{on_refusal}"
+        )));
+    }
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    eprint!("Restart Teams? This ends any call in progress. [y/N] ");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        return Err(AppError::ConfirmationRequired(format!(
+            "Teams restart cancelled.{on_refusal}"
+        )));
+    }
+    Ok(())
+}
+
 async fn desktop_connection(
     profile: Option<&str>,
     command: DesktopCommand,
@@ -1162,21 +1254,8 @@ async fn desktop_connection(
         DesktopCommand::Disconnect(args) => (Action::Disconnect, args),
         DesktopCommand::Recover(args) => (Action::Recover, args),
     };
-    if matches!(action, Action::Connect | Action::Disconnect) && !yes {
-        if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
-            return Err(AppError::ConfirmationRequired(
-                "Restarting Teams needs confirmation; pass --yes when not running in a terminal"
-                    .into(),
-            ));
-        }
-        eprint!("Restart Teams? This ends any call in progress. [y/N] ");
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
-            return Err(AppError::ConfirmationRequired(
-                "Teams restart cancelled".into(),
-            ));
-        }
+    if matches!(action, Action::Connect | Action::Disconnect) {
+        confirm_teams_restart(yes, None, "")?;
     }
     let port = match args.port {
         Some(port) => port,

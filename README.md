@@ -275,11 +275,16 @@ endpoint: quit Teams and relaunch it normally if its ownership was not recorded.
 
 While the port is open, any program running as you can read chats and send as you.
 The WSL TUI offers the same managed connect after explicit restart confirmation.
-`doctor` and `init` print the managed opening and closing commands when no endpoint
-is found. They do not launch Teams or verify sign-in.
-`init --no-login` saves configuration without probing; ordinary desktop
-initialization probes the existing endpoint. A normal Teams launch usually has no
-endpoint, which `doctor` reports as `no_listener`.
+`teams init --backend desktop` sets the connection up end to end. When no endpoint
+listens it runs the same managed connect after the same restart confirmation (`--yes`
+when scripted), then reads one chat page. It saves the profile only when that read
+succeeds, so `session_verified: true` means reads work, and a declined restart or a
+failed read leaves Teams and any existing profile of that name untouched. If the read
+fails after a restart, the error says the debugging port is still open and how to close
+it. `init --no-login` saves configuration without contacting Teams. `doctor` prints the
+managed opening and closing commands when no endpoint is found; it does not launch
+Teams or verify sign-in. A normal Teams launch
+usually has no endpoint, which `doctor` reports as `no_listener`.
 
 macOS checks listener binding and installed Teams process ancestry before accessing
 loopback metadata or the Teams page. On Windows, `teams.exe` checks the listener itself through the

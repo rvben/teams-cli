@@ -173,3 +173,68 @@ impl AppError {
         }
     }
 }
+
+impl AppError {
+    /// Appends `hint` to the message while keeping the error kind, so callers can say
+    /// what state a failure left behind.
+    pub fn with_hint(self, hint: &str) -> Self {
+        let add = |message: String| format!("{message} {hint}");
+        match self {
+            Self::InvalidInput(m) => Self::InvalidInput(add(m)),
+            Self::Auth(m) => Self::Auth(add(m)),
+            Self::ReadOnly(m) => Self::ReadOnly(add(m)),
+            Self::Permission(m) => Self::Permission(add(m)),
+            Self::NotFound(m) => Self::NotFound(add(m)),
+            Self::Api(m) => Self::Api(add(m)),
+            Self::NonInteractive(m) => Self::NonInteractive(add(m)),
+            Self::ConfirmationRequired(m) => Self::ConfirmationRequired(add(m)),
+            Self::Unconfirmed(m) => Self::Unconfirmed(add(m)),
+            Self::UnconfirmedSend {
+                message,
+                chat_id,
+                client_message_id,
+            } => Self::UnconfirmedSend {
+                message: add(message),
+                chat_id,
+                client_message_id,
+            },
+            Self::Unsupported(m) => Self::Unsupported(add(m)),
+            Self::Desktop(m) => Self::Desktop(add(m)),
+            Self::Unhealthy(m) => Self::Unhealthy(add(m)),
+            Self::Unexpected(m) => Self::Unexpected(add(m)),
+            Self::Io(err) => Self::Unexpected(add(err.to_string())),
+            // The rate-limit message is fixed and carries only the retry delay.
+            Self::RateLimit(_) => self,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_hint_appends_to_the_message_and_keeps_the_kind() {
+        let err = AppError::Auth("signed out".into()).with_hint("Port still open.");
+        assert_eq!(err.contract().kind, "auth");
+        assert_eq!(err.to_string(), "signed out Port still open.");
+
+        let err = AppError::Desktop("no chats".into()).with_hint("Port still open.");
+        assert_eq!(err.contract().kind, "desktop_error");
+        assert_eq!(err.to_string(), "no chats Port still open.");
+    }
+
+    #[test]
+    fn with_hint_keeps_io_errors_unexpected() {
+        let io = std::io::Error::other("disk full");
+        let err = AppError::Io(io).with_hint("Port still open.");
+        assert_eq!(err.contract().kind, "unexpected_error");
+        assert_eq!(err.to_string(), "disk full Port still open.");
+    }
+
+    #[test]
+    fn with_hint_leaves_rate_limits_alone() {
+        let err = AppError::RateLimit(Some(5)).with_hint("Port still open.");
+        assert!(matches!(err, AppError::RateLimit(Some(5))));
+    }
+}

@@ -466,3 +466,47 @@ fn lifecycle_restart_requires_confirmation_before_any_endpoint_or_app_access() {
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error"]["kind"], "invalid_input");
 }
+
+#[test]
+fn desktop_init_never_restarts_teams_or_overwrites_a_profile_without_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let seeded = cli(&temp)
+        .args(["--profile", "local", "init", "--no-login"])
+        .output()
+        .unwrap();
+    assert!(seeded.status.success(), "{seeded:?}");
+    let output = cli(&temp)
+        .args([
+            "--profile",
+            "local",
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-port",
+            "19223",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    // Plain Linux has no desktop transport; everywhere else nothing listens on the port.
+    let kind = error["error"]["kind"].as_str().unwrap();
+    assert!(
+        ["confirmation_required", "unsupported"].contains(&kind),
+        "{error}"
+    );
+    if kind == "confirmation_required" {
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("--yes") && message.contains("No profile was saved"),
+            "{message}"
+        );
+    }
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(temp.path().join("teams/config.toml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        config["profiles"]["local"]["backend"].as_str(),
+        Some("graph")
+    );
+}

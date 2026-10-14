@@ -54,7 +54,7 @@ impl ProbeStatus {
     pub fn detail(self) -> &'static str {
         match self {
             Self::NoListener => {
-                "No endpoint on this port: Teams is not running with its debugging port open. `teams doctor` shows the commands to open it; the WSL TUI can also restart Teams after confirmation."
+                "No endpoint on this port: Teams is not running with its debugging port open. `teams desktop connect` opens it by restarting Teams after confirmation (it ends any call in progress)."
             }
             Self::UnsafeListenerRefused => "Refused a listener bound beyond loopback.",
             Self::NonTeamsListenerRefused => {

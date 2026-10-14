@@ -131,7 +131,13 @@ fn command_errors(name: &str) -> &'static [&'static str] {
         "desktop_error",
     ];
     match name {
-        "init" => &["auth", "tty_required", "desktop_error"],
+        "init" => &[
+            "auth",
+            "tty_required",
+            "confirmation_required",
+            "unsupported",
+            "desktop_error",
+        ],
         "auth login" => &["auth", "tty_required", "unsupported"],
         "auth logout" => &["unsupported"],
         "auth status" => &["auth", "rate_limit", "api_error", "desktop_error"],
@@ -237,8 +243,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         {
             let mut value = single(
                 "init",
-                "Configure a Graph or experimental desktop profile",
-                "idempotent",
+                "Configure a Graph or experimental desktop profile; desktop init opens Teams' debugging port (restarting Teams after confirmation) and verifies a chat read",
+                "non_idempotent",
                 vec![
                     field("profile", "string"),
                     field("backend", "string"),
@@ -253,7 +259,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     nullable_field("endpoint_available", "boolean"),
                     nullable_field("connection", "object"),
                     field("session_verified", "boolean"),
-                    debugging_setup(),
+                    nullable_field("teams_restarted", "boolean"),
+                    nullable_field("chat_list_empty", "boolean"),
                 ],
             );
             value["args"] = json!([
@@ -269,7 +276,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 arg(
                     "--no-login",
                     "boolean",
-                    "Save configuration without sign-in or desktop endpoint access"
+                    "Save configuration without sign-in or contacting Teams"
                 ),
                 arg("--device-code", "boolean", "Use device-code sign-in"),
                 arg(
@@ -280,6 +287,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 {"name":"--read-only","type":"boolean","x-conflicts":["--allow-send"],"description":"Block remote write operations"},
                 {"name":"--allow-send","type":"boolean","x-requires":{"--backend":"desktop"},"x-conflicts":["--read-only"],"description":"Allow a desktop profile to send chat messages (desktop profiles are read-only otherwise)"}
             ]);
+            value["confirmation_bypass_arg"] = json!("--yes");
             value
         },
         {
