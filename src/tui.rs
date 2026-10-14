@@ -2323,8 +2323,14 @@ impl Theme {
         }
     }
 
+    /// Text colour only: the cell keeps the canvas, selection or header behind it. A
+    /// `Color::Reset` background here would show the terminal's own colour through the text.
     fn fg(self, foreground: Color) -> Style {
-        self.style(foreground, Color::Reset)
+        if self.color {
+            Style::default().fg(foreground)
+        } else {
+            Style::default()
+        }
     }
 
     fn canvas(self) -> Style {
@@ -2840,6 +2846,32 @@ mod tests {
         assert!(frame.contains("── Today ──"));
         assert!(frame.contains("You  09:34"));
         assert!(frame.contains("q quit"));
+    }
+
+    #[test]
+    fn colour_paints_every_cell_so_the_terminal_background_never_shows() {
+        let now: Zoned = "2026-10-13T10:15:00+02:00[Europe/Amsterdam]"
+            .parse()
+            .unwrap();
+        let mut app = App::new(Source::Demo, Theme { color: true }, now);
+        app.start();
+        let unpainted = |buffer: &ratatui::buffer::Buffer| {
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.bg == Color::Reset)
+                .count()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(unpainted(terminal.backend().buffer()), 0);
+        press(&mut app, KeyCode::Enter);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(unpainted(terminal.backend().buffer()), 0);
+        terminal
+            .draw(|frame| draw_connection(frame, Theme { color: true }, "default", true, "x"))
+            .unwrap();
+        assert_eq!(unpainted(terminal.backend().buffer()), 0);
     }
 
     #[test]
