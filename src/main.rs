@@ -296,8 +296,12 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             tenant: String::new(),
             read_only,
             allow_send: args.allow_send,
-            desktop_port: args.desktop_port.unwrap_or(config::DEFAULT_DESKTOP_PORT),
-            desktop_account: args.desktop_account.unwrap_or_default(),
+            desktop_port: args
+                .desktop_port
+                .unwrap_or_else(|| args.desktop_client.unwrap_or_default().default_port()),
+            desktop_account: args
+                .desktop_account
+                .unwrap_or_else(|| args.desktop_client.unwrap_or_default().default_account()),
             desktop_client: args.desktop_client.unwrap_or_default(),
         };
         let port = profile.desktop_port;
@@ -319,7 +323,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
                 "teams_restarted":null,"browser_started":null,"chat_list_empty":null,"connection":null}),
             );
             return out.value(&value, || {
-                format!("Saved desktop profile '{profile_name}' without contacting Teams.\nConfig: {}\nNext: `teams --profile {profile_name} init --backend desktop` to connect", path.display())
+                format!("Saved desktop profile '{profile_name}' without contacting Teams.\nConfig: {}\nNext: `teams --profile {profile_name} desktop {}` to connect", path.display(), if profile.desktop_client.is_browser() { "login" } else { "connect" })
             });
         }
         // The profile is saved only once a chat read works, so a failed init leaves any
@@ -327,11 +331,8 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
         let client = DesktopClient::from_profile(&profile)?;
         if profile.desktop_client.is_browser() {
             confirm_browser_connection(yes)?;
-            eprintln!(
-                "Sign in in the Teams browser window. It will close automatically once chats are readable, then continue headless."
-            );
             client
-                .login()
+                .login_with_progress(out.quiet)
                 .await
                 .map_err(|error| error.with_hint("No profile was saved."))?;
             let chats = client.chats(1, None).await?;
@@ -1326,13 +1327,18 @@ async fn desktop_connection(
     let port = args.port.unwrap_or_else(|| {
         selected
             .as_ref()
+            .filter(|p| p.desktop_client == kind)
             .map(|p| p.desktop_port)
-            .unwrap_or(config::DEFAULT_DESKTOP_PORT)
+            .unwrap_or_else(|| kind.default_port())
     });
     let account = selected
         .as_ref()
         .map(|p| p.desktop_account)
-        .unwrap_or_default();
+        .filter(|account| {
+            kind != config::DesktopClientKind::BrowserCore
+                || *account != config::DesktopAccount::Auto
+        })
+        .unwrap_or_else(|| kind.default_account());
     if login && !kind.is_browser() {
         return Err(AppError::InvalidInput(
             "desktop login requires --desktop-client browser".into(),
@@ -1343,7 +1349,8 @@ async fn desktop_connection(
             "--visible requires desktop connect --desktop-client browser".into(),
         ));
     }
-    if matches!(action, Action::Connect | Action::Disconnect)
+    if login
+        || matches!(action, Action::Connect | Action::Disconnect)
         || (kind.is_browser() && matches!(action, Action::Recover))
     {
         if kind.is_browser() {
@@ -1354,11 +1361,11 @@ async fn desktop_connection(
     }
     let client = DesktopClient::with_client(port, account, kind)?;
     let value = if login {
-        eprintln!(
-            "Sign in in the Teams browser window. It will close automatically once chats are readable, then continue headless."
-        );
-        client.login().await?
+        client.login_with_progress(out.quiet).await?
     } else {
+        if matches!(action, Action::Connect) {
+            client.prepare_browser(out.quiet).await?;
+        }
         connection::manage_visible(&client, action, args.visible).await?
     };
     out.value(&value, || {

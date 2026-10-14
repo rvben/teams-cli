@@ -26,6 +26,8 @@ use crate::config::{DesktopAccount, DesktopClientKind, Profile};
 pub mod browser;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod browser_core;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod browser_install;
 use crate::{error::AppError, graph::Page};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -214,7 +216,7 @@ impl DesktopClient {
         if self.kind.is_browser() {
             let mut setup = DebuggingSetup::for_shell("bash", self.port);
             setup.open = format!(
-                "teams desktop connect --desktop-client {} --port {}",
+                "teams desktop login --desktop-client {} --port {}",
                 self.kind.as_str(),
                 self.port
             );
@@ -232,7 +234,7 @@ impl DesktopClient {
     pub fn prerequisites(&self) -> Result<&'static str, AppError> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
-            browser::prerequisites()?;
+            browser::prerequisites_for(self.kind == DesktopClientKind::BrowserCore)?;
             return Ok("browser_loopback");
         }
         local_prerequisites()
@@ -281,20 +283,38 @@ impl DesktopClient {
         }
     }
 
-    /// Authenticate in a visible dedicated window, then verify the same profile headless.
+    /// Install the lightweight browser pair without launching or changing sign-in.
+    pub async fn prepare_browser(&self, quiet: bool) -> Result<(), AppError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.kind == DesktopClientKind::BrowserCore {
+            browser_install::ensure_with_progress(quiet).await?;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = quiet;
+        Ok(())
+    }
+
+    /// Authenticate visibly, then verify the same dedicated profile headless.
     pub async fn login(&self) -> Result<Value, AppError> {
+        self.login_with_progress(false).await
+    }
+
+    pub async fn login_with_progress(&self, quiet: bool) -> Result<Value, AppError> {
         if !self.kind.is_browser() {
             return Err(AppError::InvalidInput(
                 "desktop login requires --desktop-client browser".into(),
             ));
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        return browser::login(
+        return browser::login_with_progress(
             self.port,
             self.account,
             self.kind == DesktopClientKind::BrowserCore,
+            quiet,
         )
         .await;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = quiet;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Err(AppError::Unsupported(
             "browser login requires macOS or Linux (including WSL2)".into(),
@@ -325,9 +345,11 @@ impl DesktopClient {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
             return read_page(&self.browser.lock().await.read(&request).await?).map_err(|e| {
-                e.with_hint(
-                    "For browser sign-in, run `teams desktop login --desktop-client browser`",
-                )
+                e.with_hint(&format!(
+                    "Sign in again: `teams desktop login --desktop-client {} --port {}`",
+                    self.kind.as_str(),
+                    self.port
+                ))
             });
         }
         platform()?;
@@ -725,7 +747,7 @@ impl DebuggingSetup {
     pub fn text(&self) -> String {
         if self.shell == "bash" {
             return format!(
-                "Open a dedicated headless Teams browser:\n  {}\nFor first sign-in, add --visible, sign in in that window, then disconnect and reconnect headless. Close the dedicated browser:\n  {}\nThe sign-in profile is retained. While its debugging port is open, local programs can read chats and send as you.",
+                "Sign in once, then continue with a hidden Teams browser:\n  {}\nThe window closes automatically after sign-in is verified. Close the hidden browser:\n  {}\nThe sign-in profile is retained. While its debugging port is open, local programs can read chats and send as you.",
                 self.open, self.close
             );
         }

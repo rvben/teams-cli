@@ -23,6 +23,29 @@ do not bump again. Its tag starts the release workflow.
 
 Cargo and Python package versions are kept synchronized as one release unit.
 
+## Release 0.2.0
+
+The managed lightweight browser is an experimental personal-account option on
+macOS and Linux/WSL2. `teams init --backend desktop --desktop-client browser-core`
+installs a matching Chrome for Testing pair from Google's Stable channel, uses
+port 9223, and saves the CLI profile only after both visible and hidden chat reads
+succeed. No version bump is needed: 0.2.0 is already prepared.
+
+Fresh macOS onboarding passed real downloads, automatic hiding, signed-in reads,
+one-shot sends with exact ID/content readback, incoming updates from a separate
+verified client without reloading, reuse with the download network unavailable,
+stale-process reconnection, repeated login, quiet mode, and verified shutdown.
+The managed browser measured approximately 316 MiB idle process footprint in this
+short personal-account run. macOS/Linux tests and lint, and Windows cross-compilation
+cover the installer and integration. Linux signed-in use, MFA expiry, prolonged
+operation and work/school core accounts remain outside the validated scope.
+
+After publication workflows finish, verify every intended target:
+
+```sh
+vership verify 0.2.0 --targets tag,release,crates,pypi
+```
+
 ## Release 0.1.11
 
 The `0.1.11` candidate builds on the desktop implementation validated in
@@ -162,8 +185,8 @@ before claiming this automatic flow is validated on a platform.
 ## Core browser release checks
 
 `browser-core` is an opt-in, build-pinned personal-account route. It requires
-matching Chrome for Testing / chrome-headless-shell executables and a separate
-private profile. A startup verifies the retained data client with a fresh chat
+a matching Chrome for Testing / chrome-headless-shell pair (automatically
+installed from Google on first setup) and a separate private profile. A startup verifies the retained data client with a fresh chat
 query before allowing cache reads or sends. Unknown bootstrap hashes and missing
 readiness markers refuse operations; there is no automatic full-UI fallback.
 

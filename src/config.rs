@@ -50,6 +50,20 @@ pub enum DesktopClientKind {
 }
 
 impl DesktopClientKind {
+    pub fn default_port(self) -> u16 {
+        if self == Self::BrowserCore {
+            9223
+        } else {
+            DEFAULT_DESKTOP_PORT
+        }
+    }
+    pub fn default_account(self) -> DesktopAccount {
+        if self == Self::BrowserCore {
+            DesktopAccount::Personal
+        } else {
+            DesktopAccount::Auto
+        }
+    }
     pub fn is_browser(self) -> bool {
         matches!(self, Self::Browser | Self::BrowserCore)
     }

@@ -94,7 +94,15 @@ pub fn executable() -> Result<PathBuf, AppError> {
 }
 
 pub fn prerequisites() -> Result<(), AppError> {
-    executable()?;
+    prerequisites_for(false)
+}
+
+pub fn prerequisites_for(core: bool) -> Result<(), AppError> {
+    if core {
+        super::browser_install::installed().map_err(|error| failed(&format!("The lightweight browser is not ready: {error}. Run `teams desktop login --desktop-client browser-core` to set it up.")))?;
+    } else {
+        executable()?;
+    }
     #[cfg(target_os = "macos")]
     if !Path::new("/usr/sbin/lsof").is_file() {
         return Err(failed("lsof is required to verify the browser listener"));
@@ -108,35 +116,26 @@ pub fn prerequisites() -> Result<(), AppError> {
     Ok(())
 }
 
-fn shell_executable() -> Result<PathBuf, AppError> {
-    let path = std::env::var_os("TEAMS_DESKTOP_HEADLESS_BROWSER")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .ok_or_else(|| failed("browser-core requires TEAMS_DESKTOP_HEADLESS_BROWSER: absolute path to chrome-headless-shell matching the visible Chrome for Testing version"))?;
-    let path = std::fs::canonicalize(path).map_err(|_| failed("headless shell does not exist"))?;
-    if path
-        .file_name()
-        .is_none_or(|n| n != "chrome-headless-shell")
-    {
-        return Err(failed(
-            "browser-core requires the actual chrome-headless-shell executable",
-        ));
-    }
-    Ok(path)
-}
-
 fn session_executable(core: bool, visible: bool) -> Result<PathBuf, AppError> {
-    if core && !visible {
-        shell_executable()
+    if core {
+        let (chrome, shell) = super::browser_install::installed()?;
+        Ok(if visible { chrome } else { shell })
     } else {
         executable()
     }
 }
 
-fn browser_version(path: &Path) -> Result<String, AppError> {
+pub(super) fn browser_version(path: &Path) -> Result<String, AppError> {
     let output = Command::new(path).arg("--version").output()?;
     if !output.status.success() {
-        return Err(failed("could not inspect browser version"));
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(400)
+            .collect::<String>();
+        return Err(failed(&format!(
+            "The browser could not start: {}. On Linux, install the Chrome system libraries named in this error and retry setup.",
+            detail.trim()
+        )));
     }
     String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
@@ -151,7 +150,9 @@ fn validate_core(account: DesktopAccount) -> Result<(), AppError> {
             "browser-core currently requires --desktop-account personal",
         ));
     }
-    if browser_version(&executable()?)? != browser_version(&shell_executable()?)? {
+    if browser_version(&session_executable(true, true)?)?
+        != browser_version(&session_executable(true, false)?)?
+    {
         return Err(failed(
             "visible browser and headless shell must have exactly matching versions",
         ));
@@ -228,7 +229,7 @@ impl Verifier for BrowserSystem {
     }
 
     async fn verify(&self, port: u16) -> Result<(ConnectionMetadata, Vec<Value>), AppError> {
-        prerequisites()?;
+        prerequisites_for(self.core)?;
         let mut metadata = ConnectionMetadata::empty(port);
         let sockets = system::listeners(port)?;
         if sockets.is_empty() {
@@ -285,6 +286,10 @@ fn launch_args(
     if core && cfg!(target_os = "macos") {
         args.push("--use-mock-keychain".into());
     }
+    #[cfg(target_os = "linux")]
+    if visible && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        args.push("--ozone-platform-hint=auto".into());
+    }
     if !visible {
         args.push("--headless=new".into());
         if core {
@@ -312,7 +317,7 @@ impl Drop for Guard {
     }
 }
 
-fn prepare_directory(dir: &Path) -> Result<(), AppError> {
+pub(super) fn prepare_directory(dir: &Path) -> Result<(), AppError> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -321,7 +326,7 @@ fn prepare_directory(dir: &Path) -> Result<(), AppError> {
     validate_directory(dir)
 }
 
-fn validate_directory(dir: &Path) -> Result<(), AppError> {
+pub(super) fn validate_directory(dir: &Path) -> Result<(), AppError> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(dir)?;
     let me = system::uid()?;
@@ -345,11 +350,11 @@ trait LoginSession {
 async fn login_flow(session: &mut impl LoginSession) -> Result<(), AppError> {
     session.connect(true).await?;
     session.wait_read(Duration::from_secs(300)).await.map_err(|error| error.with_hint(
-        "The visible browser and its profile were preserved. Finish signing in and retry desktop login --desktop-client browser."))?;
+        "The visible browser and its profile were preserved. Finish signing in and retry the sign-in command."))?;
     session.disconnect().await?;
     session.connect(false).await?;
     session.wait_read(Duration::from_secs(60)).await.map_err(|error| error.with_hint(
-        "The headless browser and saved profile were preserved. Retry desktop login --desktop-client browser to sign in visibly again."))
+        "The headless browser and saved profile were preserved. Retry the sign-in command to open the visible window again."))
 }
 
 struct BrowserLogin {
@@ -363,6 +368,13 @@ impl LoginSession for BrowserLogin {
         // An existing session can be reused in its current mode. A mode change
         // closes only the verified managed browser and keeps its profile.
         let dir = directory(self.port)?;
+        if let Some(state) = load(&dir, self.port)?
+            && state.core == self.core
+            && !owned(&state, &dir)
+            && system::listeners(self.port)?.is_empty()
+        {
+            manage(self.port, self.account, Action::Recover, false, self.core).await?;
+        }
         if let Some(state) = load(&dir, self.port)?
             && state.visible != visible
         {
@@ -422,7 +434,25 @@ fn login_read_ready(reply: &Value) -> Result<bool, AppError> {
 }
 
 pub async fn login(port: u16, account: DesktopAccount, core: bool) -> Result<Value, AppError> {
-    prerequisites()?;
+    login_with_progress(port, account, core, false).await
+}
+
+pub async fn login_with_progress(
+    port: u16,
+    account: DesktopAccount,
+    core: bool,
+    quiet: bool,
+) -> Result<Value, AppError> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Err(failed(
+            "Visible sign-in needs a display. On WSL2, enable WSLg; on Linux, run from a desktop session.",
+        ));
+    }
+    if core {
+        super::browser_install::ensure_with_progress(quiet).await?;
+    }
+    prerequisites_for(core)?;
     let dir = directory(port)?;
     prepare_directory(&dir)?;
     let lock = OpenOptions::new()
@@ -435,12 +465,17 @@ pub async fn login(port: u16, account: DesktopAccount, core: bool) -> Result<Val
     lock.try_lock()
         .map_err(|_| failed("another browser login is running"))?;
     let _guard = Guard(lock);
+    if !quiet {
+        eprintln!(
+            "Opening Teams sign-in. Complete sign-in in the window; it will hide automatically once your chats are ready."
+        );
+    }
     login_flow(&mut BrowserLogin {
         port,
         account,
         core,
     })
-    .await?;
+    .await.map_err(|error| error.with_hint(&format!("Retry sign-in: `teams desktop login --desktop-client {} --port {port}`. To close this dedicated browser: `teams desktop disconnect --desktop-client {} --port {port}`.", if core { "browser-core" } else { "browser" }, if core { "browser-core" } else { "browser" })))?;
     let mut value = manage(port, account, Action::Status, false, core).await?;
     value["session_verified"] = json!(true);
     Ok(value)
@@ -453,7 +488,10 @@ pub async fn manage(
     visible: bool,
     core: bool,
 ) -> Result<Value, AppError> {
-    prerequisites()?;
+    if core && matches!(action, Action::Connect) {
+        super::browser_install::ensure().await?;
+    }
+    prerequisites_for(core)?;
     let dir = directory(port)?;
     prepare_directory(&dir)?;
     prepare_directory(&profile(&dir))?;
@@ -479,6 +517,16 @@ pub async fn manage(
         Action::Connect => {
             if core {
                 validate_core(account)?;
+            }
+            // A dead/reused owner with an empty port can be forgotten without
+            // touching a process. Unrecorded startups and occupied ports still refuse.
+            if state
+                .as_ref()
+                .is_some_and(|s| s.owner.is_some() && !owned(s, &dir))
+                && system::listeners(port)?.is_empty()
+            {
+                std::fs::remove_file(dir.join("connection.json"))?;
+                state = None;
             }
             if let Some(current) = state.as_ref() {
                 if !owned(current, &dir) {
@@ -984,7 +1032,7 @@ mod tests {
             ..Default::default()
         };
         let error = login_flow(&mut session).await.unwrap_err();
-        assert!(error.to_string().contains("Retry desktop login"));
+        assert!(error.to_string().contains("Retry the sign-in command"));
         assert_eq!(session.events.last(), Some(&"read-headless"));
     }
 

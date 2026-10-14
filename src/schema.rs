@@ -271,9 +271,9 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             );
             value["args"] = json!([
                 {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics, chats and opt-in chat sending"},
-                {"name":"--desktop-port","type":"integer","description":"Existing loopback endpoint port (desktop only; default 9222)","x-minimum":1024,"x-maximum":65535},
-                {"name":"--desktop-client","type":"string","enum":["native","browser","browser-core"],"default":"native","description":"Native Teams or a dedicated Chrome/Edge profile (macOS/Linux/WSL2); browser connects run headless unless --visible"},
-                {"name":"--desktop-account","type":"string","enum":["auto","personal","work-school"],"default":"auto","description":"Select the Teams account surface; multiple cached accounts within it remain unsupported"},
+                {"name":"--desktop-port","type":"integer","description":"Loopback endpoint port (desktop only; native/browser default 9222, browser-core default 9223)","x-minimum":1024,"x-maximum":65535},
+                {"name":"--desktop-client","type":"string","enum":["native","browser","browser-core"],"default":"native","description":"Native Teams, installed Chrome/Edge, or a managed lightweight browser; core defaults to personal and downloads a matching browser pair on first sign-in"},
+                {"name":"--desktop-account","type":"string","enum":["auto","personal","work-school"],"default":"auto","description":"Select the Teams account surface; defaults to personal for browser-core, auto otherwise; multiple cached accounts remain unsupported"},
                 arg(
                     "--client-id",
                     "string",
@@ -760,7 +760,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
 pub fn backend_capabilities() -> Value {
     json!({
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
-        "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl","linux"],"clients":{"native":["macos","windows","wsl"],"browser":["macos","linux","wsl"],"browser-core":["macos","linux","wsl"]},"browser_validation":"experimental; core personal messaging validated on macOS only","browser_core":{"account_types":["personal"],"bootstrap":"build-pinned; unknown builds refused","browser_versions":"matching Chrome for Testing and chrome-headless-shell","live_validation":["macos-personal"]},
+        "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl","linux"],"clients":{"native":["macos","windows","wsl"],"browser":["macos","linux","wsl"],"browser-core":["macos","linux","wsl"]},"browser_validation":"experimental; core personal messaging validated on macOS only","browser_core":{"account_types":["personal"],"bootstrap":"build-pinned; unknown builds refused","browser_versions":"automatically installed matching Chrome for Testing and chrome-headless-shell; paired path overrides supported","live_validation":["macos-personal"]},
             "account_types":["Microsoft 365 work or school","personal Microsoft accounts"],"account_selection":"account_type_then_single_account_only",
             "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","managed connect/status/disconnect/recover","delivery reconciliation by client message ID","chats (macos, windows, wsl; browser also on linux)","chat messages (macos, windows, wsl; browser also on linux)","send plain-text chat messages (macos, windows, wsl; browser also on linux; opt-in)","TUI (macos, windows, wsl; browser also on linux)"],
             "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","unconfirmed Teams launch or restart"],

@@ -52,6 +52,16 @@ teams init
 teams init
 ```
 
+For a personal Microsoft account with the lightweight hidden browser:
+
+```console
+teams init --profile personal --backend desktop --desktop-client browser-core
+```
+
+This downloads its browsers automatically, opens visible sign-in once, and then
+runs hidden. See [lightweight browser setup](#low-memory-browser-client-experimental)
+for sending, reconnecting, and experimental compatibility limits.
+
 Browser PKCE is the human-friendly default. The browser talks directly to Microsoft, and the CLI never receives or stores your password. Normal sign-in requests these delegated scopes:
 
 ```text
@@ -409,27 +419,50 @@ validation does not establish browser-client compatibility.
 ### Low-memory browser client (experimental)
 
 `--desktop-client browser-core` keeps the authenticated Teams data runtime without
-starting the main UI. It currently requires `--desktop-account personal` and the
+starting the main UI. It supports personal accounts only and requires the
 exact Teams Personal bootstrap build validated by this CLI. Unknown builds fail
 with `desktop_error`; the CLI does not fall back to old cache data or the full UI.
 Use `--desktop-client browser` on a separate port for the full web client.
 
-Install matching versions of **Chrome for Testing** and **chrome-headless-shell**,
-then point the CLI to both actual executables:
+Start with one command:
 
 ```console
-export TEAMS_DESKTOP_BROWSER=/absolute/path/to/chrome
-export TEAMS_DESKTOP_HEADLESS_BROWSER=/absolute/path/to/chrome-headless-shell
-teams init --profile core --backend desktop --desktop-client browser-core --desktop-account personal --desktop-port 9333 --yes
-# Sign in visibly; the CLI verifies the core client before continuing headless.
-teams --profile core chats list
-teams --profile core desktop disconnect --yes
+teams init --profile core --backend desktop --desktop-client browser-core
 ```
 
-The two browser versions must match exactly. Downloads are managed by you; the CLI
-does not download or alter your browser installation. Linux/WSL2 use Linux binaries
-and need a display for sign-in. A port has one browser mode; disconnect with its
-original mode before changing it. Use a separate port/profile for core mode.
+The CLI downloads a matching **Chrome for Testing / chrome-headless-shell** pair
+from Google's official Stable channel on first setup, opens a separate sign-in
+window, and hides it once chats are readable. It verifies the hidden session before
+saving your CLI profile. Core mode defaults to a personal account, port **9223**,
+and read-only access; add `--allow-send` to enable sending. Your normal browser,
+its profile, and the native Teams connection on port 9222 are left alone.
+
+Browser binaries and sign-in state live in a private `teams-cli/browser` data
+directory. The installed pair is reused offline and is not silently updated while
+sessions are running. Setup needs roughly 1 GiB of disk space for the browsers and
+extraction; the ZIP downloads are removed after installation. Linux/WSL2 need a
+desktop display (WSLg on WSL2) for initial sign-in.
+
+```console
+teams --profile core desktop login       # Sign in again; automatically hide afterward
+teams --profile core desktop disconnect  # Stop the browser; retain sign-in
+teams --profile core desktop connect     # Start hidden using the saved session
+teams --profile core desktop status      # Inspect process and recovery state
+```
+
+An interrupted sign-in retains the dedicated window and profile. Rerun `desktop
+login` to finish; an expired hidden session can use the same command. A stale
+process record is recovered automatically only when its port has no listener;
+unrelated or changed processes are refused. `desktop recover` preserves sign-in
+and can close only a verified managed browser. The status command does not prove
+that you are signed in; `chats list` or `doctor` verifies message access.
+
+Advanced setups can override both `TEAMS_DESKTOP_BROWSER` and
+`TEAMS_DESKTOP_HEADLESS_BROWSER` with absolute paths to matching executables.
+Set both or neither; a partial override is refused. `TEAMS_DESKTOP_BROWSER_DATA_DIR`
+changes the private data location. Keep these settings stable while a session is
+running. Unknown Teams builds are refused; use the full `browser` client on its
+own port if your Teams build is not yet supported.
 
 On macOS, both dedicated test browsers use mock-keychain encryption because the
 headless shell uses it. This profile contains sensitive login state and remains in
@@ -449,7 +482,7 @@ Sending still requires `init --allow-send` and the existing send confirmation.
 - The Graph backend supports Microsoft 365 work or school accounts only. Use the experimental desktop backend on macOS, Windows or WSL for personal Microsoft accounts; the relevant Teams Graph endpoints do not support them.
 - A work account can authenticate successfully before Microsoft Teams is licensed or provisioned; `teams doctor` distinguishes identity access from Teams availability.
 - Calling and screen sharing are not available as a delegated user CLI; Graph calling is built around bot/application scenarios.
-- No extracted desktop tokens, browser interception, or direct calls to private Teams services; the experimental desktop backend reads the local client cache and sends only through the Teams window's own client.
+- No extracted desktop tokens or direct calls to private Teams services; the experimental desktop backend reads the local client cache and sends only through the Teams window's own client.
 - Tenant policy and admin consent can restrict delegated capabilities.
 
 ## CLI Spec

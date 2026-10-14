@@ -669,8 +669,6 @@ fn core_client_is_explicit_and_requires_personal_account_before_launch() {
             "desktop",
             "--desktop-client",
             "browser-core",
-            "--desktop-account",
-            "personal",
             "--no-login",
         ])
         .assert()
@@ -678,6 +676,8 @@ fn core_client_is_explicit_and_requires_personal_account_before_launch() {
     let output = cli(&temp).args(["config", "show"]).output().unwrap();
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["desktop_client"], "browser_core");
+    assert_eq!(value["desktop_account"], "personal");
+    assert_eq!(value["desktop_port"], 9223);
     assert_eq!(value["read_only"], true);
     let output = cli(&temp).args(["desktop", "connect"]).output().unwrap();
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();

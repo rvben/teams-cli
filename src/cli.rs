@@ -9,7 +9,9 @@ use crate::output::OutputFormat;
     version,
     long_version = env!("TEAMS_LONG_VERSION"),
     about = "Microsoft Teams from your terminal, for humans and agents",
-    after_help = "Get started:\n  teams init                         Guided setup\n  teams tui --demo                   Explore without an account\n  teams doctor                       Diagnose configuration and access\n  teams schema --command 'messages send'\n                                     Inspect the automation contract"
+    after_help = "Get started:\n  teams init                         Guided setup\n  teams init --backend desktop --desktop-client browser-core
+                                     Lightweight browser, personal account
+  teams tui --demo                   Explore without an account\n  teams doctor                       Diagnose configuration and access\n  teams schema --command 'messages send'\n                                     Inspect the automation contract"
 )]
 pub struct Cli {
     /// Config profile to use
