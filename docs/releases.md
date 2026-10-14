@@ -84,6 +84,13 @@ interrupted setup, external setting changes, conflicting owners, changed
 processes, existing debugging flags and repeated disconnects. These checks use
 isolated records and simulated platform effects.
 
+WSL live checks also covered restart confirmation and cancellation with Windows
+PATH entries removed, one TUI send with exact readback, and native Windows
+disconnect after WSL TUI use. The final lifecycle run restored normal Teams,
+closed the debugging port and cleared the recovery record without fallback.
+Windows fixtures additionally cover auxiliary processes appearing or exiting,
+reused process IDs, changed listener ownership and a rebound port during cleanup.
+
 The tested personal Teams cache omitted delivery status even when the exact
 message was present. Readback therefore reported `found: true` and delivery
 `unknown`; cache presence alone is not a delivery receipt. Each real send was

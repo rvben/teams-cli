@@ -1,6 +1,7 @@
 # Exercise the production state machine with isolated files and fake platform effects.
 # No user environment value or Teams process may be touched by these fixtures.
 $ErrorActionPreference = 'Stop'
+$originalProcessFlags = [Environment]::GetEnvironmentVariable('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'Process')
 $sourcePath = Join-Path $PSScriptRoot '..\src\desktop\connection.ps1'
 $source = [IO.File]::ReadAllText($sourcePath)
 $testDir = Join-Path ([IO.Path]::GetTempPath()) ('teams-cli-fixture-' + [Guid]::NewGuid().ToString('N'))
@@ -21,7 +22,7 @@ foreach ($pair in $replacements) {
 if ($source.Contains('[Environment]::SetEnvironmentVariable') -or $source.Contains('Stop-Process -Id') -or $source.Contains("Start-Process 'shell:")) { throw 'unsafe_fixture_adapter' }
 $marker = "try {`n    try { `$locked"
 if (!$source.Contains($marker)) { throw 'fixture_override_point_changed' }
-$source = $source.Replace($marker, "function Processes { `$script:processes }`nfunction Start-Sleep { }`n" + $marker)
+$source = $source.Replace($marker, "function Processes { `$script:processes }`nfunction Listener-Owners { if (`$script:listenerRoot) { `$script:listenerRoot } }`nfunction Start-Sleep { }`n" + $marker)
 $script:flags = $null
 $script:processes = @([PSCustomObject]@{id=1;started='original'})
 $script:starts = 0
@@ -29,11 +30,16 @@ $script:stops = 0
 $script:failStart = $false
 function Test-GetFlags { $script:flags }
 function Test-SetFlags($value) { $script:flags = $value }
-function Test-StopTeams($processId) { $script:stops++; $script:processes = @() }
+function Test-StopTeams($processId) {
+    $script:stops++
+    $script:processes = @($script:processes | Where-Object { $_.id -ne $processId })
+    if ($script:listenerRoot -eq $processId) { $script:listenerRoot = $script:replacementListener }
+}
 function Test-StartTeams {
     if ($script:failStart) { throw 'private_platform_error_must_not_escape' }
     $script:starts++
-    $script:processes = @([PSCustomObject]@{id=100+$script:starts;started=('generation'+$script:starts)})
+    $script:processes += @([PSCustomObject]@{id=100+$script:starts;started=('generation'+$script:starts)})
+    $script:listenerRoot = $(if ($env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS -match '--remote-debugging-port=') { 100+$script:starts } else { 0 })
 }
 function Invoke-Operation($action, $port=19222, $token=$null, $restart=$false) {
     $request = [PSCustomObject]@{action=$action;port=$port;token=$token;restart=$restart}
@@ -45,7 +51,7 @@ function Invoke-Operation($action, $port=19222, $token=$null, $restart=$false) {
 function Check($condition, $name) { if (!$condition) { throw ('fixture_failed_'+$name) }; $script:checks++ }
 function Reset-Fixture($prior=$null) {
     if (Test-Path -LiteralPath $testDir) { Remove-Item -Recurse -LiteralPath $testDir }
-    $script:flags=$prior; $script:processes=@([PSCustomObject]@{id=1;started='original'}); $script:starts=0; $script:stops=0; $script:failStart=$false
+    $script:flags=$prior; $script:processes=@([PSCustomObject]@{id=1;started='original'}); $script:starts=0; $script:stops=0; $script:failStart=$false; $script:listenerRoot=0; $script:replacementListener=0
 }
 $script:checks = 0
 try {
@@ -87,8 +93,37 @@ try {
     $null=Invoke-Operation 'connect' 19222 'owner-a'
     $null=Invoke-Operation 'finish' 19222 'owner-a'
     $script:processes=@([PSCustomObject]@{id=999;started='independent-restart'})
+    $script:listenerRoot=999
     Check ((Invoke-Operation 'disconnect' 19222 $null $true).error -eq 'session_changed') 'changed_process_preserved'
     Check ($script:starts -eq 1) 'changed_process_not_restarted'
+    Reset-Fixture
+    $null=Invoke-Operation 'connect' 19222 'owner-a'
+    $null=Invoke-Operation 'finish' 19222 'owner-a'
+    $script:processes+=@([PSCustomObject]@{id=999;started='auxiliary'})
+    $r=Invoke-Operation 'disconnect' 19222 $null $true
+    Check (!$r.managed -and @($script:processes|Where-Object id -eq 999).Count -eq 1) 'additional_process_preserved'
+    Reset-Fixture
+    $null=Invoke-Operation 'connect' 19222 'owner-a'
+    $script:processes+=@([PSCustomObject]@{id=999;started='temporary'})
+    $null=Invoke-Operation 'finish' 19222 'owner-a'
+    $script:processes=@($script:processes|Where-Object id -ne 999)
+    Check (!(Invoke-Operation 'disconnect' 19222 $null $true).managed) 'exited_auxiliary_does_not_block_listener_owner'
+    Reset-Fixture
+    $null=Invoke-Operation 'connect' 19222 'owner-a'
+    $null=Invoke-Operation 'finish' 19222 'owner-a'
+    $script:processes+=@([PSCustomObject]@{id=999;started='independent'})
+    $script:listenerRoot=999
+    Check ((Invoke-Operation 'disconnect' 19222 $null $true).error -eq 'session_changed' -and $script:stops -eq 1) 'unowned_listener_not_adopted'
+    Reset-Fixture
+    $null=Invoke-Operation 'connect' 19222 'owner-a'
+    $null=Invoke-Operation 'finish' 19222 'owner-a'
+    $script:processes=@([PSCustomObject]@{id=101;started='reused-pid'})
+    Check ((Invoke-Operation 'disconnect' 19222 $null $true).error -eq 'session_changed' -and $script:stops -eq 1) 'reused_pid_not_stopped'
+    Reset-Fixture
+    $null=Invoke-Operation 'connect' 19222 'owner-a'
+    $null=Invoke-Operation 'finish' 19222 'owner-a'
+    $script:replacementListener=999
+    Check ((Invoke-Operation 'disconnect' 19222 $null $true).error -eq 'session_changed' -and (Invoke-Operation 'status').managed) 'port_rebound_keeps_recovery_record'
     Reset-Fixture '--remote-debugging-port=9333'
     Check ((Invoke-Operation 'connect' 19222 'owner-a').error -eq 'existing_flags') 'existing_debug_session_preserved'
     Check ($script:flags -ceq '--remote-debugging-port=9333' -and $script:starts -eq 0) 'existing_flags_untouched'
@@ -98,5 +133,6 @@ try {
     Check ((Invoke-Operation 'disconnect' 19222 $null $true).error -eq 'not_managed' -and $script:starts -eq 0) 'unmanaged_process_not_restarted'
     [PSCustomObject]@{status='passed';checks=$script:checks;real_user_environment_changes=0;real_teams_restarts=0}|ConvertTo-Json -Compress
 } finally {
+    [Environment]::SetEnvironmentVariable('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', $originalProcessFlags, 'Process')
     if (Test-Path -LiteralPath $testDir) { Remove-Item -Recurse -LiteralPath $testDir }
 }

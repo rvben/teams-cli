@@ -255,7 +255,8 @@ teams --profile local desktop disconnect
 Connect and disconnect ask before restarting Teams because a restart ends active
 calls; pass `--yes` for a scripted restart. `--port` overrides the selected profile's
 port. An existing verified endpoint is inspected without being adopted; disconnect
-only restarts the same Teams process recorded by a managed connect. If Teams was
+only restarts recorded Teams processes that still own the debugging listener.
+Added auxiliary processes are left alone. If Teams was
 restarted independently, quit and relaunch it normally, then disconnect again to
 clear the old record. No command automatically restarts Teams on exit.
 

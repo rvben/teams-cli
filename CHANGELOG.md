@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Keep multiline bracketed pastes in the TUI draft until Enter is pressed, preserve drafts after failed sends, and ignore additional input while sending.
 - Render Teams' formatting whitespace after HTML line breaks without adding an extra blank line.
+- Keep managed Windows/WSL disconnect working when Teams starts auxiliary processes, while refusing changed listener owners and reused process IDs.
 
 ## [0.1.10-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.9-alpha.1...v0.1.10-alpha.1) - 2026-10-14
 

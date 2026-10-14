@@ -27,6 +27,25 @@ function Processes {
         }
     })
 }
+function Listener-Owners([int]$port) {
+    $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+    if ($listeners.Count -eq 0) { return }
+    $processes = @{}
+    foreach ($process in (Get-CimInstance Win32_Process)) { $processes[[int]$process.ProcessId] = $process }
+    foreach ($listener in $listeners) {
+        $processId = [int]$listener.OwningProcess
+        $seen = @{}
+        $found = $false
+        for ($depth = 0; $depth -lt 32; $depth++) {
+            if ($processId -eq 0 -or $seen.ContainsKey($processId) -or !$processes.ContainsKey($processId)) { break }
+            $seen[$processId] = $true
+            $process = $processes[$processId]
+            if ($process.Name -ieq 'ms-teams.exe') { $processId; $found = $true; break }
+            $processId = [int]$process.ParentProcessId
+        }
+        if (!$found) { throw 'session_changed' }
+    }
+}
 function Restore-Settings {
     $current = [Environment]::GetEnvironmentVariable($key, 'User')
     if ($current -ceq $script:state.installed) {
@@ -92,12 +111,20 @@ try {
             if ($request.restart) {
                 $current = @(Processes)
                 $owned = @($script:state.owners)
-                if ($owned.Count -eq 0 -or $current.Count -ne $owned.Count) { throw 'session_changed' }
-                foreach ($owner in $current) {
-                    if (!($owned | Where-Object { $_.id -eq $owner.id -and $_.started -ceq $owner.started })) { throw 'session_changed' }
+                $matching = @($current | Where-Object {
+                    $candidate = $_
+                    @($owned | Where-Object { $_.id -eq $candidate.id -and $_.started -ceq $candidate.started }).Count -gt 0
+                })
+                $listeners = @(Listener-Owners $request.port)
+                if ($matching.Count -eq 0 -or $listeners.Count -eq 0) { throw 'session_changed' }
+                foreach ($processId in $listeners) {
+                    if (!($matching | Where-Object { $_.id -eq $processId })) { throw 'session_changed' }
                 }
-                foreach ($owner in $current) { Stop-Process -Id $owner.id -ErrorAction Stop }
+                # Teams may add auxiliary processes after startup. Only recorded
+                # identities are ours; the verified listener must still belong to one.
+                foreach ($owner in $matching) { Stop-Process -Id $owner.id -ErrorAction Stop }
                 Start-Sleep -Seconds 2
+                if (@(Listener-Owners $request.port).Count -gt 0) { throw 'session_changed' }
                 # Set only this launch's environment; the previous user value is already restored.
                 $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $script:state.previous
                 Start-Process 'shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams'
