@@ -23,34 +23,32 @@ do not bump again. Its tag starts the release workflow.
 
 Cargo and Python package versions are kept synchronized as one release unit.
 
-## Alpha and beta releases
+## Release 0.1.11
 
-Use a prerelease while desktop support relies on experimental Teams internals.
-The `0.1.11-beta.1` candidate promotes the desktop implementation validated in
-`0.1.10-alpha.1`, with clearer setup, installation and support boundaries. It
-supports cached chat reads and opt-in plain-text sends through Teams on macOS,
-Windows and WSL. The Windows helper speaks protocol 3. Personal Microsoft accounts
-use the desktop backend; Graph remains limited to work/school accounts.
+The `0.1.11` candidate builds on the desktop implementation validated in
+`0.1.10-alpha.1`, adding direct Enter-to-send with multiline paste handling and a
+confirmed Teams debugging restart from the WSL TUI. It also clarifies setup and
+support boundaries. It supports cached chat reads and opt-in plain-text sends
+through Teams on macOS, Windows and WSL. The Windows helper speaks protocol 3.
+Personal Microsoft accounts use the desktop backend; Graph remains limited to
+work/school accounts.
 
-GitHub marks tags containing a prerelease suffix as prereleases and leaves them
-out of the latest stable release selection. Maturin normalizes the Python
-package version to PEP 440 (`0.1.11b1` for this candidate); the CLI still reports
-its Cargo version, `0.1.11-beta.1`.
+An unsuffixed release can include an explicitly experimental, opt-in backend.
+Graph remains the default. Desktop compatibility still depends on Teams internals
+and is limited to the operations and tested scope documented below. A beta release
+is optional; it is not a prerequisite for publishing `0.1.11`.
 
-Vership 0.5.26 has no prerelease bump option. Prepare the patch once with
-`vership bump patch --prepare`, then apply the prerelease suffix to the unpublished
-candidate's Cargo version, lockfile and changelog and amend its release commit,
-including the `Vership-Release: v0.1.11-beta.1` marker. This is a local workaround
-for the unsupported version operation. Run `make check` on the final candidate,
-then continue with `vership release --dry-run` and, after approval,
-`vership release`. Do not run another bump for a prepared candidate.
+The version is already prepared. Finish it with `vership release` after approval;
+do not run another bump. Cargo, the Python package and the CLI all use `0.1.11`.
+Before publishing, run `make check`, the release dry run and package checks on the
+final candidate. Live-test the new TUI send/paste behavior and the WSL restart
+confirmation, cancellation and reconnection paths. Release CI must pass its
+Linux/macOS/Windows checks and build every intended archive and Python wheel.
 
-After the workflows finish, verify the Cargo/GitHub version and normalized Python
-version separately:
+After the workflows finish, verify every publication target:
 
 ```sh
-vership verify 0.1.11-beta.1 --targets tag,release,crates
-vership verify 0.1.11b1 --targets pypi
+vership verify 0.1.11 --targets tag,release,crates,pypi
 ```
 
 The binary build jobs extract and smoke test their packaged CLI before uploading
@@ -59,10 +57,10 @@ including the matching Windows helper's automatic download under WSL. Desktop
 diagnostics can be tested with isolated profiles; successful connection metadata
 does not establish sign-in or message access.
 
-### Beta validation scope
+### Desktop validation scope
 
-The following runtime coverage was collected against the published
-`0.1.10-alpha.1` desktop implementation before beta preparation:
+The instrumented runtime checks below used the published `0.1.10-alpha.1`
+artifacts. Work/school WSL2 coverage is a separate user report.
 
 | Account | Apple Silicon macOS | Native Windows | WSL2 |
 | --- | --- | --- | --- |
@@ -72,6 +70,8 @@ The following runtime coverage was collected against the published
 The work/school report did not capture the exact CLI or Teams version. Keep it
 separate from instrumented evidence. The user also reported Windows working;
 individual native Windows TUI interactions were not instrumented.
+The newer TUI send/paste and WSL restart flows have automated regression coverage;
+the alpha's live results do not establish live validation of those newer flows.
 
 Instrumented checks also covered cache pagination, read-only refusal, explicit
 account-surface selection and ambiguity refusal, malformed cached text and
@@ -81,13 +81,14 @@ helper fixture verified one send attempt and an `unconfirmed` error after a lost
 response; no real Teams send was deliberately interrupted. Each real test send
 was issued once and read back by its exact message ID.
 
-Beta does not imply stable compatibility with Teams internals. Multi-day daily
-use, actual account switching, macOS work/school sending, live Intel Mac coverage,
-and broader Teams-version and managed-policy coverage remain to be validated.
+Multi-day daily use, actual account switching, macOS work/school sending, live
+Intel Mac coverage, and broader Teams-version and managed-policy coverage remain
+to be validated. These are follow-up coverage goals for the experimental backend;
+they do not require putting the whole CLI on a prerelease channel.
 The cache contains only synced history; only existing chats and plain-text sends
 are supported. Missing cached profiles leave names or viewer identity unknown
 without breaking reads. Multiple accounts within one selected surface are
-refused. Keep these limits visible when assessing readiness for a stable release.
+refused. Keep these limits visible in the normal release documentation.
 
 ## Failure policy
 

@@ -18,18 +18,6 @@ uvx teams-cli --help
 
 The PyPI distribution provides both `teams` and `teams-cli` as executable names.
 
-Install the desktop beta with an explicit version:
-
-```console
-pipx install 'teams-cli==0.1.11b1'
-# or
-cargo install teams-cli --version '0.1.11-beta.1' --locked
-# or run without installing
-uvx --from 'teams-cli==0.1.11b1' teams --help
-```
-
-The Python package version is `0.1.11b1`; the CLI reports `0.1.11-beta.1`.
-
 To work from source:
 
 ```console
@@ -93,7 +81,7 @@ pane at a time, and `NO_COLOR` is respected.
 | `pgup`/`pgdn`, `g`/`G` | Page, or jump to the oldest/newest message |
 | `o` | Load older messages in the open chat |
 | `/` | Filter chats by name or last message |
-| `c` | Write a message in the open chat (`enter` to review, `y` to send, `ctrl-j` for a new line, `esc` to close and keep the draft) |
+| `c` | Write a message in the open chat (`enter` to send, `ctrl-j` or `alt-enter` for a new line, `esc` to close and keep the draft) |
 | `r` | Refresh now |
 | `?` | Show every key |
 | `q` | Quit |
@@ -202,7 +190,7 @@ teams --profile local messages send --chat '19:...@thread.v2' --body 'On my way'
 Personal-account read, send and readback have been tested with released binaries
 on Apple Silicon macOS, native Windows and WSL2. Work/school read, send and
 readback have also been reported working by a WSL2 user; macOS work/school cache
-reads were tested separately. See the [release validation scope](docs/releases.md#beta-validation-scope)
+reads were tested separately. See the [release validation scope](docs/releases.md#desktop-validation-scope)
 for coverage and remaining limits.
 
 On macOS, Windows and WSL, `chats list` and `messages list --chat` read from the running
@@ -234,9 +222,10 @@ next starts. The result has the Graph send shape plus `"source": "desktop"`,
 `clientMessageId` and Teams' own `status`. `doctor` checks that the send path is still
 recognised without sending anything.
 
-Chat creation, teams, channels, identity commands, subscriptions, replies,
-mentions, attachments and edits return `unsupported` on desktop; the TUI reads chats from the same cache and sends
-through the same path as `messages send`. Existing profiles without a backend field
+Desktop cannot create new chats. Teams, channels, identity commands, subscriptions,
+replies, mentions, attachments and edits return `unsupported` on desktop. The TUI
+reads chats from the same cache and sends through the same path as `messages send`.
+Existing profiles without a backend field
 continue to use Graph; Graph remains the default for `init`.
 
 The endpoint must already be enabled through an explicit Teams debugging launch.
@@ -263,7 +252,10 @@ While the port is open, any program running as you can read your chats and send 
 you, so close it when you are done.
 The WSL TUI offers to restart Teams with debugging enabled when no endpoint is
 listening. It asks for confirmation first because restarting ends active calls.
-Other commands never launch, restart, quit, or sign into Teams, or enable debugging. `init --no-login` saves configuration without probing; ordinary desktop
+It uses the Windows user variable above; exiting the TUI leaves debugging enabled.
+Remove the variable and restart Teams normally when finished.
+Other commands never launch, restart, quit, or sign into Teams, or enable debugging.
+`init --no-login` saves configuration without probing; ordinary desktop
 initialization probes the existing endpoint. A normal Teams launch usually has no
 endpoint, which `doctor` reports as `no_listener`.
 

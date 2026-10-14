@@ -7,10 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/rvben/teams-cli/compare/v0.1.10-alpha.1...v0.1.11) - 2026-10-14
+
+### Added
+
+- Offer a confirmed Teams restart with debugging enabled when the WSL TUI finds no endpoint, with cancellation and retry actions.
+
 ### Changed
 
-- Prepare desktop support for beta testing with explicit prerelease installation instructions, macOS setup coverage, and documented personal and work/school validation scope.
-- Clarify that desktop history is cache-bound, chat creation is unsupported, and TUI sends require confirmation.
+- Include opt-in experimental desktop support in the regular release channel, with macOS setup instructions and documented personal and work/school validation scope.
+- Clarify that desktop history is cache-bound, chat creation is unsupported, and Enter sends a TUI draft directly.
+
+### Fixed
+
+- Keep multiline bracketed pastes in the TUI draft until Enter is pressed, preserve drafts after failed sends, and ignore additional input while sending.
 
 ## [0.1.10-alpha.1](https://github.com/rvben/teams-cli/compare/v0.1.9-alpha.1...v0.1.10-alpha.1) - 2026-10-14
 
