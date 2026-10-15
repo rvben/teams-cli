@@ -23,7 +23,9 @@ try {
             try {
                 [IO.File]::WriteAllBytes($temporary, $encrypted)
                 if ([IO.File]::Exists($path)) {
-                    [IO.File]::Replace($temporary, $path, $null)
+                    # PowerShell coerces $null to an empty string for string
+                    # parameters; File.Replace needs an actual null backup path.
+                    [IO.File]::Replace($temporary, $path, [System.Management.Automation.Language.NullString]::Value)
                 } else {
                     [IO.File]::Move($temporary, $path)
                 }

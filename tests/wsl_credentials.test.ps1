@@ -8,7 +8,7 @@ $path = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "teams-
 function Request($action, $secret = '') {
     $inputJson = @{ action = $action; id = $id; secret = $secret } | ConvertTo-Json -Compress
     $response = $inputJson | & powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded
-    if ($LASTEXITCODE -ne 0) { throw 'Credential request failed' }
+    if ($LASTEXITCODE -ne 0) { throw "Credential request failed during $action" }
     return ($response | ConvertFrom-Json)
 }
 function Assert($condition, $message) {
