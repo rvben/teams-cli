@@ -66,6 +66,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ChatsCommand,
     },
+    /// Find people to start a conversation with
+    People {
+        #[command(subcommand)]
+        command: PeopleCommand,
+    },
     /// Read and send messages
     Messages {
         #[command(subcommand)]
@@ -187,6 +192,22 @@ pub enum ChannelsCommand {
 #[derive(Debug, Subcommand)]
 pub enum ChatsCommand {
     List(PageArgs),
+    /// Create or reuse a one-to-one conversation; does not send a message
+    Create {
+        /// Exact person ID returned by `people search`
+        #[arg(long)]
+        recipient: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PeopleCommand {
+    /// Search people by name or email, without sending anything
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=50))]
+        limit: u16,
+    },
 }
 
 #[derive(Debug, Args, Clone)]

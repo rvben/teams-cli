@@ -382,6 +382,60 @@ impl DesktopClient {
         self.read(None, limit, cursor).await
     }
 
+    pub async fn search_people(&self, query: &str, limit: u16) -> Result<Page, AppError> {
+        crate::graph::validate_people_query(query, usize::from(limit))?;
+        let value = self
+            .people(json!({"op":"search","query":query.trim(),"limit":limit}))
+            .await?;
+        let items = value["items"]
+            .as_array()
+            .ok_or_else(|| AppError::Desktop("Invalid recipient-search response".into()))?
+            .clone();
+        Ok(Page {
+            items,
+            next_cursor: None,
+            next_offset: None,
+            truncated: value["truncated"] == true,
+            source: Some("desktop_people"),
+            viewer: None,
+        })
+    }
+
+    pub async fn create_chat(&self, recipient: &str) -> Result<Value, AppError> {
+        check_recipient(recipient)?;
+        let value = self
+            .people(json!({"op":"create","recipient":recipient}))
+            .await?;
+        if !value["id"].as_str().is_some_and(chat_id) {
+            return Err(AppError::Unconfirmed("Teams may have created the conversation; check Teams before trying again. No message was sent".into()));
+        }
+        Ok(value)
+    }
+
+    async fn people(&self, mut request: Value) -> Result<Value, AppError> {
+        let create = request["op"] == "create";
+        request["port"] = json!(self.port);
+        request["account_type"] = json!(self.account);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.kind.is_browser() {
+            return people_result(&self.browser.lock().await.people(&request).await?, create);
+        }
+        platform()?;
+        #[cfg(any(windows, target_os = "macos"))]
+        let reply = self.session.lock().await.people(&request).await?;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let reply = {
+            let mut helper = self.helper.lock().await;
+            let op = json!({"op":"people","request":request});
+            if create {
+                helper.call_once(op).await?
+            } else {
+                helper.call(op).await?
+            }
+        };
+        people_result(&reply, create)
+    }
+
     pub async fn messages(
         &self,
         chat: &str,
@@ -522,6 +576,45 @@ impl DesktopClient {
             .await?;
         check_send_reply(&reply)
     }
+}
+
+pub fn check_recipient(id: &str) -> Result<(), AppError> {
+    if id.starts_with("8:") && valid_id(id) && id.len() > 2 {
+        Ok(())
+    } else {
+        Err(AppError::InvalidInput("Select an exact recipient ID from `teams people search`; desktop recipient IDs start with 8:".into()))
+    }
+}
+
+fn people_result(reply: &Value, create: bool) -> Result<Value, AppError> {
+    let invalid = || {
+        if create {
+            AppError::Unconfirmed("Teams may have created the conversation; check Teams before trying again. No message was sent".into())
+        } else {
+            AppError::Desktop(
+                "Recipient search failed. Check the Teams connection and try again".into(),
+            )
+        }
+    };
+    let value = if reply["error"].is_string() {
+        reply.clone()
+    } else {
+        reply["result"]["result"]["value"]
+            .as_str()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .ok_or_else(invalid)?
+    };
+    if let Some(code) = value["error"].as_str() {
+        return Err(match code {
+            "account_ambiguous" => account_selection_error(),
+            "permission_denied" => AppError::Permission("Teams policy does not allow a chat with this recipient".into()),
+            "search_failed" => AppError::Desktop("Teams could not resolve this person. Check sign-in and try their full email address".into()),
+            "layout" => AppError::Unsupported("This Teams version does not expose a supported recipient interface".into()),
+            "unconfirmed" => invalid(),
+            _ => send_error(code),
+        });
+    }
+    Ok(value)
 }
 
 fn check_send_reply(reply: &Value) -> Result<(), AppError> {
@@ -1057,7 +1150,7 @@ mod tests {
     /// the new one; otherwise just update the expectations.
     #[test]
     fn the_protocol_is_pinned() {
-        assert_eq!(helper::PROTOCOL, 3);
+        assert_eq!(helper::PROTOCOL, 4);
         let cursor = encode_cursor(&json!({"t": 1, "id": "m1"})).unwrap();
         assert_eq!(
             read_request(9222, Some(NOTES), 20, Some(&cursor)).unwrap(),
@@ -1085,6 +1178,7 @@ mod tests {
             include_str!("desktop.js"),
             include_str!("desktop_send.js"),
             include_str!("desktop_cache.js"),
+            include_str!("desktop_people.js"),
         ]
         .map(|script| {
             use sha2::Digest;
@@ -1095,8 +1189,60 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         });
-        // Timestamp normalization keeps the protocol-3 request/result shapes.
-        assert_eq!(scripts, ["32ca0293d2d5", "baa0bc29c44b", "3e837cc21336"]);
+        // Protocol 4 adds recipient operations; existing sends retain their request shapes.
+        assert_eq!(
+            scripts,
+            [
+                "32ca0293d2d5",
+                "baa0bc29c44b",
+                "3e837cc21336",
+                "8fb119e6309b"
+            ]
+        );
+    }
+
+    #[test]
+    fn recipient_scripts_keep_search_readonly_and_creation_once_only() {
+        let output = std::process::Command::new("node")
+            .args(["--test", "tests/js/people.test.mjs"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("Node.js 20 or newer is required for desktop script tests");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn recipient_replies_preserve_uncertainty_and_account_errors() {
+        assert!(matches!(
+            people_result(&json!({"error":"unconfirmed"}), true),
+            Err(AppError::Unconfirmed(_))
+        ));
+        assert!(matches!(
+            people_result(&json!({"result":{}}), true),
+            Err(AppError::Unconfirmed(_))
+        ));
+        assert!(matches!(
+            people_result(&page_reply(json!({"error":"permission_denied"})), true),
+            Err(AppError::Permission(_))
+        ));
+        assert!(matches!(
+            people_result(&page_reply(json!({"error":"account_ambiguous"})), false),
+            Err(AppError::Desktop(_))
+        ));
+        for id in [
+            "someone@example.invalid",
+            "8:bad id",
+            "8:",
+            "8:bad/extra",
+            "",
+        ] {
+            assert!(check_recipient(id).is_err());
+        }
+        assert!(check_recipient("8:live:.cid.012345").is_ok());
     }
 
     #[test]

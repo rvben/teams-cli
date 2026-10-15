@@ -65,8 +65,8 @@ for sending, reconnecting, and experimental compatibility limits.
 Browser PKCE is the human-friendly default. The browser talks directly to Microsoft, and the CLI never receives or stores your password. Normal sign-in requests these delegated scopes:
 
 ```text
-openid profile offline_access User.Read Team.ReadBasic.All
-Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send
+openid profile offline_access User.Read User.ReadBasic.All
+Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send
 ChannelMessage.Send
 ```
 
@@ -147,6 +147,8 @@ For short-lived automation, `TEAMS_ACCESS_TOKEN` overrides the stored credential
 teams list
 teams channels list TEAM_ID
 teams chats list --limit 25
+teams people search "Alex" --limit 20
+teams chats create --recipient PERSON_ID --yes  # no message is sent
 teams messages list --chat CHAT_ID
 teams auth login --channel-history  # once, with administrator approval
 teams messages list --team TEAM_ID --channel CHANNEL_ID
@@ -162,7 +164,21 @@ teams config path
 teams doctor --offline
 ```
 
-Collection commands expose `--limit` and `--fields`; Graph-native collections use `--cursor`, while joined teams and channels use `--offset` because those endpoints do not accept `$top`. With a terminal they render concise text; when stdout is piped they emit JSON envelopes with continuation metadata and `truncated`.
+Chat, message, team and channel collections expose `--limit` and `--fields`; Graph-native collections use `--cursor`, while joined teams and channels use `--offset` because those endpoints do not accept `$top`. With a terminal they render concise text; when stdout is piped they emit JSON envelopes with continuation metadata and `truncated`.
+
+To message someone for the first time, use `people search` to find their verified
+identity in the active profile. Search accepts a name or email prefix of 2–256
+characters and returns at most 50 people; refine the query if `truncated` is true.
+Pass the exact returned ID to `chats create`, then pass the resulting chat ID to
+`messages send`. Creating a conversation reuses an existing one-to-one chat when
+available and sends no message. It requires a writable profile and confirmation
+(`--yes` for automation). Recipient IDs belong to their selected account/backend.
+If creation is unconfirmed, inspect your chats before trying again.
+
+Graph recipient search needs delegated `User.ReadBasic.All` consent. Existing
+sign-ins can keep reading chats; run `teams auth login` again to enable directory
+search. Your organization may restrict consent, directory guest access, external
+recipients or chat creation. Personal accounts use the desktop backend.
 
 Profiles can block every remote write while keeping reads, sign-in, diagnostics, and the TUI available:
 
@@ -257,7 +273,9 @@ paste; `r` checks delivery, `s` offers an explicit second-copy confirmation, and
 `esc` keeps the draft and uncertainty together in memory. Reopening it does not
 unlock ordinary sending. Queued results are labelled queued rather than sent.
 
-Desktop cannot create new chats. Teams, channels, identity commands, subscriptions,
+Desktop supports people search and one-to-one chat creation through the selected
+Teams client's own session. Creation requires a profile with `--allow-send` and
+sends no message. Teams, channels, identity commands, subscriptions,
 replies, mentions, attachments and edits return `unsupported` on desktop. The TUI
 reads chats from the same cache and sends through the same path as `messages send`.
 Existing profiles without a backend field

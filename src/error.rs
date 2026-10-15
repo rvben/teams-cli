@@ -101,7 +101,7 @@ pub const UNCONFIRMED: ErrorContract = ErrorContract {
     kind: "unconfirmed",
     exit_code: 8,
     retryable: false,
-    description: "A send may have been delivered but was not confirmed; check the conversation before sending again",
+    description: "A remote write may have been accepted but was not confirmed; check the conversation before trying again",
 };
 pub const UNEXPECTED: ErrorContract = ErrorContract {
     kind: "unexpected_error",

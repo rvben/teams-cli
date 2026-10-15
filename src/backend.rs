@@ -51,6 +51,19 @@ impl TeamsBackend {
             Self::Desktop(client) => client.chats(limit, cursor).await,
         }
     }
+    pub async fn search_people(&self, query: &str, limit: u16) -> Result<Page, AppError> {
+        crate::graph::validate_people_query(query, usize::from(limit))?;
+        match self {
+            Self::Graph(client) => client.search_people(query, usize::from(limit)).await,
+            Self::Desktop(client) => client.search_people(query, limit).await,
+        }
+    }
+    pub async fn create_chat(&self, recipient: &str) -> Result<Value, AppError> {
+        match self {
+            Self::Graph(client) => client.create_chat(recipient).await,
+            Self::Desktop(client) => client.create_chat(recipient).await,
+        }
+    }
     pub async fn messages(
         &self,
         chat: Option<&str>,

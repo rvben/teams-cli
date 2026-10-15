@@ -143,8 +143,8 @@ fn command_errors(name: &str) -> &'static [&'static str] {
         "auth status" => &["auth", "rate_limit", "api_error", "desktop_error"],
         "profile remove" => &["confirmation_required"],
         "whoami" | "list" | "channels list" => GRAPH_READ,
-        "chats list" | "messages list" => CONVERSATION_READ,
-        "messages send" => &[
+        "chats list" | "messages list" | "people search" => CONVERSATION_READ,
+        "messages send" | "chats create" => &[
             "auth",
             "read_only",
             "permission_denied",
@@ -191,6 +191,11 @@ fn example(name: &str) -> Value {
                 "--fields",
                 "id,topic,lastUpdatedDateTime",
             ],
+            None,
+        ),
+        "people search" => (&["people", "search", "Alex", "--limit", "20"], None),
+        "chats create" => (
+            &["chats", "create", "--recipient", "PERSON_ID", "--yes"],
             None,
         ),
         "messages list" => (
@@ -446,6 +451,45 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 .as_array_mut()
                 .unwrap()
                 .insert(0, required_arg("team", "string", "Team ID"));
+            value
+        },
+        {
+            let mut value = single(
+                "people search",
+                "Find up to 50 verified people by name or email; refine the query when truncated; never sends or creates a chat",
+                "read_only",
+                vec![
+                    field("id", "string"),
+                    field("displayName", "string"),
+                    nullable_field("email", "string"),
+                    field("source", "string"),
+                ],
+            );
+            value["cardinality"] = json!("bounded");
+            value["args"] = json!([
+                {"name":"query","type":"string","required":true,"x-min-length":2,"x-max-length":256,"description":"Name or email prefix; 2–256 characters, no control characters"},
+                {"name":"--limit","type":"integer","default":20,"x-minimum":1,"x-maximum":50,"description":"Maximum matching people; refine the query for more specific results"}
+            ]);
+            value
+        },
+        {
+            let mut value = single(
+                "chats create",
+                "Create or reuse a one-to-one conversation with a verified person; requires a writable profile and confirmation; sends no message",
+                "idempotent",
+                vec![
+                    field("id", "string"),
+                    field("chatType", "string"),
+                    nullable_field("topic", "string"),
+                    nullable_field("source", "string"),
+                ],
+            );
+            value["args"] = json!([required_arg(
+                "--recipient",
+                "string",
+                "Exact person ID from people search in the same profile"
+            )]);
+            value["confirmation_bypass_arg"] = json!("--yes");
             value
         },
         paged(
@@ -706,6 +750,22 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     "macOS/Windows/WSL (browser client also on Linux); plain-text chat messages through the running Teams window; needs a profile created with `init --allow-send`; prompts on a terminal and needs --yes otherwise; results carry source \"desktop\", clientMessageId and Teams' status"
                 )
             }
+            "people search" => {
+                command["extensions"]["graph"] = json!(
+                    "Work/school directory profiles; User.ReadBasic.All consent required; guest callers and personal accounts unsupported"
+                );
+                command["extensions"]["desktop"] = json!(
+                    "Uses the selected Teams client's own people search; IDs belong to that account and must not be reused with another profile"
+                );
+            }
+            "chats create" => {
+                command["extensions"]["graph"] = json!(
+                    "Chat.Create; includes the signed-in user and verified recipient; returns an existing one-on-one chat when present; no automatic retry after an unconfirmed response"
+                );
+                command["extensions"]["desktop"] = json!(
+                    "Needs a profile created with --allow-send; opens or creates a one-to-one chat through the selected Teams client; requires --yes without a terminal; sends no message"
+                );
+            }
             _ => {}
         }
     }
@@ -723,7 +783,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             {"name":"--output", "short":"-o", "type":"string", "enum":["auto","text","json"], "default":"auto", "description":"Output format"},
             {"name":"--profile", "type":"string", "x-env":"TEAMS_PROFILE", "description":"Configuration profile; defaults to the active one"},
             {"name":"--quiet", "type":"boolean", "description":"Suppress informational stderr output"},
-            {"name":"--yes", "short":"-y", "type":"boolean", "description":"Confirm without prompting (desktop sends, profile removal)"}
+            {"name":"--yes", "short":"-y", "type":"boolean", "description":"Confirm without prompting (conversation creation, desktop sends, profile removal)"}
         ],
         "commands": commands,
         "errors": error::ALL.iter().map(|e| json!({"kind":e.kind,"exit_code":e.exit_code,"retryable":e.retryable,"description":e.description})).collect::<Vec<_>>(),
@@ -762,7 +822,7 @@ pub fn backend_capabilities() -> Value {
         "graph":{"default":true,"authentication":"delegated_oauth","api":"Microsoft Graph v1.0","account_types":["Microsoft 365 work or school"]},
         "desktop":{"experimental":true,"read_only_by_default":true,"platforms":["macos","windows","wsl","linux"],"clients":{"native":["macos","windows","wsl"],"browser":["macos","linux","wsl"],"browser-core":["macos","linux","wsl"]},"browser_validation":"experimental; core personal messaging validated on macOS only","browser_core":{"account_types":["personal"],"bootstrap":"build-pinned; unknown builds refused","browser_versions":"automatically installed matching Chrome for Testing and chrome-headless-shell; paired path overrides supported","live_validation":["macos-personal"]},
             "account_types":["Microsoft 365 work or school","personal Microsoft accounts"],"account_selection":"account_type_then_single_account_only",
-            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","managed connect/status/disconnect/recover","delivery reconciliation by client message ID","chats (macos, windows, wsl; browser also on linux)","chat messages (macos, windows, wsl; browser also on linux)","send plain-text chat messages (macos, windows, wsl; browser also on linux; opt-in)","TUI (macos, windows, wsl; browser also on linux)"],
+            "authentication":"teams_desktop_session_unverified","supported":["configuration","connection metadata","doctor","auth status","managed connect/status/disconnect/recover","delivery reconciliation by client message ID","people search","create or reuse one-to-one chats (opt-in)","chats (macos, windows, wsl; browser also on linux)","chat messages (macos, windows, wsl; browser also on linux)","send plain-text chat messages (macos, windows, wsl; browser also on linux; opt-in)","TUI (macos, windows, wsl; browser also on linux)"],
             "unsupported":["teams and channels","identity","channel messages, replies, mentions, attachments and edits","subscriptions","unconfirmed Teams launch or restart"],
             "requires":"native: Teams-owned loopback debugging endpoint (WSL needs Windows interop); browser: installed Chrome/Chromium/Edge with a dedicated profile and visible initial sign-in",
             "transport":{"macos":"native_loopback","windows":"windows_native","wsl":"windows_helper_stdio","browser":"dedicated_chromium_loopback"},

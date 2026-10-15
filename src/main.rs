@@ -8,7 +8,7 @@ use teams_cli::auth;
 use teams_cli::backend::TeamsBackend;
 use teams_cli::cli::{
     AuthCommand, ChannelsCommand, ChatsCommand, Cli, Command, ConfigCommand, DesktopCommand,
-    InitArgs, MessagesCommand, OffsetPageArgs, PageArgs, ProfileCommand, TuiArgs,
+    InitArgs, MessagesCommand, OffsetPageArgs, PageArgs, PeopleCommand, ProfileCommand, TuiArgs,
 };
 use teams_cli::config::{self, BackendKind, Profile};
 use teams_cli::desktop::{self, DesktopClient};
@@ -127,6 +127,68 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
             let client = client(profile_arg).await?;
             let mut result = client.chats(page.limit, page.cursor.as_deref()).await?;
             render_conversation(&mut result, &page, out, render::chats)
+        }
+        Command::People {
+            command: PeopleCommand::Search { query, limit },
+        } => {
+            graph::validate_people_query(&query, usize::from(limit))?;
+            let result = client(profile_arg)
+                .await?
+                .search_people(&query, limit)
+                .await?;
+            out.value(&result, || {
+                if result.items.is_empty() {
+                    return "No people found. Try a longer name or an exact email address.".into();
+                }
+                let mut lines = result
+                    .items
+                    .iter()
+                    .map(|person| {
+                        let safe = |key: &str| {
+                            person[key]
+                                .as_str()
+                                .unwrap_or_default()
+                                .chars()
+                                .filter(|ch| !ch.is_control())
+                                .collect::<String>()
+                        };
+                        format!(
+                            "{}\n  {}\n  {}",
+                            safe("displayName"),
+                            safe("email"),
+                            safe("id")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if result.truncated {
+                    lines.push("More people match; refine your search.".into());
+                }
+                lines.join("\n\n")
+            })
+        }
+        Command::Chats {
+            command: ChatsCommand::Create { recipient },
+        } => {
+            let (name, profile) = config::load(profile_arg)?;
+            profile.require_writable()?;
+            if recipient.trim() != recipient
+                || recipient.is_empty()
+                || recipient.len() > 512
+                || recipient.chars().any(char::is_control)
+            {
+                return Err(AppError::InvalidInput(
+                    "--recipient must be an exact person ID returned by `teams people search`"
+                        .into(),
+                ));
+            }
+            confirm_create_chat(yes, &name, &recipient)?;
+            let value = client(profile_arg).await?.create_chat(&recipient).await?;
+            out.value(&value, || {
+                format!(
+                    "Conversation ready: {}. No message was sent.",
+                    value["id"].as_str().unwrap_or("unknown")
+                )
+            })
         }
         Command::Messages {
             command:
@@ -1195,14 +1257,14 @@ fn doctor_report(
 
 fn capabilities(out: Output) -> Result<(), AppError> {
     let value = serde_json::json!({
-        "supported":["delegated work/school sign-in","identity","joined teams","channels","chats","chat messages","channel messages","send messages","TUI"],
+        "supported":["delegated work/school sign-in","identity","joined teams","channels","chats","people search","create one-to-one chats","chat messages","channel messages","send messages","TUI"],
         "unsupported":["personal Microsoft accounts through Graph","user calls and screen sharing","private Teams protocols","tenant administration"],
         "account_types":["Microsoft 365 work or school","personal Microsoft accounts (desktop; browser client also on Linux)"],
         "api":"Microsoft Graph v1.0",
         "backends":schema::backend_capabilities(),
         "notes":["Normal sign-in uses only user-consentable delegated permissions.","Reading channel messages requires `teams auth login --channel-history` and admin consent for ChannelMessage.Read.All.","Calls require bot/application APIs and are outside this user client."]
     });
-    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, chats, messages; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL; browser client on macOS/Linux/WSL2)\n  Endpoint diagnostics. Personal and work/school accounts support chats and chat messages from the running Teams client's local cache, and plain-text chat sending for profiles created with `--allow-send`; the TUI uses the same backend. The browser client uses a dedicated profile, with visible sign-in and headless operation.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
+    out.value(&value, || "Graph (default)\n  Work/school delegated sign-in; teams, channels, people search, chats, messages; create one-to-one chats; send as yourself; TUI\n\nDesktop (experimental, macOS/Windows/WSL; browser client on macOS/Linux/WSL2)\n  Endpoint diagnostics. Personal and work/school accounts support chats and chat messages from the running Teams client's local cache, people search, and one-to-one chat creation and plain-text sending for profiles created with `--allow-send`; the TUI uses the same backend. The browser client uses a dedicated profile, with visible sign-in and headless operation.\n\nNot supported\n  Desktop teams, channels, replies and attachments; personal accounts through Graph; calls or screen sharing; private Teams protocols; tenant administration\n\nRun `teams schema` for the machine contract.".into())
 }
 
 /// Desktop sends act through the user's own Teams window, so each one is confirmed at the
@@ -1223,6 +1285,27 @@ fn confirm_desktop_send(chat: &str, body: &str) -> Result<(), AppError> {
     } else {
         Err(AppError::ConfirmationRequired(
             "send cancelled; nothing was sent".into(),
+        ))
+    }
+}
+
+fn confirm_create_chat(yes: bool, profile: &str, recipient: &str) -> Result<(), AppError> {
+    if yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return Err(AppError::ConfirmationRequired("creating a conversation needs confirmation; pass --yes when not running in a terminal. No message will be sent".into()));
+    }
+    eprint!(
+        "Create or open a one-to-one conversation with {recipient} using profile '{profile}'? No message will be sent. [y/N] "
+    );
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err(AppError::ConfirmationRequired(
+            "conversation creation cancelled; nothing was sent".into(),
         ))
     }
 }

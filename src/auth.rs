@@ -12,9 +12,9 @@ use crate::config::Profile;
 use crate::error::AppError;
 use crate::output::Output;
 
-pub const BASE_SCOPES: &str = "openid profile offline_access User.Read Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send";
+pub const BASE_SCOPES: &str = "openid profile offline_access User.Read User.ReadBasic.All Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send";
 pub const CHANNEL_HISTORY_SCOPE: &str = "ChannelMessage.Read.All";
-pub const CHANNEL_HISTORY_SCOPES: &str = "openid profile offline_access User.Read Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send ChannelMessage.Read.All";
+pub const CHANNEL_HISTORY_SCOPES: &str = "openid profile offline_access User.Read User.ReadBasic.All Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send ChannelMessage.Read.All";
 const SERVICE: &str = "teams-cli";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +397,16 @@ mod tests {
     #[test]
     fn default_login_is_least_privilege() {
         assert!(!BASE_SCOPES.contains(CHANNEL_HISTORY_SCOPE));
+        assert!(
+            BASE_SCOPES
+                .split_whitespace()
+                .any(|scope| scope == "User.ReadBasic.All")
+        );
+        assert!(
+            !BASE_SCOPES
+                .split_whitespace()
+                .any(|scope| scope == "User.Read.All")
+        );
         assert_eq!(scopes(false), BASE_SCOPES);
     }
 

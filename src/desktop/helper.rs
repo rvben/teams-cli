@@ -4,12 +4,13 @@
 //! CLI's protocol, whatever its version or build, which are only reported. Bump it when
 //! either side would misread the other (`desktop::tests::the_protocol_is_pinned`).
 //! `hello` and its `version` and `protocol` fields never change. Protocol 2 adds sending;
+//! protocol 4 adds recipient search and once-only chat creation.
 //! protocol 3 adds explicit account-type selection to reads, sends and send checks.
 use crate::error::AppError;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The commit this binary was built from (see `build.rs`), reported in `hello` for
 /// diagnosis and never compared; empty when unknown.
@@ -66,6 +67,7 @@ pub async fn serve<S: super::session::Verifier>(
                 None => Err(AppError::InvalidInput("invalid desktop port".into())),
             },
             Some("read") => session.read(&request["request"]).await,
+            Some("people") => session.people(&request["request"]).await,
             Some("send") => session.send(&request["request"]).await,
             Some("send_check") => {
                 match request["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {

@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **desktop**: add `teams desktop clear-flags` and a confirmed TUI cleanup that remove remote-debugging flags from the user-wide WebView2 setting while keeping its other arguments.
+- Search people by name or email and create or reuse a one-to-one conversation with `people search` and `chats create --recipient ID --yes`. Opening a conversation never sends a message.
+- Support these operations through the selected personal or work/school desktop account and through Microsoft Graph. Graph search requires a new sign-in to consent to `User.ReadBasic.All`.
+
+### Changed
+
+- Windows desktop helpers use protocol 4. WSL requires the helper from the same CLI release.
+- Ambiguous conversation-creation outcomes remain unconfirmed and are never automatically retried.
 
 ### Fixed
 

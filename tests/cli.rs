@@ -3,6 +3,82 @@ use predicates::prelude::*;
 use serde_json::Value;
 
 #[test]
+fn new_conversation_commands_declare_their_confirmation_and_bounded_search_contracts() {
+    for name in ["people search", "chats create"] {
+        let output = Command::cargo_bin("teams")
+            .unwrap()
+            .args(["schema", "--command", name])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let command = &value["commands"][0];
+        assert_eq!(command["name"], name);
+        if name == "people search" {
+            assert_eq!(command["effects"], "read_only");
+            assert_eq!(command["cardinality"], "bounded");
+        } else {
+            assert_eq!(command["confirmation_bypass_arg"], "--yes");
+        }
+    }
+}
+
+#[test]
+fn create_chat_blocks_read_only_and_requires_confirmation_before_connecting() {
+    for backend in ["graph", "desktop"] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut init = Command::cargo_bin("teams").unwrap();
+        init.env("XDG_CONFIG_HOME", temp.path())
+            .args(["init", "--backend", backend, "--no-login", "--read-only"])
+            .assert()
+            .success();
+        Command::cargo_bin("teams")
+            .unwrap()
+            .env("XDG_CONFIG_HOME", temp.path())
+            .args(["chats", "create", "--recipient", "PERSON_ID", "--yes"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("\"kind\":\"read_only\""));
+        let mut writable = Command::cargo_bin("teams").unwrap();
+        writable.env("XDG_CONFIG_HOME", temp.path()).args([
+            "init",
+            "--backend",
+            backend,
+            "--no-login",
+        ]);
+        if backend == "desktop" {
+            writable.arg("--allow-send");
+        }
+        writable.assert().success();
+        Command::cargo_bin("teams")
+            .unwrap()
+            .env("XDG_CONFIG_HOME", temp.path())
+            .args(["chats", "create", "--recipient", "PERSON_ID"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "\"kind\":\"confirmation_required\"",
+            ));
+    }
+}
+
+#[test]
+fn recipient_search_rejects_short_and_control_queries_before_loading_a_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    for query in ["a", "Alex\nInjected"] {
+        Command::cargo_bin("teams")
+            .unwrap()
+            .env("XDG_CONFIG_HOME", temp.path())
+            .args(["people", "search", query])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "recipient search must contain 2–256 characters",
+            ));
+    }
+}
+
+#[test]
 fn capabilities_scope_personal_accounts_to_the_desktop_backend() {
     for command in ["capabilities", "schema"] {
         let output = Command::cargo_bin("teams")

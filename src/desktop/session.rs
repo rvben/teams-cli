@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 const READ_SCRIPT: &str = include_str!("../desktop.js");
 const SEND_SCRIPT: &str = include_str!("../desktop_send.js");
+const PEOPLE_SCRIPT: &str = include_str!("../desktop_people.js");
 const CACHE_SCRIPT: &str = include_str!("../desktop_cache.js");
 // Teams can cache lone UTF-16 surrogates. JSON.stringify escapes them, but Rust's
 // JSON strings require Unicode scalar values. Repair only the projected output.
@@ -130,6 +131,46 @@ impl<S: Verifier> Session<S> {
             {
                 Ok(result) => json!({"result": result}),
                 Err(_) => json!({"error": "unconfirmed"}),
+            },
+        )
+    }
+
+    /// Search is read-only. Chat creation is evaluated once, never retried.
+    pub async fn people(&self, request: &Value) -> Result<Value, AppError> {
+        let port = request["port"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .ok_or_else(|| AppError::InvalidInput("invalid desktop port".into()))?;
+        valid_port(port)?;
+        let account = DesktopAccount::from_request(&request["account_type"])?;
+        let create = request["op"] == "create";
+        if create {
+            super::check_recipient(request["recipient"].as_str().unwrap_or_default())?;
+        } else if request["op"] == "search" {
+            crate::graph::validate_people_query(
+                request["query"].as_str().unwrap_or_default(),
+                request["limit"].as_u64().unwrap_or_default() as usize,
+            )?;
+        } else {
+            return Err(AppError::InvalidInput("invalid recipient operation".into()));
+        }
+        let (mut page, personal) = match self.main_page(port, account).await {
+            Ok(page) => page,
+            Err(refused) => return Ok(refused),
+        };
+        let mut params = request.clone();
+        params["personal"] = json!(personal);
+        let expression = scoped_expression(
+            &format!("({PEOPLE_SCRIPT})({params},({CACHE_SCRIPT})).then({READ_JSON})"),
+            personal,
+        );
+        Ok(
+            match page
+                .evaluate(&core_guard(&expression, self.system.core_only(port)))
+                .await
+            {
+                Ok(result) => json!({"result":result}),
+                Err(_) => json!({"error":if create { "unconfirmed" } else { "search_failed" }}),
             },
         )
     }
