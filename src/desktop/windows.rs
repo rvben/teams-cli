@@ -1,5 +1,6 @@
 //! Windows facts for listener verification, read directly from the OS: the TCP listener
-//! table, one process snapshot, and the owning package and user of the Teams process.
+//! table, one process snapshot, the owning package and user of the Teams process, and the
+//! user-wide WebView2 arguments.
 use super::owner::{Listener, System};
 use crate::error::AppError;
 use std::collections::HashMap;
@@ -16,6 +17,9 @@ use windows_sys::Win32::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS,
+        },
+        Registry::{
+            HKEY_CURRENT_USER, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
         },
         Threading::{
             GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -108,6 +112,58 @@ impl System for WindowsSystem {
                 user_sid(unsafe { GetCurrentProcess() }) == Some(sid)
             })
     }
+
+    fn user_debugging_flags(&self) -> bool {
+        user_environment("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_some_and(|value| {
+            value.split_whitespace().any(|token| {
+                ["--remote-debugging-port", "--remote-debugging-address"]
+                    .iter()
+                    .any(|flag| token == *flag || token.starts_with(&format!("{flag}=")))
+            })
+        })
+    }
+}
+
+/// A string value of the user-scope environment, as stored (not expanded).
+fn user_environment(name: &str) -> Option<String> {
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (key, value) = (wide("Environment"), wide(name));
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    let mut size = 0u32;
+    // SAFETY: a size query with a null buffer; the strings are NUL-terminated.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
+    // SAFETY: the buffer holds `size` bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    buffer.truncate((size as usize / 2).min(buffer.len()));
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..end]))
 }
 
 /// Every row of the listener table for one address family.

@@ -352,7 +352,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             if connection.status != desktop::ProbeStatus::NoListener {
                 return Err(AppError::Desktop(format!(
                     "No profile was saved. {}",
-                    connection.status.detail()
+                    connection.detail()
                 )));
             }
             if profile.desktop_client.is_browser() {
@@ -564,7 +564,7 @@ async fn auth_command(
             "config_path":config::path(),"read_only":profile.read_only,"desktop_port":profile.desktop_port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client,
             "granted_scopes":null,"channel_history":null,"connection":connection});
         return out.value(&value, || format!("Profile: {name}\nBackend: desktop (experimental)\nEndpoint: {}\nSigned in: unknown\nSession verified: no\nRead only: {}",
-            connection.as_ref().map(|c| c.status.detail()).unwrap_or("not checked (offline)"), yes_no(profile.read_only)));
+            connection.as_ref().map(|c| c.detail()).unwrap_or_else(|| "not checked (offline)".into()), yes_no(profile.read_only)));
     }
     match command {
         AuthCommand::Login {
@@ -858,6 +858,8 @@ mod tests {
                 version: None,
                 browser_websocket_advertised: false,
                 targets: Vec::new(),
+                foreign_listeners: Vec::new(),
+                user_debugging_flags: false,
             };
             assert!(
                 debugging_setup(Some(&connection), 9333).is_none(),
@@ -1092,15 +1094,14 @@ async fn desktop_doctor(
         } else {
             "fail"
         },
-        detail: connection
-            .as_ref()
-            .map(|c| c.status.detail())
-            .unwrap_or(if offline {
+        detail: connection.as_ref().map(|c| c.detail()).unwrap_or_else(|| {
+            if offline {
                 "endpoint check skipped (offline)"
             } else {
                 "endpoint check unavailable"
-            })
-            .into(),
+            }
+            .into()
+        }),
     });
     let endpoint_ok = connection.as_ref().is_some_and(|c| c.endpoint_available());
     let (status, detail) = if profile.read_only {
@@ -1303,6 +1304,27 @@ fn confirm_browser_connection(yes: bool) -> Result<(), AppError> {
     }
 }
 
+fn confirm_clear_flags(yes: bool) -> Result<(), AppError> {
+    if yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return Err(AppError::ConfirmationRequired("Changing the user-wide WebView2 setting needs confirmation; pass --yes when not running in a terminal".into()));
+    }
+    eprint!(
+        "Remove the remote-debugging flags from the user-wide WebView2 setting? Other arguments are kept. Apps already running keep the port until fully quit. [y/N] "
+    );
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim().eq_ignore_ascii_case("y") {
+        Ok(())
+    } else {
+        Err(AppError::ConfirmationRequired(
+            "Clearing debugging flags cancelled".into(),
+        ))
+    }
+}
+
 async fn desktop_connection(
     profile: Option<&str>,
     command: DesktopCommand,
@@ -1311,11 +1333,13 @@ async fn desktop_connection(
 ) -> Result<(), AppError> {
     use desktop::connection::{self, Action};
     let login = matches!(&command, DesktopCommand::Login(_));
+    let clear = matches!(&command, DesktopCommand::ClearFlags(_));
     let (action, args) = match command {
         DesktopCommand::Status(args) => (Action::Status, args),
         DesktopCommand::Connect(args) | DesktopCommand::Login(args) => (Action::Connect, args),
         DesktopCommand::Disconnect(args) => (Action::Disconnect, args),
         DesktopCommand::Recover(args) => (Action::Recover, args),
+        DesktopCommand::ClearFlags(args) => (Action::Status, args),
     };
     let selected = config::connection_profile(profile)?;
     let kind = args.desktop_client.unwrap_or_else(|| {
@@ -1344,6 +1368,11 @@ async fn desktop_connection(
             "desktop login requires --desktop-client browser".into(),
         ));
     }
+    if clear && kind.is_browser() {
+        return Err(AppError::InvalidInput(
+            "desktop clear-flags applies to the Teams desktop client".into(),
+        ));
+    }
     if args.visible && (login || !kind.is_browser() || !matches!(action, Action::Connect)) {
         return Err(AppError::InvalidInput(
             "--visible requires desktop connect --desktop-client browser".into(),
@@ -1360,6 +1389,17 @@ async fn desktop_connection(
         }
     }
     let client = DesktopClient::with_client(port, account, kind)?;
+    if clear {
+        confirm_clear_flags(yes)?;
+        let value = connection::clear_flags(&client).await?;
+        return out.value(&value, || {
+            if value["cleared"] == true {
+                "Removed the debugging flags from the user-wide WebView2 setting. Fully quit and reopen apps that use WebView2 (such as Outlook) so they close the port.".into()
+            } else {
+                "The user-wide WebView2 setting has no debugging flags; nothing changed.".into()
+            }
+        });
+    }
     let value = if login {
         client.login_with_progress(out.quiet).await?
     } else {

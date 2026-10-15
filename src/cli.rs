@@ -275,6 +275,8 @@ pub enum DesktopCommand {
     Disconnect(DesktopArgs),
     /// Recover interrupted native settings or close a managed browser session
     Recover(DesktopArgs),
+    /// Remove remote-debugging flags from the user-wide WebView2 setting (Windows/WSL)
+    ClearFlags(DesktopArgs),
 }
 
 #[derive(Debug, Args)]

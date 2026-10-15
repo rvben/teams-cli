@@ -103,6 +103,12 @@ pub struct ConnectionMetadata {
     pub version: Option<BrowserVersion>,
     pub browser_websocket_advertised: bool,
     pub targets: Vec<TargetMetadata>,
+    /// Executable names of the applications hosting refused listeners.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_listeners: Vec<String>,
+    /// The user-wide WebView2 arguments open a debugging port in every WebView2 app.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_debugging_flags: bool,
 }
 
 impl ConnectionMetadata {
@@ -116,12 +122,39 @@ impl ConnectionMetadata {
             version: None,
             browser_websocket_advertised: false,
             targets: vec![],
+            foreign_listeners: vec![],
+            user_debugging_flags: false,
         }
     }
     pub fn endpoint_available(&self) -> bool {
         self.status == ProbeStatus::MetadataOk
             && self.loopback_only == Some(true)
             && self.teams_owned == Some(true)
+    }
+
+    /// The status explanation plus what is known about a refused listener.
+    pub fn detail(&self) -> String {
+        let mut detail = self.status.detail().to_string();
+        if self.status != ProbeStatus::NonTeamsListenerRefused {
+            return detail;
+        }
+        if !self.foreign_listeners.is_empty() {
+            detail.push_str(&format!(
+                " Port {} is also served by {}.",
+                self.port,
+                self.foreign_listeners.join(", ")
+            ));
+        }
+        if self.user_debugging_flags {
+            detail.push_str(" A user-wide WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS setting opens a debugging port in every WebView2 application. Run `teams desktop clear-flags` to remove only its debugging flags, then fully quit and reopen those applications.");
+        }
+        detail
+    }
+
+    /// Applications to quit and reopen after the user-wide flags are cleared.
+    pub fn stray_debugging_flags(&self) -> Option<&[String]> {
+        (self.status == ProbeStatus::NonTeamsListenerRefused && self.user_debugging_flags)
+            .then_some(self.foreign_listeners.as_slice())
     }
 }
 
@@ -248,6 +281,21 @@ impl DesktopClient {
                 .probe()
                 .await
                 .is_ok_and(|probe| probe.status == ProbeStatus::NoListener)
+    }
+
+    /// Applications serving the port because of user-wide debugging flags, offered
+    /// for cleanup by the TUI after a failed read.
+    pub async fn stray_debugging_flags(&self) -> Option<Vec<String>> {
+        if self.kind != DesktopClientKind::Native {
+            return None;
+        }
+        let probe = self.probe().await.ok()?;
+        probe.stray_debugging_flags().map(<[String]>::to_vec)
+    }
+
+    /// Called only after the person confirms the cleanup in the TUI.
+    pub async fn clear_debugging_flags(&self) -> Result<(), AppError> {
+        connection::clear_flags(self).await.map(|_| ())
     }
 
     /// Called only after the person confirms the restart in the TUI.
@@ -453,6 +501,7 @@ impl DesktopClient {
 }
 
 fn check_send_reply(reply: &Value) -> Result<(), AppError> {
+    refused(reply)?;
     match reply["error"].as_str() {
         None if reply["ok"] == true => Ok(()),
         code => Err(send_error(code.unwrap_or_default())),
@@ -531,6 +580,20 @@ fn send_request(port: u16, chat: &str, body: &str) -> Result<Value, AppError> {
     }))
 }
 
+/// A listener refusal that carries its diagnosis explains itself in full.
+fn refused(reply: &Value) -> Result<(), AppError> {
+    match reply
+        .get("connection")
+        .cloned()
+        .map(serde_json::from_value::<ConnectionMetadata>)
+    {
+        Some(Ok(metadata)) if reply.get("error").is_some() => {
+            Err(AppError::Desktop(metadata.detail()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn send_error(code: &str) -> AppError {
     match code {
         "not_found" => AppError::NotFound("chat not found in the Teams desktop cache".into()),
@@ -555,6 +618,7 @@ fn send_error(code: &str) -> AppError {
 
 /// Maps a send reply to the Graph send shape, plus Teams' own status label.
 fn sent_message(reply: &Value, chat: &str) -> Result<Value, AppError> {
+    refused(reply)?;
     if let Some(code) = reply.get("error").and_then(Value::as_str) {
         return Err(send_error(code));
     }
@@ -638,6 +702,7 @@ fn decode_cursor(cursor: &str) -> Result<Value, AppError> {
 /// Maps a session reply: a refusal code, or the raw `Runtime.evaluate` result.
 fn read_page(reply: &Value) -> Result<Page, AppError> {
     let invalid = || AppError::Desktop("the Teams page returned an invalid chat response".into());
+    refused(reply)?;
     if let Some(code) = reply.get("error").and_then(Value::as_str) {
         let status = serde_json::from_value::<ProbeStatus>(json!(code)).ok();
         if code == "account_ambiguous" {
@@ -716,7 +781,7 @@ pub fn platform() -> Result<&'static str, AppError> {
 }
 
 /// Commands for manual setup and the confirmed WSL TUI restart. macOS uses
-/// process-only environment; Windows/WSL preserve and restore the user's WebView2 variable.
+/// process-only environment; Windows/WSL set the flags only for the Teams launch.
 #[derive(Debug, Serialize)]
 pub struct DebuggingSetup {
     /// `zsh` on macOS, `wsl` for a WSL shell, `powershell` on Windows.
@@ -757,7 +822,7 @@ impl DebuggingSetup {
             _ => "PowerShell",
         };
         format!(
-            "To open Teams' debugging port, run this in {shell}. It restarts Teams, which ends any call in progress:\n  {}\nTo close it again:\n  {}\nManaged setup preserves existing settings. `teams desktop recover` restores settings after an interrupted setup. While the port is open, any program running as you can read your chats and send as you.",
+            "To open Teams' debugging port, run this in {shell}. It restarts Teams, which ends any call in progress:\n  {}\nTo close it again:\n  {}\nThe flags apply only to that Teams launch; other apps and your settings are unchanged. If setup is interrupted, run `teams desktop recover`. While the port is open, any program running as you can read your chats and send as you.",
             self.open, self.close
         )
     }

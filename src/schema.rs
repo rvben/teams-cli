@@ -25,7 +25,7 @@ fn debugging_setup() -> Value {
     object_field(
         "debugging_setup",
         true,
-        "Managed connection commands, available when no endpoint listens. Restart commands require confirmation and preserve prior settings; recover restores interrupted setup settings",
+        "Managed connection commands, available when no endpoint listens. Restart commands require confirmation and pass debugging flags only to the Teams launch; recover clears an interrupted setup; clear-flags removes debugging flags from the user-wide WebView2 setting after confirmation",
         vec![
             described(
                 field("shell", "string"),

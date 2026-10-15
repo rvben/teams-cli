@@ -24,7 +24,10 @@ fn failure(code: &str) -> AppError {
             "A saved desktop session needs attention; run `teams desktop recover`, then disconnect it before connecting again"
         }
         "existing_flags" => {
-            "Existing remote-debugging flags were preserved; close that debugging session before using managed connect"
+            "The user-wide WebView2 setting already has remote-debugging flags, which open the port in every WebView2 app; run `teams desktop clear-flags` first"
+        }
+        "launcher_missing" => {
+            "The ms-teams.exe app execution alias is missing; turn it on under Settings > Apps > Advanced app settings > App execution aliases, then retry"
         }
         "settings_changed" => {
             "Debugging settings changed outside this CLI and were preserved; restore the prior settings manually before retrying recovery"
@@ -36,7 +39,7 @@ fn failure(code: &str) -> AppError {
             "The desktop recovery record is missing or invalid; no settings were changed. Close debugging manually using `teams doctor`"
         }
         _ => {
-            "Desktop connection operation failed; run `teams desktop recover` to restore interrupted setup settings, then `teams doctor`"
+            "Desktop connection operation failed; run `teams desktop recover`, then `teams doctor`"
         }
     };
     AppError::Desktop(message.into())
@@ -76,10 +79,10 @@ pub async fn manage_visible(
     let metadata = client.probe().await?;
     if matches!(action, Action::Connect) && !metadata.endpoint_available() {
         if metadata.status != ProbeStatus::NoListener {
-            return Err(AppError::Desktop(metadata.status.detail().into()));
+            return Err(AppError::Desktop(metadata.detail()));
         }
-        // Even if starting or waiting fails, preserve a recovery record and try to
-        // restore the temporary user variable. A killed process can recover next run.
+        // Even if starting or waiting fails, keep a recovery record so a killed
+        // process can recover on the next run.
         let result = async {
             local("connect", client.port, false, Some(&token)).await?;
             for _ in 0..20 {
@@ -90,7 +93,7 @@ pub async fn manage_visible(
                     return Ok(());
                 }
                 if current.status != ProbeStatus::NoListener {
-                    return Err(AppError::Desktop(current.status.detail().into()));
+                    return Err(AppError::Desktop(current.detail()));
                 }
             }
             Err(AppError::Desktop("Teams has not opened its endpoint; run `teams desktop status` and `teams desktop recover` before trying again".into()))
@@ -103,7 +106,7 @@ pub async fn manage_visible(
         }
     } else if matches!(action, Action::Disconnect) {
         if !metadata.endpoint_available() && metadata.status != ProbeStatus::NoListener {
-            return Err(AppError::Desktop(metadata.status.detail().into()));
+            return Err(AppError::Desktop(metadata.detail()));
         }
         local(
             "disconnect",
@@ -122,6 +125,19 @@ pub async fn manage_visible(
     Ok(
         json!({"port":client.port,"endpoint_available":metadata.endpoint_available(),"session_verified":false,"management":state,"connection":metadata}),
     )
+}
+
+/// Removes remote-debugging flags from the user-wide WebView2 arguments, keeping the
+/// rest. Apps already running keep their port until they are fully quit.
+pub async fn clear_flags(client: &DesktopClient) -> Result<Value, AppError> {
+    if cfg!(target_os = "macos") || client.kind.is_browser() {
+        return Err(AppError::Unsupported(
+            "clear-flags applies to the Teams desktop app on Windows or WSL".into(),
+        ));
+    }
+    super::platform()?;
+    let value = local("clear_flags", client.port, false, None).await?;
+    Ok(json!({"port":client.port,"cleared":value["cleared"] == true}))
 }
 
 async fn local(

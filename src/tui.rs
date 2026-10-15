@@ -210,6 +210,8 @@ enum Action {
 enum Outcome {
     DebuggingRequired,
     Restarted(Result<(), AppError>),
+    StrayFlags(Vec<String>),
+    FlagsCleared(Result<(), AppError>),
     Chats {
         more: bool,
         result: Result<Page, AppError>,
@@ -236,6 +238,32 @@ enum DebuggingRestart {
     Offered,
     Confirming,
     Running,
+}
+
+/// Cleanup of user-wide WebView2 debugging flags that let other apps hold the port.
+#[derive(Clone, PartialEq, Eq)]
+struct FlagCleanup {
+    stage: Cleanup,
+    /// Applications that served the port, to quit and reopen afterwards.
+    apps: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cleanup {
+    Offered,
+    Confirming,
+    Running,
+    Done,
+}
+
+impl FlagCleanup {
+    fn apps(&self) -> String {
+        if self.apps.is_empty() {
+            "the apps that use WebView2".into()
+        } else {
+            self.apps.join(", ")
+        }
+    }
 }
 
 enum Load {
@@ -331,6 +359,7 @@ struct App {
     chat_cursor: Option<String>,
     chats_load: Load,
     debugging_restart: Option<DebuggingRestart>,
+    flag_cleanup: Option<FlagCleanup>,
     loading_more: bool,
     filter: String,
     /// Indices into `rows` that pass the filter, in ledger order.
@@ -379,6 +408,7 @@ impl App {
             chat_cursor: None,
             chats_load: Load::Loading,
             debugging_restart: None,
+            flag_cleanup: None,
             loading_more: false,
             filter: String::new(),
             visible: Vec::new(),
@@ -528,6 +558,7 @@ impl App {
 
     fn load_chats(&mut self, more: bool) {
         self.debugging_restart = None;
+        self.flag_cleanup = None;
         let initial = !more && !matches!(self.chats_load, Load::Ready);
         let cursor = if more {
             if self.loading_more || self.chat_cursor.is_none() {
@@ -554,6 +585,14 @@ impl App {
                         return;
                     }
                     let result = backend.chats(PAGE, cursor.as_deref()).await;
+                    if initial
+                        && result.is_err()
+                        && let TeamsBackend::Desktop(client) = backend.as_ref()
+                        && let Some(apps) = client.stray_debugging_flags().await
+                    {
+                        let _ = sender.send(Outcome::StrayFlags(apps));
+                        return;
+                    }
                     let _ = sender.send(Outcome::Chats { more, result });
                 });
             }
@@ -626,6 +665,29 @@ impl App {
                 self.debugging_restart = Some(DebuggingRestart::Offered);
                 self.notice = Notice::new(Tone::Quiet, "Teams needs debugging enabled to connect");
             }
+            Outcome::StrayFlags(apps) => {
+                self.fetching_chats = false;
+                self.flag_cleanup = Some(FlagCleanup {
+                    stage: Cleanup::Offered,
+                    apps,
+                });
+                self.notice =
+                    Notice::new(Tone::Quiet, "Another app holds the Teams debugging port");
+            }
+            Outcome::FlagsCleared(result) => match result {
+                Ok(()) => {
+                    if let Some(cleanup) = &mut self.flag_cleanup {
+                        cleanup.stage = Cleanup::Done;
+                    }
+                    self.notice = Notice::new(Tone::Quiet, "Debugging flags removed");
+                }
+                Err(error) => {
+                    self.flag_cleanup = None;
+                    self.chats_load = Load::failed(&error);
+                    self.notice =
+                        Notice::new(Tone::Error, "Flags were not removed; press r to retry");
+                }
+            },
             Outcome::Restarted(result) => {
                 self.debugging_restart = None;
                 match result {
@@ -1245,6 +1307,22 @@ impl App {
         });
     }
 
+    fn clear_flags(&mut self) {
+        let Some(backend) = self.backend() else {
+            return;
+        };
+        if let Some(cleanup) = &mut self.flag_cleanup {
+            cleanup.stage = Cleanup::Running;
+        }
+        self.notice = Notice::new(Tone::Quiet, "Removing debugging flags…");
+        let sender = self.outcomes.0.clone();
+        tokio::spawn(async move {
+            if let TeamsBackend::Desktop(client) = backend.as_ref() {
+                let _ = sender.send(Outcome::FlagsCleared(client.clear_debugging_flags().await));
+            }
+        });
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && key.code == KeyCode::Char('c') {
@@ -1262,6 +1340,26 @@ impl App {
                 }
                 (DebuggingRestart::Offered, KeyCode::Char('r')) => self.load_chats(false),
                 (DebuggingRestart::Offered, KeyCode::Esc) => return Action::Quit,
+                _ => {}
+            }
+            return Action::None;
+        }
+        if let Some(stage) = self.flag_cleanup.as_ref().map(|cleanup| cleanup.stage) {
+            match (stage, key.code) {
+                (_, KeyCode::Char('q')) => return Action::Quit,
+                (Cleanup::Offered, KeyCode::Enter) => {
+                    if let Some(cleanup) = &mut self.flag_cleanup {
+                        cleanup.stage = Cleanup::Confirming;
+                    }
+                }
+                (Cleanup::Confirming, KeyCode::Char('y')) => self.clear_flags(),
+                (Cleanup::Confirming, _) => {
+                    if let Some(cleanup) = &mut self.flag_cleanup {
+                        cleanup.stage = Cleanup::Offered;
+                    }
+                }
+                (Cleanup::Offered | Cleanup::Done, KeyCode::Char('r')) => self.load_chats(false),
+                (Cleanup::Offered | Cleanup::Done, KeyCode::Esc) => return Action::Quit,
                 _ => {}
             }
             return Action::None;
@@ -1489,6 +1587,34 @@ impl App {
                         "While enabled, programs running as you can read chats and send as you.",
                         theme.muted(),
                     ),
+                ],
+                theme.active_rule(),
+            );
+        } else if let Some(cleanup) = &self.flag_cleanup {
+            let apps = cleanup.apps();
+            let (title, copy) = match cleanup.stage {
+                Cleanup::Offered => (
+                    "DEBUGGING LEFT ON",
+                    format!("{apps} holds the Teams port through a user-wide WebView2 debugging setting. Remove just those flags?"),
+                ),
+                Cleanup::Confirming => (
+                    "REMOVE DEBUGGING FLAGS?",
+                    "Edits the user-wide WebView2 arguments and keeps its other arguments. Remove now?".into(),
+                ),
+                Cleanup::Running => ("REMOVING FLAGS", "Updating the user-wide setting…".into()),
+                Cleanup::Done => (
+                    "FLAGS REMOVED",
+                    format!("Quit {apps} completely and reopen, then press r."),
+                ),
+            };
+            state_panel(
+                frame,
+                body,
+                theme,
+                title,
+                vec![
+                    Line::styled(copy, theme.body()),
+                    Line::styled("Apps keep the port until fully quit.", theme.muted()),
                 ],
                 theme.active_rule(),
             );
@@ -1892,6 +2018,21 @@ impl App {
                 ],
                 DebuggingRestart::Running => vec![("q", "quit", 0)],
             }
+        } else if let Some(cleanup) = &self.flag_cleanup {
+            match cleanup.stage {
+                Cleanup::Offered => vec![
+                    ("enter", "remove flags", 0),
+                    ("r", "retry", 1),
+                    ("q", "quit", 0),
+                ],
+                Cleanup::Confirming => vec![
+                    ("y", "remove flags", 0),
+                    ("esc", "cancel", 0),
+                    ("q", "quit", 1),
+                ],
+                Cleanup::Running => vec![("q", "quit", 0)],
+                Cleanup::Done => vec![("r", "retry", 0), ("q", "quit", 0)],
+            }
         } else if let Some(compose) = &self.compose {
             match compose.stage {
                 Stage::Editing => vec![
@@ -1937,6 +2078,7 @@ impl App {
             ]
         };
         if self.debugging_restart.is_none()
+            && self.flag_cleanup.is_none()
             && self.compose.is_none()
             && self.overlay.is_none()
             && !self.sign_in_needed()
@@ -2818,6 +2960,75 @@ mod tests {
                 if state == DebuggingRestart::Confirming {
                     assert!(text.contains("ends any call"), "{text}");
                     assert!(text.contains("cancel"), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flag_cleanup_requires_confirmation_and_ends_with_a_retry() {
+        let mut app = demo_app();
+        app.apply(Outcome::StrayFlags(vec!["OUTLOOK.EXE".into()]));
+        let stage = |app: &App| app.flag_cleanup.as_ref().map(|cleanup| cleanup.stage);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(stage(&app) == Some(Cleanup::Offered));
+        press(&mut app, KeyCode::Enter);
+        assert!(stage(&app) == Some(Cleanup::Confirming));
+        press(&mut app, KeyCode::Esc);
+        assert!(stage(&app) == Some(Cleanup::Offered));
+        press(&mut app, KeyCode::Enter);
+        // The demo app has no desktop client, so nothing is changed.
+        press(&mut app, KeyCode::Char('y'));
+        assert!(stage(&app) == Some(Cleanup::Confirming));
+        app.apply(Outcome::FlagsCleared(Ok(())));
+        assert!(stage(&app) == Some(Cleanup::Done));
+        assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::Quit));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.flag_cleanup.is_none());
+        assert!(matches!(app.chats_load, Load::Ready));
+
+        app.apply(Outcome::StrayFlags(vec![]));
+        app.apply(Outcome::FlagsCleared(Err(AppError::Desktop(
+            "Clearing failed".into(),
+        ))));
+        assert!(app.flag_cleanup.is_none());
+        assert!(matches!(app.chats_load, Load::Failed { auth: false, .. }));
+    }
+
+    #[test]
+    fn flag_cleanup_panels_name_the_apps_and_the_consequences() {
+        for (width, height) in [(50, 14), (80, 24), (120, 30)] {
+            for stage in [
+                Cleanup::Offered,
+                Cleanup::Confirming,
+                Cleanup::Running,
+                Cleanup::Done,
+            ] {
+                let mut app = demo_app();
+                app.chats_load = Load::Loading;
+                app.flag_cleanup = Some(FlagCleanup {
+                    stage,
+                    apps: vec!["OUTLOOK.EXE".into()],
+                });
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                let text = buffer_text(terminal.backend().buffer());
+                let words = text
+                    .replace('│', " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(words.contains("until fully quit"), "{text}");
+                assert!(text.contains("quit"), "{text}");
+                match stage {
+                    Cleanup::Offered | Cleanup::Done => {
+                        assert!(words.contains("OUTLOOK.EXE"), "{text}")
+                    }
+                    Cleanup::Confirming => {
+                        assert!(words.contains("keeps its other"), "{text}");
+                        assert!(text.contains("cancel"), "{text}");
+                    }
+                    Cleanup::Running => {}
                 }
             }
         }

@@ -66,7 +66,7 @@ impl<S: Verifier> Session<S> {
             return Ok(refusal(ProbeStatus::MetadataProbeFailed));
         };
         if metadata.status != ProbeStatus::MetadataOk {
-            return Ok(refusal(metadata.status));
+            return Ok(refusal_for(&metadata));
         }
         let candidates = match selected_pages(&targets, account) {
             Ok(pages) => pages,
@@ -140,7 +140,7 @@ impl<S: Verifier> Session<S> {
             return Err(refusal(ProbeStatus::MetadataProbeFailed));
         };
         if metadata.status != ProbeStatus::MetadataOk {
-            return Err(refusal(metadata.status));
+            return Err(refusal_for(&metadata));
         }
         let candidates = selected_pages(&targets, account)?;
         if candidates.is_empty() {
@@ -234,6 +234,11 @@ fn send_params(request: &Value) -> Result<(u16, Value), AppError> {
 
 fn refusal(status: ProbeStatus) -> Value {
     json!({"error": status})
+}
+
+/// Carries the sanitized diagnosis so the caller can explain the refusal.
+fn refusal_for(metadata: &ConnectionMetadata) -> Value {
+    json!({"error": metadata.status, "connection": metadata})
 }
 
 fn valid_port(port: u16) -> Result<(), AppError> {
@@ -714,10 +719,9 @@ mod tests {
             trusted: vec![],
             ..FakeSystem::teams()
         });
-        assert_eq!(
-            session.read(&request).await.unwrap(),
-            json!({"error": "non_teams_listener_refused"})
-        );
+        let reply = session.read(&request).await.unwrap();
+        assert_eq!(reply["error"], "non_teams_listener_refused");
+        assert_eq!(reply["connection"]["teams_owned"], false);
     }
 
     fn send_request(port: u16) -> Value {
@@ -825,9 +829,12 @@ mod tests {
         });
         let sends = Arc::new(AtomicUsize::new(0));
         let port = teams_window(sends.clone(), true, "https://teams.microsoft.com").await;
+        let reply = untrusted.send(&send_request(port)).await.unwrap();
+        assert_eq!(reply["error"], "non_teams_listener_refused");
+        assert_eq!(reply["connection"]["teams_owned"], false);
         assert_eq!(
-            untrusted.send(&send_request(port)).await.unwrap(),
-            json!({"error": "non_teams_listener_refused"})
+            reply["connection"]["foreign_listeners"],
+            json!(["ms-teams.exe"])
         );
         assert_eq!(sends.load(Ordering::SeqCst), 0);
         let empty = devtools_server(json!([]), |_| None).await;

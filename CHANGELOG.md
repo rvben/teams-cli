@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **desktop**: add `teams desktop clear-flags` and a confirmed TUI cleanup that remove remote-debugging flags from the user-wide WebView2 setting while keeping its other arguments.
+
+### Fixed
+
+- **desktop**: pass the debugging flags only to the Teams launch on Windows and WSL, so other WebView2 apps such as Outlook no longer open the debugging port.
+- **desktop**: name the application that holds a refused port and report a user-wide debugging setting as the cause.
+
 ## [0.2.0](https://github.com/rvben/teams-cli/compare/v0.1.13...v0.2.0) - 2026-10-14
 
 ### Added

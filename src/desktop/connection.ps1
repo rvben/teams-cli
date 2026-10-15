@@ -1,10 +1,15 @@
 # The request contains only a fixed action, port and restart boolean. This script is
 # shared by native Windows and WSL so both use the same lock and recovery record.
+# Debugging flags are given to the Teams launch only. A user-wide value would reach
+# every WebView2 application (Outlook, Widgets, ...) started while it is set.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $dir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'teams-cli'
 $file = Join-Path $dir 'desktop-connection.json'
 $key = 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'
+# The app execution alias passes this process's environment on to Teams;
+# shell:AppsFolder activation would not.
+$launcher = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\WindowsApps\ms-teams.exe'
 $mutex = [Threading.Mutex]::new($false, ('Local\teams-cli-desktop-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value))
 $locked = $false
 function Save-State {
@@ -46,7 +51,16 @@ function Listener-Owners([int]$port) {
         if (!$found) { throw 'session_changed' }
     }
 }
+function Start-Teams([string]$flags) {
+    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $flags
+    Start-Process $launcher
+}
+function Without-Debugging([string]$value) {
+    ($value -replace '\s*(?<!\S)--remote-debugging-(port|address)(=\S*|\s+(?!-)\S+)?(?!\S)', '').Trim()
+}
+# Only records written by older versions changed the user-wide value.
 function Restore-Settings {
+    if (!$script:state.settings_pending) { return }
     $current = [Environment]::GetEnvironmentVariable($key, 'User')
     if ($current -ceq $script:state.installed) {
         [Environment]::SetEnvironmentVariable($key, $script:state.previous, 'User')
@@ -69,24 +83,32 @@ try {
     $script:state = $null
     if (Test-Path -LiteralPath $file) {
         $script:state = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
-        if ($script:state.version -ne 1 -or $script:state.port -lt 1024 -or $null -eq $script:state.phase) { throw 'invalid_state' }
+        if ($script:state.version -notin 1,2 -or $script:state.port -lt 1024 -or $null -eq $script:state.phase) { throw 'invalid_state' }
     }
     if ($request.action -eq 'status') { Result | ConvertTo-Json -Compress; return }
+    if ($request.action -eq 'clear_flags') {
+        # A legacy record still owns the user-wide value until it is recovered.
+        if ($null -ne $script:state -and $script:state.settings_pending) { throw 'already_managed' }
+        $current = [Environment]::GetEnvironmentVariable($key, 'User')
+        $cleared = Without-Debugging $current
+        $changed = $cleared -cne [string]$current
+        if ($changed) { [Environment]::SetEnvironmentVariable($key, $cleared, 'User') } # Empty removes it.
+        Result | Add-Member -NotePropertyName cleared -NotePropertyValue $changed -PassThru | ConvertTo-Json -Compress
+        return
+    }
     if ($null -ne $script:state -and $script:state.port -ne $request.port) { throw 'different_port' }
     if ($null -ne $request.token -and $null -ne $script:state -and $request.token -cne $script:state.token) { throw 'busy' }
     switch ($request.action) {
         'connect' {
             if ($null -ne $script:state) { throw 'already_managed' }
-            $previous = [Environment]::GetEnvironmentVariable($key, 'User')
-            if ($previous -match '--remote-debugging-(port|address)(=|\s)') { throw 'existing_flags' }
-            $installed = ($previous + ' --remote-debugging-port=' + $request.port + ' --remote-debugging-address=127.0.0.1').Trim()
-            $script:state = [PSCustomObject]@{ version = 1; port = $request.port; previous = $previous; installed = $installed; settings_pending = $true; phase = 'starting'; token = $request.token; owners = @() }
-            Save-State # Durable recovery record precedes every environment change.
-            [Environment]::SetEnvironmentVariable($key, $installed, 'User')
-            $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $installed
+            $own = [Environment]::GetEnvironmentVariable($key, 'User')
+            if ($own -match '(?<!\S)--remote-debugging-(port|address)(=|\s|$)') { throw 'existing_flags' }
+            if (!(Test-Path -LiteralPath $launcher)) { throw 'launcher_missing' }
+            $script:state = [PSCustomObject]@{ version = 2; port = $request.port; phase = 'starting'; token = $request.token; owners = @() }
+            Save-State # Durable recovery record precedes stopping Teams.
             foreach ($owner in (Processes)) { Stop-Process -Id $owner.id -ErrorAction Stop }
             Start-Sleep -Seconds 2
-            Start-Process 'shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams'
+            Start-Teams (($own + ' --remote-debugging-port=' + $request.port + ' --remote-debugging-address=127.0.0.1').Trim())
         }
         'finish' {
             if ($null -eq $script:state) { throw 'missing_state' }
@@ -125,9 +147,8 @@ try {
                 foreach ($owner in $matching) { Stop-Process -Id $owner.id -ErrorAction Stop }
                 Start-Sleep -Seconds 2
                 if (@(Listener-Owners $request.port).Count -gt 0) { throw 'session_changed' }
-                # Set only this launch's environment; the previous user value is already restored.
-                $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $script:state.previous
-                Start-Process 'shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams'
+                # Any legacy user-wide change is already restored above.
+                Start-Teams ([Environment]::GetEnvironmentVariable($key, 'User'))
             }
             Remove-Item -LiteralPath $file
             $script:state = $null
@@ -138,7 +159,7 @@ try {
 } catch {
     # Never return arbitrary PowerShell exceptions: they can contain private settings.
     $code = $_.Exception.Message
-    if ($code -notin @('busy','invalid_state','different_port','already_managed','existing_flags','missing_state','session_changed','settings_changed','not_managed','invalid_action')) { $code = 'operation_failed' }
+    if ($code -notin @('busy','invalid_state','different_port','already_managed','existing_flags','launcher_missing','missing_state','session_changed','settings_changed','not_managed','invalid_action')) { $code = 'operation_failed' }
     @{ error = $code } | ConvertTo-Json -Compress
 } finally {
     if ($locked) { $mutex.ReleaseMutex() }

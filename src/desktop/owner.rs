@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 const TEAMS_EXECUTABLE: &str = "ms-teams.exe";
+const WEBVIEW_EXECUTABLE: &str = "msedgewebview2.exe";
 
 pub struct Listener {
     pub pid: u32,
@@ -20,6 +21,9 @@ pub trait System: Send + Sync {
     fn processes(&self) -> Result<HashMap<u32, (u32, String)>, AppError>;
     /// Whether `pid` belongs to the installed Teams package and runs as the current user.
     fn trusted_teams(&self, pid: u32) -> bool;
+    /// Whether the user-wide WebView2 arguments contain remote-debugging flags,
+    /// which open the port in every WebView2 application the user starts.
+    fn user_debugging_flags(&self) -> bool;
 }
 
 impl<S: System> super::session::Verifier for S {
@@ -46,12 +50,23 @@ pub async fn verify(
         return Ok((metadata, vec![]));
     }
     let processes = system.processes()?;
-    let owned = listeners.iter().all(|listener| {
-        teams_ancestor(&processes, listener.pid).is_some_and(|pid| system.trusted_teams(pid))
-    });
-    metadata.teams_owned = Some(owned);
-    if !owned {
+    let foreign: Vec<_> = listeners
+        .iter()
+        .filter(|listener| {
+            !teams_ancestor(&processes, listener.pid).is_some_and(|pid| system.trusted_teams(pid))
+        })
+        .collect();
+    metadata.teams_owned = Some(foreign.is_empty());
+    if !foreign.is_empty() {
         metadata.status = ProbeStatus::NonTeamsListenerRefused;
+        let mut names: Vec<_> = foreign
+            .iter()
+            .filter_map(|listener| host_name(&processes, listener.pid))
+            .collect();
+        names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        metadata.foreign_listeners = names;
+        metadata.user_debugging_flags = system.user_debugging_flags();
         return Ok((metadata, vec![]));
     }
     let targets = fill_metadata(&mut metadata).await;
@@ -75,6 +90,33 @@ fn teams_ancestor(processes: &HashMap<u32, (u32, String)>, mut pid: u32) -> Opti
     None
 }
 
+/// The application a listener serves: WebView2 processes are attributed to the
+/// nearest ancestor that is not WebView2 itself. Only short, plain names are reported.
+fn host_name(processes: &HashMap<u32, (u32, String)>, mut pid: u32) -> Option<String> {
+    let mut seen = HashSet::new();
+    let mut name = None;
+    for _ in 0..32 {
+        if pid == 0 || !seen.insert(pid) {
+            break;
+        }
+        let Some((parent, current)) = processes.get(&pid) else {
+            break;
+        };
+        name = Some(current);
+        if !current.eq_ignore_ascii_case(WEBVIEW_EXECUTABLE) {
+            break;
+        }
+        pid = *parent;
+    }
+    name.filter(|name| {
+        name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+    })
+    .cloned()
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -84,6 +126,7 @@ pub mod tests {
         pub listeners: Vec<(u32, bool)>,
         pub processes: Vec<(u32, u32, &'static str)>,
         pub trusted: Vec<u32>,
+        pub user_flags: bool,
     }
 
     impl FakeSystem {
@@ -97,6 +140,7 @@ pub mod tests {
                     (10, 1, "explorer.exe"),
                 ],
                 trusted: vec![20],
+                user_flags: false,
             }
         }
     }
@@ -118,6 +162,9 @@ pub mod tests {
         }
         fn trusted_teams(&self, pid: u32) -> bool {
             self.trusted.contains(&pid)
+        }
+        fn user_debugging_flags(&self) -> bool {
+            self.user_flags
         }
     }
 
@@ -168,6 +215,52 @@ pub mod tests {
                 Some(false)
             )
         );
+    }
+
+    #[tokio::test]
+    async fn refusals_name_the_host_application_and_the_user_wide_flags() {
+        // Outlook's WebView2 opened the port because of a user-wide setting.
+        let mut outlook = FakeSystem::teams();
+        outlook.listeners.push((42, true));
+        outlook.processes.extend([
+            (42, 41, "msedgewebview2.exe"),
+            (41, 40, "msedgewebview2.exe"),
+            (40, 10, "OUTLOOK.EXE"),
+            (43, 10, "Widgets.exe"),
+        ]);
+        outlook.user_flags = true;
+        let (metadata, _) = verify(&outlook, 9222).await.unwrap();
+        assert_eq!(metadata.foreign_listeners, ["OUTLOOK.EXE"]);
+        assert!(metadata.user_debugging_flags);
+        assert!(metadata.detail().contains("served by OUTLOOK.EXE"));
+        assert!(metadata.detail().contains("teams desktop clear-flags"));
+        assert_eq!(
+            metadata.stray_debugging_flags(),
+            Some(["OUTLOOK.EXE".to_string()].as_slice())
+        );
+        // Several listeners from one app are named once; Teams itself is not named.
+        outlook.listeners.extend([(42, true), (43, true)]);
+        let (metadata, _) = verify(&outlook, 9222).await.unwrap();
+        assert_eq!(metadata.foreign_listeners, ["OUTLOOK.EXE", "Widgets.exe"]);
+        // An untrusted Teams copy and an unknown process: nothing to clean up.
+        let mut other = FakeSystem {
+            trusted: vec![],
+            ..FakeSystem::teams()
+        };
+        other.listeners.push((77, true));
+        other.processes.push((50, 10, "bad\\name<script>.exe"));
+        other.listeners.push((50, true));
+        let (metadata, _) = verify(&other, 9222).await.unwrap();
+        assert_eq!(metadata.foreign_listeners, ["ms-teams.exe"]);
+        assert!(!metadata.user_debugging_flags);
+        assert_eq!(metadata.stray_debugging_flags(), None);
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert!(json.get("user_debugging_flags").is_none());
+        // A healthy probe never reports either field.
+        let mut healthy = FakeSystem::teams();
+        healthy.user_flags = true;
+        let (metadata, _) = verify(&healthy, 9222).await.unwrap();
+        assert!(metadata.foreign_listeners.is_empty() && !metadata.user_debugging_flags);
     }
 
     #[test]

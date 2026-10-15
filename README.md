@@ -279,15 +279,22 @@ Added auxiliary processes are left alone. If Teams was
 restarted independently, quit and relaunch it normally, then disconnect again to
 clear the old record. No command automatically restarts Teams on exit.
 
-On macOS, flags apply only to the managed launch. On Windows/WSL, setup saves the
-previous user environment value, applies flags temporarily while Teams starts, then
-restores that value. Unrelated changes to the value are preserved and reported.
+Debugging flags apply only to the managed Teams launch; other apps and the user
+environment are left unchanged. On Windows/WSL, Teams starts through its
+`ms-teams.exe` app execution alias, which must be enabled (Settings > Apps >
+Advanced app settings > App execution aliases). Connect refuses a user-wide
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` that already has debugging flags: such a
+setting opens the port in every WebView2 app, for example Outlook, and the
+listener is then refused because Teams does not own it. Errors name those apps.
+`teams desktop clear-flags` removes only the debugging flags from that setting
+after confirmation (`--yes` when scripted); quit and reopen the named apps
+afterwards. The TUI offers the same cleanup.
 Windows and WSL share a recovery record and lock. WSL finds PowerShell in its normal
 Windows system directory even when Windows PATH entries are disabled; Windows
 executable interop must still be enabled.
 
-If setup is interrupted, run `teams --profile local desktop recover`. It restores
-pending settings without restarting Teams or requiring the Windows helper; it does
+If setup is interrupted, run `teams --profile local desktop recover`. It clears the
+interrupted record (and restores settings left by older versions) without restarting Teams or requiring the Windows helper; it does
 not claim ownership of an unrecorded Teams process. Use `desktop status` to inspect
 the endpoint and saved session. Recovery cannot close an already-running debugging
 endpoint: quit Teams and relaunch it normally if its ownership was not recorded.
