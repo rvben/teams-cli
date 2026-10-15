@@ -331,10 +331,11 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
         let client = DesktopClient::from_profile(&profile)?;
         if profile.desktop_client.is_browser() {
             confirm_browser_connection(yes)?;
-            client
+            let login = client
                 .login_with_progress(out.quiet)
                 .await
                 .map_err(|error| error.with_hint("No profile was saved."))?;
+            let mode = browser_mode(&login);
             let chats = client.chats(1, None).await?;
             let connection = client.probe().await?;
             let path = config::save(profile_name, profile.clone())?;
@@ -344,7 +345,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
                 "session_verified":true,"teams_restarted":false,"browser_started":true,
                 "chat_list_empty":chats.items.is_empty(),"connection":connection}),
             );
-            return out.value(&value, || format!("Connected desktop profile '{profile_name}'; browser is running headless.\nConfig: {}\nNext: `teams --profile {profile_name}` opens your inbox", path.display()));
+            return out.value(&value, || format!("Connected desktop profile '{profile_name}'; browser is running {mode}.\nConfig: {}\nNext: `teams --profile {profile_name}` opens your inbox", path.display()));
         }
         let mut connection = client.probe().await?;
         let needs_restart = !connection.endpoint_available();
@@ -1283,6 +1284,15 @@ fn confirm_teams_restart(yes: bool, note: Option<&str>, on_refusal: &str) -> Res
     Ok(())
 }
 
+/// How a verified browser sign-in left the browser, from its management status.
+fn browser_mode(status: &serde_json::Value) -> &'static str {
+    if status["management"]["visible"] == true {
+        "visible; keep its window open"
+    } else {
+        "headless"
+    }
+}
+
 fn confirm_browser_connection(yes: bool) -> Result<(), AppError> {
     if yes {
         return Ok(());
@@ -1410,7 +1420,10 @@ async fn desktop_connection(
     };
     out.value(&value, || {
         if login {
-            return "Teams sign-in verified; the browser is running headless.".into();
+            return format!(
+                "Teams sign-in verified; the browser is running {}.",
+                browser_mode(&value)
+            );
         }
         format!(
             "Desktop endpoint: {}. Managed session: {}. Recovery needed: {}.",

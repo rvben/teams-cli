@@ -132,6 +132,15 @@ impl ConnectionMetadata {
             && self.teams_owned == Some(true)
     }
 
+    /// The verified browser shows web pages but no Teams page: Teams was sent to sign-in.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub fn signed_out(&self) -> bool {
+        let pages: Vec<_> = self.targets.iter().filter(|t| t.kind == "page").collect();
+        self.endpoint_available()
+            && pages.iter().any(|t| t.url_scheme == "https")
+            && !pages.iter().any(|t| t.teams_origin)
+    }
+
     /// The status explanation plus what is known about a refused listener.
     pub fn detail(&self) -> String {
         let mut detail = self.status.detail().to_string();
@@ -392,13 +401,28 @@ impl DesktopClient {
         request["account_type"] = json!(self.account);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
-            return read_page(&self.browser.lock().await.read(&request).await?).map_err(|e| {
-                e.with_hint(&format!(
-                    "Sign in again: `teams desktop login --desktop-client {} --port {}`",
-                    self.kind.as_str(),
-                    self.port
-                ))
-            });
+            let mut browser = self.browser.lock().await;
+            return match read_page(&browser.read(&request).await?) {
+                Ok(page) => Ok(page),
+                Err(error) => {
+                    let hint = format!(
+                        "Sign in again: `teams desktop login --desktop-client {} --port {}`.",
+                        self.kind.as_str(),
+                        self.port
+                    );
+                    let signed_out = browser
+                        .probe(self.port)
+                        .await
+                        .is_ok_and(|metadata| metadata.signed_out());
+                    Err(if signed_out {
+                        AppError::Desktop(format!(
+                            "Teams in the dedicated browser was sent back to Microsoft sign-in. {hint}"
+                        ))
+                    } else {
+                        error.with_hint(&hint)
+                    })
+                }
+            };
         }
         platform()?;
         #[cfg(any(windows, target_os = "macos"))]
@@ -605,7 +629,7 @@ fn send_error(code: &str) -> AppError {
             "The Teams window's send interface was not recognised; this Teams version is not supported for sending yet".into(),
         ),
         "no_target" => AppError::Desktop(
-            "No Teams window is available on the debugging endpoint; open Teams and sign in".into(),
+            "No Teams window is available on the debugging endpoint; open Teams and sign in.".into(),
         ),
         code => match serde_json::from_value::<ProbeStatus>(json!(code)) {
             Ok(status) => AppError::Desktop(status.detail().into()),
@@ -711,7 +735,7 @@ fn read_page(reply: &Value) -> Result<Page, AppError> {
         return Err(AppError::Desktop(match (status, code) {
             (Some(status), _) => status.detail().into(),
             (None, "no_target") => {
-                "No Teams window is available on the debugging endpoint; open Teams and sign in"
+                "No Teams window is available on the debugging endpoint; open Teams and sign in."
                     .into()
             }
             _ => "The Teams page could not be read over the debugging endpoint; run `teams doctor`"
@@ -1315,6 +1339,35 @@ mod tests {
             let output = serde_json::to_string(&target).unwrap();
             assert!(!output.contains("PRIVATE") && !output.contains("SECRET"));
         }
+    }
+
+    #[test]
+    fn sign_out_means_web_pages_without_a_teams_page() {
+        let metadata = |pages: &[(&str, &str)]| {
+            let mut metadata = ConnectionMetadata::empty(9224);
+            metadata.status = ProbeStatus::MetadataOk;
+            metadata.loopback_only = Some(true);
+            metadata.teams_owned = Some(true);
+            metadata.targets = pages
+                .iter()
+                .map(|(kind, url)| sanitize_target(&json!({"type":kind,"url":url})))
+                .collect();
+            metadata
+        };
+        let login = ("page", "https://login.microsoftonline.com/common/oauth2");
+        let federated = ("page", "https://adfs.example.com/adfs/ls/wia");
+        let teams = ("page", "https://teams.cloud.microsoft/");
+        let worker = ("service_worker", "https://teams.cloud.microsoft/sw.js");
+        assert!(metadata(&[login, worker]).signed_out());
+        assert!(metadata(&[federated]).signed_out());
+        assert!(!metadata(&[teams, worker]).signed_out());
+        assert!(!metadata(&[teams, login]).signed_out());
+        // A starting browser or the lightweight client's blank page is not a sign-out.
+        assert!(!metadata(&[]).signed_out());
+        assert!(!metadata(&[("page", "about:blank")]).signed_out());
+        let mut refused = metadata(&[login]);
+        refused.teams_owned = Some(false);
+        assert!(!refused.signed_out());
     }
 
     #[tokio::test]

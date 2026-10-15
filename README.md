@@ -394,6 +394,13 @@ A sign-in timeout leaves the visible window open; finish signing in and retry
 `desktop login`. Interrupting login preserves the browser and its saved profile.
 On WSL2, the visible step needs WSLg or another graphical display.
 
+Some organisations sign in through their own identity provider (for example AD FS
+with Windows sign-in) and do not let Teams renew its sign-in in a headless browser.
+For work/school accounts, login therefore watches the headless browser for up to a
+minute; when Teams is sent back to sign-in, the visible browser is reopened and stays
+open instead. Minimise that window, but keep it open. When a headless session is sent
+back to sign-in later, reads report it; run `desktop login` again.
+
 Use `--desktop-account personal` for a personal Microsoft account. Sending still
 requires an explicit `init --allow-send` and the existing send confirmation.
 `init --no-login` only saves configuration. `desktop connect --visible` remains
@@ -404,7 +411,8 @@ The browser uses its own profile under the local data directory at
 profile. Different ports use different browser profiles. Disconnect closes this
 browser and keeps its sign-in data. To switch between visible and headless operation,
 disconnect first. `desktop recover` closes a verified managed browser or clears a
-stale record when no listener remains. Unverifiable processes are left untouched.
+stale record when no listener remains. A verified browser that does not exit after
+closing its debugging port is stopped; unverifiable processes are left untouched.
 
 The CLI checks that every listener is loopback-only and belongs to the recorded
 browser process, running as you with the expected executable, debugging port and

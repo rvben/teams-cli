@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **desktop**: pass the debugging flags only to the Teams launch on Windows and WSL, so other WebView2 apps such as Outlook no longer open the debugging port.
 - **desktop**: name the application that holds a refused port and report a user-wide debugging setting as the cause.
+- **desktop**: recognise the dedicated browser on Linux and WSL when Chrome rewrites its process title, so setup no longer stops with "did not open its debugging endpoint"; recovery hints now name the browser mode and port in use.
+- **desktop**: keep the work/school browser visible when the organisation's sign-in (such as AD FS with Windows sign-in) does not let Teams stay signed in headless, instead of reporting success and then losing the session; reads now say when Teams was sent back to sign-in, and setup reports whether the browser runs headless or visible.
+- **desktop**: stop a verified dedicated browser that hangs after closing its debugging port, so disconnect and recover no longer leave it running.
 
 ## [0.2.0](https://github.com/rvben/teams-cli/compare/v0.1.13...v0.2.0) - 2026-10-14
 

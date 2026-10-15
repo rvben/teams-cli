@@ -1,5 +1,6 @@
 //! A dedicated Chromium profile. Verification precedes every page connection; closing
-//! uses the verified browser's DevTools socket, never a signal to an arbitrary PID.
+//! uses the verified browser's DevTools socket, never a signal to an arbitrary PID. Only
+//! the verified browser is signalled, when it does not exit after closing its endpoint.
 use super::{ConnectionMetadata, ProbeStatus, cdp::Cdp, connection::Action, session::Verifier};
 use crate::{config::DesktopAccount, error::AppError};
 use serde::{Deserialize, Serialize};
@@ -345,22 +346,37 @@ trait LoginSession {
     async fn connect(&mut self, visible: bool) -> Result<(), AppError>;
     async fn disconnect(&mut self) -> Result<(), AppError>;
     async fn wait_read(&mut self, timeout: Duration) -> Result<(), AppError>;
+    /// Whether the headless browser keeps Teams signed in for `period`.
+    async fn stays_signed_in(&mut self, period: Duration) -> Result<bool, AppError>;
 }
 
-async fn login_flow(session: &mut impl LoginSession) -> Result<(), AppError> {
+/// Returns whether the browser was left visible.
+async fn login_flow(session: &mut impl LoginSession) -> Result<bool, AppError> {
     session.connect(true).await?;
     session.wait_read(Duration::from_secs(300)).await.map_err(|error| error.with_hint(
         "The visible browser and its profile were preserved. Finish signing in and retry the sign-in command."))?;
     session.disconnect().await?;
     session.connect(false).await?;
     session.wait_read(Duration::from_secs(60)).await.map_err(|error| error.with_hint(
-        "The headless browser and saved profile were preserved. Retry the sign-in command to open the visible window again."))
+        "The headless browser and saved profile were preserved. Retry the sign-in command to open the visible window again."))?;
+    if session.stays_signed_in(Duration::from_secs(60)).await? {
+        return Ok(false);
+    }
+    // Teams renews its sign-in shortly after loading. Organisations that sign in through
+    // their own identity provider (such as AD FS with Windows sign-in) refuse that renewal
+    // headless and send the page back to sign-in, so the visible browser stays open.
+    session.disconnect().await?;
+    session.connect(true).await?;
+    session.wait_read(Duration::from_secs(300)).await.map_err(|error| error.with_hint(
+        "Your organisation's sign-in needs the visible browser; finish signing in there and retry the sign-in command."))?;
+    Ok(true)
 }
 
 struct BrowserLogin {
     port: u16,
     account: DesktopAccount,
     core: bool,
+    quiet: bool,
 }
 
 impl LoginSession for BrowserLogin {
@@ -412,6 +428,26 @@ impl LoginSession for BrowserLogin {
         })
         .await
         .map_err(|_| failed("Timed out waiting for a readable Teams chat cache"))?
+    }
+
+    async fn stays_signed_in(&mut self, period: Duration) -> Result<bool, AppError> {
+        // Personal accounts renew headless; their sign-in needs no extra wait.
+        if self.account == DesktopAccount::Personal {
+            return Ok(true);
+        }
+        if !self.quiet {
+            eprintln!("Checking that Teams stays signed in without its window (up to a minute).");
+        }
+        let system = BrowserSystem { core: self.core };
+        let deadline = tokio::time::Instant::now() + period;
+        while tokio::time::Instant::now() < deadline {
+            let (metadata, _) = system.verify(self.port).await?;
+            if metadata.signed_out() {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(true)
     }
 }
 
@@ -470,12 +506,18 @@ pub async fn login_with_progress(
             "Opening Teams sign-in. Complete sign-in in the window; it will hide automatically once your chats are ready."
         );
     }
-    login_flow(&mut BrowserLogin {
+    let visible = login_flow(&mut BrowserLogin {
         port,
         account,
         core,
+        quiet,
     })
     .await.map_err(|error| error.with_hint(&format!("Retry sign-in: `teams desktop login --desktop-client {} --port {port}`. To close this dedicated browser: `teams desktop disconnect --desktop-client {} --port {port}`.", if core { "browser-core" } else { "browser" }, if core { "browser-core" } else { "browser" })))?;
+    if visible && !quiet {
+        eprintln!(
+            "Your organisation's sign-in does not allow Teams to stay signed in without its window, so the browser stays visible. Minimise it, but keep it open."
+        );
+    }
     let mut value = manage(port, account, Action::Status, false, core).await?;
     value["session_verified"] = json!(true);
     Ok(value)
@@ -507,6 +549,10 @@ pub async fn manage(
     let _guard = Guard(lock);
     let mut state = load(&dir, port)?;
     let system = BrowserSystem { core };
+    let recover = format!(
+        "teams desktop recover --desktop-client {} --port {port}",
+        if core { "browser-core" } else { "browser" }
+    );
     if state.as_ref().is_some_and(|s| s.core != core) {
         return Err(failed(
             "this port uses another browser mode; use its original --desktop-client to disconnect it first",
@@ -530,9 +576,9 @@ pub async fn manage(
             }
             if let Some(current) = state.as_ref() {
                 if !owned(current, &dir) {
-                    return Err(failed(
-                        "the saved browser session is no longer owned; run desktop recover --desktop-client browser before connecting",
-                    ));
+                    return Err(failed(&format!(
+                        "the saved browser session is no longer owned; run `{recover}` before connecting"
+                    )));
                 }
                 if current.visible != visible {
                     return Err(failed(
@@ -555,9 +601,18 @@ pub async fn manage(
                     phase: "starting".into(),
                 };
                 save(&dir, &next)?;
-                let mut child = Command::new(session_executable(core, visible)?).args(launch_args(&dir, port, account, visible, core))
-                    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-                    .process_group(0).spawn().map_err(|error| failed(&format!("could not launch the Teams browser: {error}; run desktop recover --desktop-client browser")))?;
+                let mut child = Command::new(session_executable(core, visible)?)
+                    .args(launch_args(&dir, port, account, visible, core))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0)
+                    .spawn()
+                    .map_err(|error| {
+                        failed(&format!(
+                            "could not launch the Teams browser: {error}; run `{recover}`"
+                        ))
+                    })?;
                 let pid = child.id();
                 // Capture the process after exec, then reap it without tying its life to the CLI.
                 let owner = system::process(pid).map(|(identity, _)| identity);
@@ -581,9 +636,9 @@ pub async fn manage(
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             if !ready {
-                return Err(failed(
-                    "the browser did not open its debugging endpoint; its recovery record was preserved. Run desktop status/recover --desktop-client browser",
-                ));
+                return Err(failed(&format!(
+                    "the browser did not open its debugging endpoint; its recovery record was preserved. Inspect it with `teams desktop status`, or run `{recover}`."
+                )));
             }
             let current = state.as_mut().expect("browser state");
             if core && !visible && current.phase != "core_ready" {
@@ -627,12 +682,16 @@ pub async fn manage(
                 }
             }
             if let Some(current) = state.as_ref() {
-                if owned(current, &dir) {
+                if owned(current, &dir) && system::listeners(port)?.is_empty() {
+                    // It already released its endpoint, as after a close request it never
+                    // finished, so DevTools cannot reach it any more.
+                    stop(current, &dir).await?;
+                } else if owned(current, &dir) {
                     let (metadata, _) = system.verify(port).await?;
                     if !metadata.endpoint_available() {
-                        return Err(failed(
-                            "browser ownership could not be verified; close the dedicated browser manually, then run desktop recover --desktop-client browser",
-                        ));
+                        return Err(failed(&format!(
+                            "browser ownership could not be verified; close the dedicated browser manually, then run `{recover}`"
+                        )));
                     }
                     let (version, _) = super::read_metadata(port).await?;
                     let id = browser_id(&version, port)?;
@@ -640,16 +699,8 @@ pub async fn manage(
                         return Err(failed("the browser process changed; it was left untouched"));
                     }
                     Cdp::close_browser(port, &id).await?;
-                    for _ in 0..50 {
-                        if !owned(current, &dir) {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    if owned(current, &dir) {
-                        return Err(failed(
-                            "the browser has not closed; its recovery record was preserved",
-                        ));
+                    if !exited(current, &dir, Duration::from_secs(10)).await {
+                        stop(current, &dir).await?;
                     }
                 } else if current.owner.is_some() {
                     // A reused or changed PID is never contacted or signalled. Recover
@@ -685,6 +736,36 @@ pub async fn manage(
         "visible":state.as_ref().map(|s|s.visible),"core_only":core,"settings_pending":false,
         "needs_recovery":state.as_ref().is_some_and(|s|!matches!(s.phase.as_str(), "active" | "core_ready") || !live)}}),
     )
+}
+
+/// Whether the saved browser exits within `timeout`.
+async fn exited(state: &State, dir: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while owned(state, dir) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
+/// Stops the saved browser when it was asked to close and did not: Chrome can hang on
+/// exit after closing its endpoint. Only the process verified by PID, start time,
+/// executable and profile arguments is signalled.
+async fn stop(state: &State, dir: &Path) -> Result<(), AppError> {
+    if let Some(owner) = state.owner.as_ref()
+        && owned(state, dir)
+    {
+        // SAFETY: kill(2) has no memory effects; the PID was verified just above.
+        unsafe { libc::kill(owner.pid as libc::pid_t, libc::SIGKILL) };
+    }
+    if exited(state, dir, Duration::from_secs(5)).await {
+        return Ok(());
+    }
+    Err(failed(
+        "the browser has not closed; its recovery record was preserved. Close the dedicated browser manually, then recover.",
+    ))
 }
 
 impl BrowserSystem {
@@ -773,11 +854,7 @@ mod system {
             return Err(failed("browser belongs to another user"));
         }
         let before = std::fs::read_to_string(dir.join("stat"))?;
-        let args = std::fs::read(dir.join("cmdline"))?
-            .split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| OsString::from_vec(a.into()))
-            .collect();
+        let args = arguments(&std::fs::read(dir.join("cmdline"))?);
         let exe = std::fs::read_link(dir.join("exe"))?;
         let after = std::fs::read_to_string(dir.join("stat"))?;
         let started = start_time(&before)?;
@@ -792,6 +869,33 @@ mod system {
             },
             args,
         ))
+    }
+    /// Chrome rewrites its process title as its arguments joined by spaces, so /proc
+    /// can report a single argument; split that title back at each option.
+    pub fn arguments(cmdline: &[u8]) -> Vec<OsString> {
+        let args: Vec<_> = cmdline
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .collect();
+        let parts = match args[..] {
+            [title] => {
+                let mut parts = vec![];
+                let mut start = 0;
+                for i in 0..title.len().saturating_sub(2) {
+                    if &title[i..i + 3] == b" --" {
+                        parts.push(&title[start..i]);
+                        start = i + 1;
+                    }
+                }
+                parts.push(&title[start..]);
+                parts
+            }
+            _ => args,
+        };
+        parts
+            .into_iter()
+            .map(|a| OsString::from_vec(a.into()))
+            .collect()
     }
     pub fn start_time(stat: &str) -> Result<String, AppError> {
         stat.rsplit_once(") ")
@@ -966,6 +1070,7 @@ mod tests {
         fail_visible: bool,
         fail_headless: bool,
         fail_close: bool,
+        signs_out_headless: bool,
     }
     impl LoginSession for FakeLogin {
         async fn connect(&mut self, visible: bool) -> Result<(), AppError> {
@@ -992,12 +1097,16 @@ mod tests {
             }
             Ok(())
         }
+        async fn stays_signed_in(&mut self, _period: Duration) -> Result<bool, AppError> {
+            self.events.push("watch-headless");
+            Ok(!self.signs_out_headless)
+        }
     }
 
     #[tokio::test]
     async fn login_verifies_reads_before_and_after_hiding() {
         let mut session = FakeLogin::default();
-        login_flow(&mut session).await.unwrap();
+        assert!(!login_flow(&mut session).await.unwrap());
         assert_eq!(
             session.events,
             [
@@ -1005,7 +1114,31 @@ mod tests {
                 "read-visible",
                 "close",
                 "headless",
-                "read-headless"
+                "read-headless",
+                "watch-headless"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_that_needs_the_window_reopens_it_visible() {
+        let mut session = FakeLogin {
+            signs_out_headless: true,
+            ..Default::default()
+        };
+        assert!(login_flow(&mut session).await.unwrap());
+        assert_eq!(
+            session.events,
+            [
+                "visible",
+                "read-visible",
+                "close",
+                "headless",
+                "read-headless",
+                "watch-headless",
+                "close",
+                "visible",
+                "read-visible"
             ]
         );
     }
@@ -1188,6 +1321,53 @@ mod tests {
         // Command names can contain ')' and spaces; field positions start after the last ') '.
         let stat = format!("1 (browser ) name) S {} 1234 0", "0 ".repeat(18));
         assert_eq!(system::start_time(&stat).unwrap(), "1234");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_verified_browser_that_hangs_is_stopped() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("9333");
+        prepare_directory(&dir).unwrap();
+        prepare_directory(&profile(&dir)).unwrap();
+        let mut data = OsString::from("--user-data-dir=");
+        data.push(profile(&dir));
+        // The trailing command keeps the shell from replacing itself with `sleep`.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :", "browser"])
+            .arg(data)
+            .arg("--remote-debugging-port=9333")
+            .spawn()
+            .unwrap();
+        let (owner, _) = system::process(child.id()).unwrap();
+        let state = State {
+            version: 1,
+            port: 9333,
+            owner: Some(owner),
+            visible: false,
+            core: false,
+            phase: "active".into(),
+        };
+        assert!(owned(&state, &dir));
+        let reaper = std::thread::spawn(move || child.wait());
+        stop(&state, &dir).await.unwrap();
+        assert!(!owned(&state, &dir));
+        assert!(!reaper.join().unwrap().unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_arguments_survive_chrome_process_title_rewrite() {
+        let profile = Path::new("/home/me/teams data/9333/profile");
+        let launched = b"/opt/my chrome/chrome\0--user-data-dir=/home/me/teams data/9333/profile\0--remote-debugging-port=9333\0--app=https://teams.live.com\0";
+        let mut title = launched.map(|b| if b == 0 { b' ' } else { b });
+        *title.last_mut().unwrap() = 0;
+        for cmdline in [launched.as_slice(), title.as_slice()] {
+            let args = system::arguments(cmdline);
+            assert_eq!(args[0], "/opt/my chrome/chrome");
+            assert!(arguments_match(&args, profile, 9333));
+            assert!(!arguments_match(&args, profile, 9222));
+        }
     }
 
     #[cfg(target_os = "macos")]
