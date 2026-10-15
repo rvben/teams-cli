@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/rvben/teams-cli/compare/v0.2.0...v0.2.1) - 2026-10-15
+
 ### Added
 
 - **desktop**: add `teams desktop clear-flags` and a confirmed TUI cleanup that remove remote-debugging flags from the user-wide WebView2 setting while keeping its other arguments.
@@ -27,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **desktop**: keep the work/school browser visible when the organisation's sign-in (such as AD FS with Windows sign-in) does not let Teams stay signed in headless, instead of reporting success and then losing the session; reads now say when Teams was sent back to sign-in, and setup reports whether the browser runs headless or visible.
 - **desktop**: stop a verified dedicated browser that hangs after closing its debugging port, so disconnect and recover no longer leave it running.
 - **desktop**: refuse sign-in success when the browser closes or loses verified ownership during the sign-in check, and verify reads again after observing work-account sign-in.
+- **desktop**: separate email lookup from name search ([b0647f1](https://github.com/rvben/teams-cli/commit/b0647f177c3f4cb5f73e74f42aed11078832e632))
 
 ## [0.2.0](https://github.com/rvben/teams-cli/compare/v0.1.13...v0.2.0) - 2026-10-14
 
