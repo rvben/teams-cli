@@ -505,6 +505,20 @@ fn doctor_reports_failing_checks_and_exits_unhealthy() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("\"kind\":\"unhealthy\""));
     assert!(stderr.contains("credential_store"));
+    let credential_check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "credential_store")
+        .unwrap();
+    assert_eq!(credential_check["status"], "fail");
+    let credential_detail = credential_check["detail"].as_str().unwrap();
+    // Headless Linux may have no Secret Service. Keep that helper failure
+    // distinct from a usable store with no credential on macOS/Windows.
+    assert!(
+        credential_detail == "run `teams auth login`"
+            || credential_detail.starts_with("Could not read the saved credential:")
+    );
 
     teams()
         .args(["--output", "text", "doctor", "--offline"])
@@ -513,9 +527,9 @@ fn doctor_reports_failing_checks_and_exits_unhealthy() {
         .stdout(predicate::str::contains(
             "channel_history    optional  optional;",
         ))
-        .stdout(predicate::str::contains(
-            "credential_store   fail      run `teams auth login`",
-        ))
+        .stdout(predicate::str::contains(format!(
+            "credential_store   fail      {credential_detail}"
+        )))
         .stderr(predicate::str::contains("Hint:").not());
 }
 
