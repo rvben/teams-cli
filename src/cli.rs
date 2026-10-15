@@ -9,8 +9,7 @@ use crate::output::OutputFormat;
     version,
     long_version = env!("TEAMS_LONG_VERSION"),
     about = "Microsoft Teams from your terminal, for humans and agents",
-    after_help = "Get started:\n  teams init                         Guided setup\n  teams init --backend desktop --desktop-client browser-core
-                                     Lightweight browser, personal account
+    after_help = "Get started:\n  teams init                         Connect a personal or work account\n  teams                              Reopen your inbox after setup
   teams tui --demo                   Explore without an account\n  teams doctor                       Diagnose configuration and access\n  teams schema --command 'messages send'\n                                     Inspect the automation contract"
 )]
 pub struct Cli {
@@ -35,7 +34,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Configure a Graph or experimental desktop profile
+    /// Guided account setup; explicit flags configure a Graph or desktop profile
     Init(InitArgs),
     /// Manage delegated Microsoft authentication
     Auth {
@@ -105,9 +104,9 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// Connection method (desktop is experimental: chats, chat messages and opt-in chat sending)
-    #[arg(long, value_enum, default_value = "graph")]
-    pub backend: crate::config::BackendKind,
+    /// Connection method (omitted: guided in a terminal, Graph in scripts)
+    #[arg(long, value_enum)]
+    pub backend: Option<crate::config::BackendKind>,
     /// Existing loopback debugging port for a desktop profile
     #[arg(long, value_parser = clap::value_parser!(u16).range(1024..))]
     pub desktop_port: Option<u16>,
@@ -138,6 +137,9 @@ pub struct InitArgs {
     /// Allow a desktop profile to send chat messages (desktop profiles are read-only otherwise)
     #[arg(long)]
     pub allow_send: bool,
+    /// Reopen this dedicated browser when you open the inbox (browser profiles only)
+    #[arg(long)]
+    pub auto_start: bool,
 }
 
 #[derive(Debug, Subcommand)]

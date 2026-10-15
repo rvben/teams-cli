@@ -119,6 +119,9 @@ pub struct Profile {
     pub desktop_account: DesktopAccount,
     #[serde(default)]
     pub desktop_client: DesktopClientKind,
+    /// Set only after opting in; native Teams and automation never auto-connect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser_auto_start: bool,
 }
 
 impl Profile {
@@ -222,6 +225,10 @@ pub fn connection_profile(requested: Option<&str>) -> Result<Option<Profile>, Ap
     Ok(config.profiles.get(&name).cloned())
 }
 
+pub fn profiles() -> Result<BTreeMap<String, Profile>, AppError> {
+    Ok(read_file()?.profiles)
+}
+
 pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
     let config = read_file()?;
     let name = selected_profile_name_from(requested, config.active_profile.as_deref());
@@ -281,6 +288,7 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
         desktop_port,
         desktop_account: stored.map(|p| p.desktop_account).unwrap_or_default(),
         desktop_client: stored.map(|p| p.desktop_client).unwrap_or_default(),
+        browser_auto_start: stored.is_some_and(|p| p.browser_auto_start),
     };
     Ok((name, profile))
 }

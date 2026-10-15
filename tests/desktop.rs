@@ -366,6 +366,7 @@ fn old_profiles_remain_graph_and_minimal_desktop_profiles_ignore_graph_settings(
     assert_eq!(value["client_id"], "");
     assert_eq!(value["tenant"], "");
     assert_eq!(value["desktop_port"], 9222);
+    assert_eq!(value["browser_auto_start"], false);
 }
 
 #[test]

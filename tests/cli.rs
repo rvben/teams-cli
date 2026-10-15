@@ -278,6 +278,95 @@ fn noninteractive_init_uses_the_maintained_client_id() {
 }
 
 #[test]
+fn browser_auto_start_is_opt_in_and_does_not_affect_offline_or_scripted_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing_browser = temp.path().join("missing-browser");
+    let browser_data = temp.path().join("browser-data");
+    Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .args([
+            "init",
+            "--backend",
+            "desktop",
+            "--desktop-client",
+            "browser",
+            "--desktop-account",
+            "work-school",
+            "--auto-start",
+            "--no-login",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"browser_auto_start\": true"));
+    // A nonexistent executable would fail if any of these paths attempted startup.
+    for command in [
+        vec!["config", "show"],
+        vec!["auth", "status", "--offline"],
+        vec!["tui", "--demo", "--snapshot"],
+    ] {
+        Command::cargo_bin("teams")
+            .unwrap()
+            .env("XDG_CONFIG_HOME", temp.path())
+            .env("TEAMS_DESKTOP_BROWSER", &missing_browser)
+            .env("TEAMS_DESKTOP_BROWSER_DATA_DIR", &browser_data)
+            .args(command)
+            .assert()
+            .success();
+    }
+    let diagnosis = Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("TEAMS_DESKTOP_BROWSER", &missing_browser)
+        .env("TEAMS_DESKTOP_BROWSER_DATA_DIR", &browser_data)
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    assert!(!diagnosis.status.success());
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        let value: Value = serde_json::from_slice(&diagnosis.stdout).unwrap();
+        assert_eq!(value["offline"], true);
+        assert_eq!(value["connection"], Value::Null);
+        assert_eq!(value["healthy"], false);
+    } else {
+        let value: Value = serde_json::from_slice(&diagnosis.stderr).unwrap();
+        assert_eq!(value["error"]["kind"], "unsupported");
+    }
+    Command::cargo_bin("teams")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("TEAMS_DESKTOP_BROWSER", &missing_browser)
+        .env("TEAMS_DESKTOP_BROWSER_DATA_DIR", &browser_data)
+        .args(["chats", "list", "--limit", "1"])
+        .assert()
+        .failure()
+        .stderr(if cfg!(any(target_os = "macos", target_os = "linux")) {
+            predicate::str::contains("no session access was attempted")
+        } else {
+            predicate::str::contains("unsupported")
+        });
+    assert!(
+        !browser_data.exists(),
+        "reads must not prepare a browser session"
+    );
+    for flags in [
+        vec!["--auto-start", "--no-login"],
+        vec!["--backend", "desktop", "--auto-start", "--no-login"],
+    ] {
+        Command::cargo_bin("teams")
+            .unwrap()
+            .env("XDG_CONFIG_HOME", temp.path())
+            .arg("init")
+            .args(flags)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "--auto-start requires a desktop browser profile",
+            ));
+    }
+}
+
+#[test]
 fn init_can_create_a_read_only_profile_and_config_show_resolves_it() {
     let temp = tempfile::tempdir().unwrap();
     Command::cargo_bin("teams")

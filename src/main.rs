@@ -15,7 +15,7 @@ use teams_cli::desktop::{self, DesktopClient};
 use teams_cli::error::AppError;
 use teams_cli::graph::{self, Page};
 use teams_cli::output::{Output, OutputFormat, print_error, structured_from_args};
-use teams_cli::{render, schema, tui};
+use teams_cli::{render, schema, setup, tui};
 
 #[tokio::main]
 async fn main() {
@@ -56,20 +56,12 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     let yes = cli.yes;
     let command = match cli.command {
         Some(command) => command,
-        None if io::stdin().is_terminal() && io::stdout().is_terminal() && !config::exists() => {
-            Command::Init(InitArgs {
-                backend: BackendKind::Graph,
-                desktop_port: None,
-                desktop_account: None,
-                desktop_client: None,
-                client_id: None,
-                tenant: None,
-                no_login: false,
-                device_code: false,
-                channel_history: false,
-                read_only: false,
-                allow_send: false,
-            })
+        None if io::stdin().is_terminal()
+            && io::stdout().is_terminal()
+            && !out.json()
+            && config::connection_profile(profile_arg)?.is_none() =>
+        {
+            Command::Init(default_init_args()?)
         }
         None if io::stdin().is_terminal() && io::stdout().is_terminal() => Command::Tui(TuiArgs {
             demo: false,
@@ -100,7 +92,20 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
     match command {
         Command::DesktopHelper => desktop::serve_helper().await,
         Command::Desktop { command } => desktop_connection(profile_arg, command, yes, out).await,
-        Command::Init(args) => init(profile_arg.unwrap_or("default"), args, yes, out).await,
+        Command::Init(args) => {
+            if setup::offered(&args)
+                && !yes
+                && !out.quiet
+                && !out.json()
+                && io::stdin().is_terminal()
+                && io::stdout().is_terminal()
+                && io::stderr().is_terminal()
+            {
+                guided_init(profile_arg, args, out).await
+            } else {
+                init(profile_arg.unwrap_or("default"), args, yes, out).await
+            }
+        }
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
         Command::Profile { command } => profile_command(command, yes, out),
         Command::Config { command } => config_command(profile_arg, command, out),
@@ -291,7 +296,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
                 }
             })
         }
-        Command::Tui(args) => tui_command(profile_arg, args).await,
+        Command::Tui(args) => tui_command(profile_arg, args, !out.json()).await,
         Command::Doctor { offline } => doctor(profile_arg, offline, out).await,
         Command::Capabilities => capabilities(out),
         Command::Schema { command } => {
@@ -337,8 +342,58 @@ fn desktop_unsupported(command: &Command) -> bool {
     )
 }
 
+fn default_init_args() -> Result<InitArgs, AppError> {
+    // Reuse clap defaults, including TEAMS_READ_ONLY, for the no-argument path.
+    match Cli::try_parse_from(["teams", "init"])
+        .map_err(|error| AppError::InvalidInput(error.to_string()))?
+        .command
+    {
+        Some(Command::Init(args)) => Ok(args),
+        _ => unreachable!("the fixed init command parses as Init"),
+    }
+}
+
+async fn guided_init(
+    profile_arg: Option<&str>,
+    args: InitArgs,
+    out: Output,
+) -> Result<(), AppError> {
+    let plan = setup::run(
+        args,
+        profile_arg,
+        &config::profiles()?,
+        &mut io::stdin().lock(),
+        &mut io::stderr().lock(),
+        setup::available_port,
+    )?;
+    let Some(plan) = plan else {
+        out.note("Setup cancelled. Your connection settings were not changed.");
+        return Ok(());
+    };
+    init(&plan.name, plan.args, plan.browser_confirmed, out).await?;
+    tui_command(
+        Some(&plan.name),
+        TuiArgs {
+            demo: false,
+            snapshot: false,
+            width: 100,
+            height: 30,
+        },
+        true,
+    )
+    .await
+}
+
 async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Result<(), AppError> {
-    if args.backend == BackendKind::Desktop {
+    if args.auto_start
+        && (args.backend != Some(BackendKind::Desktop)
+            || !args.desktop_client.unwrap_or_default().is_browser())
+    {
+        return Err(AppError::InvalidInput(
+            "--auto-start requires a desktop browser profile".into(),
+        ));
+    }
+    if args.backend == Some(BackendKind::Desktop) {
         if args.client_id.is_some()
             || args.device_code
             || args.channel_history
@@ -365,12 +420,14 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
                 .desktop_account
                 .unwrap_or_else(|| args.desktop_client.unwrap_or_default().default_account()),
             desktop_client: args.desktop_client.unwrap_or_default(),
+            browser_auto_start: args.auto_start,
         };
         let port = profile.desktop_port;
         let output = |path: &std::path::Path, extra: serde_json::Value| {
             let mut value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
                 "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
-                "read_only":read_only,"desktop_port":port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client});
+                "read_only":read_only,"desktop_port":port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client,
+                "browser_auto_start":profile.browser_auto_start});
             if let (Some(value), serde_json::Value::Object(extra)) = (value.as_object_mut(), extra)
             {
                 value.extend(extra);
@@ -407,7 +464,13 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
                 "session_verified":true,"teams_restarted":false,"browser_started":true,
                 "chat_list_empty":chats.items.is_empty(),"connection":connection}),
             );
-            return out.value(&value, || format!("Connected desktop profile '{profile_name}'; browser is running {mode}.\nConfig: {}\nNext: `teams --profile {profile_name}` opens your inbox", path.display()));
+            return out.value(&value, || {
+                if profile.browser_auto_start {
+                    format!("You're connected. Run `teams` to open your inbox.\nThe Teams browser will reopen when needed; it is currently running {mode}.")
+                } else {
+                    format!("Connected desktop profile '{profile_name}'; browser is running {mode}.\nConfig: {}\nNext: `teams --profile {profile_name}` opens your inbox", path.display())
+                }
+            });
         }
         let mut connection = client.probe().await?;
         let needs_restart = !connection.endpoint_available();
@@ -521,6 +584,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             desktop_port: config::DEFAULT_DESKTOP_PORT,
             desktop_account: Default::default(),
             desktop_client: Default::default(),
+            browser_auto_start: false,
         },
     )?;
     let mut signed_in = false;
@@ -583,6 +647,7 @@ fn config_command(
                 "desktop_port": if profile.backend == BackendKind::Desktop { Some(profile.desktop_port) } else { None },
                 "desktop_account": if profile.backend == BackendKind::Desktop { Some(profile.desktop_account) } else { None },
                 "desktop_client": if profile.backend == BackendKind::Desktop { Some(profile.desktop_client) } else { None },
+                "browser_auto_start": profile.browser_auto_start,
                 "client_id": profile.client_id,
                 "tenant": profile.tenant,
                 "read_only": profile.read_only,
@@ -793,7 +858,11 @@ fn render_page_text(
     })
 }
 
-async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), AppError> {
+async fn tui_command(
+    profile_arg: Option<&str>,
+    args: TuiArgs,
+    interactive_resume: bool,
+) -> Result<(), AppError> {
     if args.snapshot {
         println!("{}", tui::snapshot(args.width, args.height)?);
         return Ok(());
@@ -803,6 +872,16 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
         return Ok(());
     }
     let profile_name = config::selected_profile_name(profile_arg)?;
+    if let Some(profile) = config::connection_profile(profile_arg)?
+        && profile.backend == BackendKind::Desktop
+        && profile.desktop_client.is_browser()
+        && profile.browser_auto_start
+        && interactive_resume
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        resume_browser(&profile_name, &profile).await?;
+    }
     let mut reason_override = None;
     loop {
         // `None` means the person already asked to sign in from inside the TUI.
@@ -845,25 +924,7 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
                 .await
                 .map(|_| ())
         } else {
-            init(
-                &profile_name,
-                InitArgs {
-                    backend: BackendKind::Graph,
-                    desktop_port: None,
-                    desktop_account: None,
-                    desktop_client: None,
-                    client_id: None,
-                    tenant: None,
-                    no_login: false,
-                    device_code: false,
-                    channel_history: false,
-                    read_only: false,
-                    allow_send: false,
-                },
-                false,
-                auth_output,
-            )
-            .await
+            init(&profile_name, default_init_args()?, false, auth_output).await
         };
         if let Err(error) = result {
             reason_override = Some(format!(
@@ -871,6 +932,47 @@ async fn tui_command(profile_arg: Option<&str>, args: TuiArgs) -> Result<(), App
                 concise_error(&error)
             ));
         }
+    }
+}
+
+async fn resume_browser(profile_name: &str, profile: &Profile) -> Result<(), AppError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        eprintln!("Opening your Teams inbox…");
+        let result = desktop::browser::resume(
+            profile.desktop_port,
+            profile.desktop_account,
+            profile.desktop_client == config::DesktopClientKind::BrowserCore,
+            false,
+        )
+        .await;
+        match result {
+            Ok(visible) => {
+                if visible { eprintln!("Keep the Teams browser window open; you can minimise it."); }
+                Ok(())
+            },
+            Err(AppError::Auth(_)) => {
+                use std::io::Write;
+                eprint!("Teams needs you to sign in again. Open sign-in now? [Y/n]: ");
+                io::stderr().flush()?;
+                let mut answer = String::new();
+                if io::stdin().read_line(&mut answer)? > 0
+                    && matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+                    DesktopClient::from_profile(profile)?.login_with_progress(false).await?;
+                    return Ok(());
+                }
+                Err(AppError::Auth(format!("Sign-in paused. Run `teams --profile {profile_name}` when you're ready.")))
+            },
+            Err(error) => Err(error.with_hint(&format!(
+                "To sign in again, run `teams --profile {profile_name} desktop login`. Your saved connection was preserved."))),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (profile_name, profile);
+        Err(AppError::Unsupported(
+            "Browser inbox startup needs macOS, Linux or WSL2.".into(),
+        ))
     }
 }
 

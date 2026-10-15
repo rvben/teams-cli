@@ -46,21 +46,39 @@ Run `teams` in a terminal on first use, or start explicitly:
 teams init
 ```
 
-`teams-cli` includes a maintained multitenant Microsoft Entra public-client registration, so normal setup does not require creating an app or copying a client ID:
+Choose **Work or school** or **Personal**, choose whether to enable sending, and
+sign in in the window that opens. Setup chooses a separate browser port and opens
+your inbox once chats are readable. After that, just run:
 
 ```console
-teams init
+teams
 ```
 
-For a personal Microsoft account with the lightweight hidden browser:
+On macOS, Linux and WSL2, work/school setup uses a dedicated browser; personal
+setup uses the lightweight browser. You explicitly approve reopening that browser
+when you start the inbox. The saved sign-in is reused, and expired work/school
+sign-in offers to reopen the sign-in window. Some organisations require keeping
+the browser visible; minimise it instead of closing it. WSL2 needs WSLg for sign-in.
+On native Windows, guided setup uses Teams Desktop; use WSL2 for browser mode.
+
+**Other connection options** keeps Microsoft Graph and the running Teams Desktop
+available. Microsoft Graph includes a maintained Entra public-client registration,
+so normal API setup needs no app registration or copied client ID.
+
+Scripts and explicit connection flags keep their existing behaviour. For example:
 
 ```console
-teams init --profile personal --backend desktop --desktop-client browser-core
+teams init --backend graph
+# Or configure an automatically reopened work browser explicitly:
+teams init --profile work --backend desktop --desktop-client browser \
+  --desktop-account work-school --desktop-port 9224 --auto-start
 ```
 
-This downloads its browsers automatically, opens visible sign-in once, and then
-runs hidden. See [lightweight browser setup](#low-memory-browser-client-experimental)
-for sending, reconnecting, and experimental compatibility limits.
+Browser profiles default to read-only; add `--allow-send` to enable sending.
+Existing profiles retain their connection behaviour unless you opt in with setup
+or `--auto-start`. CLI reads, JSON output, demo mode and snapshots never start a
+browser automatically. See [lightweight browser setup](#low-memory-browser-client-experimental)
+for personal-account compatibility limits.
 
 Browser PKCE is the human-friendly default. The browser talks directly to Microsoft, and the CLI never receives or stores your password. Normal sign-in requests these delegated scopes:
 
@@ -398,7 +416,7 @@ helper route remains the default for native desktop profiles.
 Create a separate read-only profile and sign in in the window that opens:
 
 ```console
-teams init --profile browser --backend desktop --desktop-client browser --desktop-account work-school --yes
+teams init --profile browser --backend desktop --desktop-client browser --desktop-account work-school --auto-start --yes
 # The window closes automatically after a successful chat read.
 # Teams then runs headless with the same saved sign-in:
 teams --profile browser

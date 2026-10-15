@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Guided `teams init` asks for Work/school or Personal, chooses a separate browser port, offers explicit send permission, and opens the inbox after verified sign-in.
+- Browser setup can opt in to reopening its saved session with `teams`; existing profiles, native Teams and scripted reads keep their connection behaviour. Explicit setup supports `--auto-start`.
+
 ## [0.2.1](https://github.com/rvben/teams-cli/compare/v0.2.0...v0.2.1) - 2026-10-15
 
 ### Added

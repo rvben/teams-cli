@@ -8,6 +8,7 @@ pub mod graph;
 pub mod output;
 pub mod render;
 pub mod schema;
+pub mod setup;
 pub mod tui;
 
 pub mod delivery;

@@ -252,7 +252,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         {
             let mut value = single(
                 "init",
-                "Configure a Graph or experimental desktop profile; desktop init opens Teams' debugging port (restarting Teams after confirmation) and verifies a chat read",
+                "Guided account setup in a terminal without connection flags; otherwise configure a Graph or experimental desktop profile. Browser setup verifies a chat read; native setup may restart Teams after confirmation",
                 "non_idempotent",
                 vec![
                     field("profile", "string"),
@@ -266,6 +266,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     nullable_field("desktop_port", "integer"),
                     nullable_field("desktop_account", "string"),
                     nullable_field("desktop_client", "string"),
+                    nullable_field("browser_auto_start", "boolean"),
                     nullable_field("endpoint_available", "boolean"),
                     nullable_field("connection", "object"),
                     field("session_verified", "boolean"),
@@ -275,7 +276,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 ],
             );
             value["args"] = json!([
-                {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; desktop supports diagnostics, chats and opt-in chat sending"},
+                {"name":"--backend","type":"string","enum":["graph","desktop"],"default":"graph","description":"Connection method; default Graph in scripts, guided account selection in a terminal with no connection flags"},
                 {"name":"--desktop-port","type":"integer","description":"Loopback endpoint port (desktop only; native/browser default 9222, browser-core default 9223)","x-minimum":1024,"x-maximum":65535},
                 {"name":"--desktop-client","type":"string","enum":["native","browser","browser-core"],"default":"native","description":"Native Teams, installed Chrome/Edge, or a managed lightweight browser; core defaults to personal and downloads a matching browser pair on first sign-in"},
                 {"name":"--desktop-account","type":"string","enum":["auto","personal","work-school"],"default":"auto","description":"Select the Teams account surface; defaults to personal for browser-core, auto otherwise; multiple cached accounts remain unsupported"},
@@ -297,7 +298,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     "Request admin-consented channel-history access"
                 ),
                 {"name":"--read-only","type":"boolean","x-conflicts":["--allow-send"],"description":"Block remote write operations"},
-                {"name":"--allow-send","type":"boolean","x-requires":{"--backend":"desktop"},"x-conflicts":["--read-only"],"description":"Allow a desktop profile to send chat messages (desktop profiles are read-only otherwise)"}
+                {"name":"--allow-send","type":"boolean","x-requires":{"--backend":"desktop"},"x-conflicts":["--read-only"],"description":"Allow a desktop profile to send chat messages (desktop profiles are read-only otherwise)"},
+                {"name":"--auto-start","type":"boolean","x-requires":{"--backend":"desktop"},"description":"Opt in to reopening a dedicated browser when the interactive inbox starts; never applies to native Teams or CLI read commands"}
             ]);
             value["confirmation_bypass_arg"] = json!("--yes");
             value
@@ -409,6 +411,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 nullable_field("desktop_port", "integer"),
                 nullable_field("desktop_account", "string"),
                 nullable_field("desktop_client", "string"),
+                field("browser_auto_start", "boolean"),
                 field("client_id", "string"),
                 field("tenant", "string"),
                 field("read_only", "boolean"),
@@ -593,7 +596,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
             value["confirmation_bypass_arg"] = json!("--yes");
             value
         },
-        json!({"name":"tui", "description":"Open the keyboard-first terminal interface; offers a confirmed Teams debugging restart on WSL when no endpoint listens; Enter sends a chat message on a profile that allows writes", "effects":"non_idempotent", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
+        json!({"name":"tui", "description":"Open the keyboard-first terminal interface; reopens an opted-in browser session on an interactive terminal; offers a confirmed Teams debugging restart on WSL when no endpoint listens; Enter sends a chat message on a profile that allows writes", "effects":"non_idempotent", "output_kind":"opaque", "media_type":"text/plain", "requires_tty":true, "args":[arg("--demo", "boolean", "Use deterministic sample data"), arg("--snapshot", "boolean", "Print one ANSI-free demo frame")]}),
         {
             let mut value = single(
                 "doctor",
