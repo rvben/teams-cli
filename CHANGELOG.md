@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/rvben/teams-cli/compare/v0.2.1...v0.2.2) - 2026-10-15
+
 ### Added
 
 - Guided `teams init` asks for Work/school or Personal, chooses a separate browser port, offers explicit send permission, and opens the inbox after verified sign-in.
