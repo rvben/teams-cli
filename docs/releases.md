@@ -23,6 +23,40 @@ do not bump again. Its tag starts the release workflow.
 
 Cargo and Python package versions are kept synchronized as one release unit.
 
+## Release 0.3.0
+
+The version is prepared. Do not bump it again. This release adds `people search`
+and `chats create`; opening a conversation does not send a message. Personal
+desktop search separates exact email lookup from name search and excludes
+off-network invitations. A recipient must resolve to a Teams identity before
+chat creation. Graph directory search requires renewed consent to
+`User.ReadBasic.All`.
+
+The Windows helper uses protocol 4 and must match the CLI version and build.
+Validate the Windows helper and WSL client together. Conversation requests and
+sends with an uncertain outcome must never be automatically retried.
+
+Teams Companion 0.1.1 downloads CLI 0.3.0. Publish and verify the CLI archives and
+checksums before distributing the extension so its built-in download works.
+Older stable CLIs from 0.1.11 retain reading and replies; New Message offers an
+update when the required commands are missing. Vership prepares the extension's
+version, while its VSIX package check validates the installable artifact.
+Vership does not publish or verify a VS Code Marketplace target.
+
+Before publication, distinguish existing-chat reuse from first-contact coverage.
+For an approved, discoverable recipient with no existing conversation, resolve
+their exact identity, create the chat once, send one labelled message and verify
+its exact ID and body. A second successful create must return the same chat ID.
+An invite-only search result does not establish a supported recipient and must
+not trigger a message or invitation. Record account/backend/platform limitations
+separately from successful runtime tests.
+
+After approved publication workflows finish, verify every CLI target:
+
+```sh
+vership verify 0.3.0 --targets tag,release,crates,pypi
+```
+
 ## Release 0.2.0
 
 The managed lightweight browser is an experimental personal-account option on
