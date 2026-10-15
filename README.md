@@ -47,19 +47,33 @@ teams init
 ```
 
 Choose **Work or school** or **Personal**, choose whether to enable sending, and
-sign in in the window that opens. Setup chooses a separate browser port and opens
-your inbox once chats are readable. After that, just run:
+follow sign-in. Setup checks this machine first and gives unavailable connections
+no selectable number, with an explanation of what they need. It chooses a separate
+browser port and opens your inbox once chats are readable. After that, just run:
 
 ```console
 teams
 ```
 
-On macOS, Linux and WSL2, work/school setup uses a dedicated browser; personal
-setup uses the lightweight browser. You explicitly approve reopening that browser
+On macOS, Linux and WSL2, work/school setup prefers a dedicated browser; personal
+setup prefers the lightweight browser. Missing display support, missing executables,
+invalid browser overrides and unavailable matching downloads are checked before
+selection. Personal can use a full browser or Teams Desktop when lightweight mode
+is unavailable. Work/school can use Teams Desktop or Microsoft Graph when needed.
+On a Linux terminal without a display, Graph uses device-code sign-in on another device.
+You explicitly approve reopening a dedicated browser
 when you start the inbox. The saved sign-in is reused, and expired work/school
 sign-in offers to reopen the sign-in window. Some organisations require keeping
 the browser visible; minimise it instead of closing it. WSL2 needs WSLg for sign-in.
-On native Windows, guided setup uses Teams Desktop; use WSL2 for browser mode.
+On native Windows, browser options are unavailable; use Teams Desktop or run inside
+WSL2 for browser mode.
+
+Guided setup saves connection settings only after a successful chat read, including
+Graph profiles. If sending was requested, desktop/browser setup also probes the
+send interface without sending a message. If that fails, you can explicitly continue
+read-only; setup never silently downgrades your choice. A successful probe establishes
+that the interface is available, while delivery and organisation policies are checked
+when you actually send. Teams build compatibility and sign-in still need live validation.
 
 **Other connection options** keeps Microsoft Graph and the running Teams Desktop
 available. Microsoft Graph includes a maintained Entra public-client registration,
@@ -80,7 +94,7 @@ or `--auto-start`. CLI reads, JSON output, demo mode and snapshots never start a
 browser automatically. See [lightweight browser setup](#low-memory-browser-client-experimental)
 for personal-account compatibility limits.
 
-Browser PKCE is the human-friendly default. The browser talks directly to Microsoft, and the CLI never receives or stores your password. Normal sign-in requests these delegated scopes:
+For Microsoft Graph profiles, browser PKCE is the default when a local browser is available. The browser talks directly to Microsoft, and the CLI never receives or stores your password. Normal Graph sign-in requests these delegated scopes:
 
 ```text
 openid profile offline_access User.Read User.ReadBasic.All

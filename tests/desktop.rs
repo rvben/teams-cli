@@ -684,7 +684,7 @@ fn core_client_is_explicit_and_requires_personal_account_before_launch() {
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["kind"], "confirmation_required");
     let invalid = tempfile::tempdir().unwrap();
-    cli(&invalid)
+    let output = cli(&invalid)
         .args([
             "init",
             "--backend",
@@ -695,12 +695,10 @@ fn core_client_is_explicit_and_requires_personal_account_before_launch() {
             "work-school",
             "--no-login",
         ])
-        .assert()
-        .success();
-    let output = cli(&invalid)
-        .args(["--yes", "desktop", "connect"])
         .output()
         .unwrap();
+    assert!(!output.status.success());
     let value: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["kind"], "unsupported");
+    assert!(!invalid.path().join("teams/config.toml").exists());
 }

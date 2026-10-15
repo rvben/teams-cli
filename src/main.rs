@@ -103,7 +103,7 @@ async fn dispatch(cli: Cli, out: Output) -> Result<(), AppError> {
             {
                 guided_init(profile_arg, args, out).await
             } else {
-                init(profile_arg.unwrap_or("default"), args, yes, out).await
+                init(profile_arg.unwrap_or("default"), args, yes, out, false).await
             }
         }
         Command::Auth { command } => auth_command(profile_arg, command, out).await,
@@ -358,8 +358,11 @@ async fn guided_init(
     args: InitArgs,
     out: Output,
 ) -> Result<(), AppError> {
+    out.note("Checking connection options…");
+    let capabilities = setup::Capabilities::detect().await;
     let plan = setup::run(
         args,
+        &capabilities,
         profile_arg,
         &config::profiles()?,
         &mut io::stdin().lock(),
@@ -370,7 +373,7 @@ async fn guided_init(
         out.note("Setup cancelled. Your connection settings were not changed.");
         return Ok(());
     };
-    init(&plan.name, plan.args, plan.browser_confirmed, out).await?;
+    init(&plan.name, plan.args, plan.browser_confirmed, out, true).await?;
     tui_command(
         Some(&plan.name),
         TuiArgs {
@@ -384,7 +387,40 @@ async fn guided_init(
     .await
 }
 
-async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Result<(), AppError> {
+async fn verify_setup_sending(
+    client: &DesktopClient,
+    profile: &mut Profile,
+    guided: bool,
+    out: Output,
+) -> Result<(), AppError> {
+    if !profile.allow_send {
+        return Ok(());
+    }
+    out.note("Checking the send interface without sending a message…");
+    if let Err(error) = client.send_check().await {
+        if guided
+            && setup::read_only_fallback(
+                &concise_error(&error),
+                &mut io::stdin().lock(),
+                &mut io::stderr().lock(),
+            )?
+        {
+            profile.allow_send = false;
+            profile.read_only = true;
+            return Ok(());
+        }
+        return Err(error.with_hint("No profile was saved. Run `teams init` and choose Read only to use the readable chat history."));
+    }
+    Ok(())
+}
+
+async fn init(
+    profile_name: &str,
+    args: InitArgs,
+    yes: bool,
+    out: Output,
+    guided: bool,
+) -> Result<(), AppError> {
     if args.auto_start
         && (args.backend != Some(BackendKind::Desktop)
             || !args.desktop_client.unwrap_or_default().is_browser())
@@ -407,7 +443,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             ));
         }
         let read_only = !args.allow_send;
-        let profile = Profile {
+        let mut profile = Profile {
             backend: BackendKind::Desktop,
             client_id: String::new(),
             tenant: String::new(),
@@ -422,11 +458,14 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             desktop_client: args.desktop_client.unwrap_or_default(),
             browser_auto_start: args.auto_start,
         };
+        profile
+            .desktop_client
+            .validate_account(profile.desktop_account)?;
         let port = profile.desktop_port;
-        let output = |path: &std::path::Path, extra: serde_json::Value| {
+        let output = |path: &std::path::Path, profile: &Profile, extra: serde_json::Value| {
             let mut value = serde_json::json!({"profile":profile_name,"backend":"desktop","experimental":true,
                 "config_path":path,"signed_in":null,"client_id":"","tenant":"","channel_history_requested":false,
-                "read_only":read_only,"desktop_port":port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client,
+                "read_only":profile.read_only,"desktop_port":port,"desktop_account":profile.desktop_account,"desktop_client":profile.desktop_client,
                 "browser_auto_start":profile.browser_auto_start});
             if let (Some(value), serde_json::Value::Object(extra)) = (value.as_object_mut(), extra)
             {
@@ -438,8 +477,9 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             let path = config::save(profile_name, profile.clone())?;
             let value = output(
                 &path,
+                &profile,
                 serde_json::json!({"endpoint_available":null,"session_verified":false,
-                "teams_restarted":null,"browser_started":null,"chat_list_empty":null,"connection":null}),
+                "send_capability_verified":null,"teams_restarted":null,"browser_started":null,"chat_list_empty":null,"connection":null}),
             );
             return out.value(&value, || {
                 format!("Saved desktop profile '{profile_name}' without contacting Teams.\nConfig: {}\nNext: `teams --profile {profile_name} desktop {}` to connect", path.display(), if profile.desktop_client.is_browser() { "login" } else { "connect" })
@@ -456,12 +496,15 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
                 .map_err(|error| error.with_hint("No profile was saved."))?;
             let mode = browser_mode(&login);
             let chats = client.chats(1, None).await?;
+            verify_setup_sending(&client, &mut profile, guided, out).await?;
             let connection = client.probe().await?;
             let path = config::save(profile_name, profile.clone())?;
             let value = output(
                 &path,
+                &profile,
                 serde_json::json!({"endpoint_available":true,
                 "session_verified":true,"teams_restarted":false,"browser_started":true,
+                "send_capability_verified":profile.allow_send.then_some(true),
                 "chat_list_empty":chats.items.is_empty(),"connection":connection}),
             );
             return out.value(&value, || {
@@ -500,6 +543,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             }
             // An open endpoint does not prove sign-in; reading a chat page does.
             let chats = client.chats(1, None).await?;
+            verify_setup_sending(&client, &mut profile, guided, out).await?;
             let path = config::save(profile_name, profile.clone())?;
             Ok::<_, AppError>((chats, path))
         }
@@ -514,7 +558,9 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
         let chat_list_empty = chats.items.is_empty();
         let value = output(
             &path,
+            &profile,
             serde_json::json!({"endpoint_available":connection.endpoint_available(),
+            "send_capability_verified":profile.allow_send.then_some(true),
             "session_verified":true,"teams_restarted":needs_restart && profile.desktop_client == config::DesktopClientKind::Native,
             "browser_started":if profile.desktop_client.is_browser() { Some(needs_restart) } else { None },"chat_list_empty":chat_list_empty,
             "connection":connection}),
@@ -525,7 +571,7 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             } else {
                 String::new()
             };
-            let access = if read_only {
+            let access = if profile.read_only {
                 "read-only; re-run init with --allow-send to send messages"
             } else {
                 "sending allowed"
@@ -550,7 +596,11 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     if interactive && !out.json() {
         eprintln!("\n  teams\n  Microsoft Teams, without leaving your flow.\n");
-        eprintln!("  We’ll open Microsoft sign-in in your browser.");
+        if args.device_code {
+            eprintln!("  Use the Microsoft sign-in code on another device.");
+        } else {
+            eprintln!("  We’ll open Microsoft sign-in in your browser.");
+        }
         eprintln!("  No password or client secret is shared with teams-cli.");
         eprintln!("  Graph supports work or school accounts.");
         eprintln!(
@@ -573,33 +623,50 @@ async fn init(profile_name: &str, args: InitArgs, yes: bool, out: Output) -> Res
             "browser sign-in requires a terminal; add --device-code or use --no-login".into(),
         ));
     }
-    let path = config::save(
-        profile_name,
-        Profile {
-            backend: BackendKind::Graph,
-            client_id: client_id.clone(),
-            tenant: tenant.clone(),
-            read_only: args.read_only,
-            allow_send: false,
-            desktop_port: config::DEFAULT_DESKTOP_PORT,
-            desktop_account: Default::default(),
-            desktop_client: Default::default(),
-            browser_auto_start: false,
-        },
-    )?;
+    let profile = Profile {
+        backend: BackendKind::Graph,
+        client_id: client_id.clone(),
+        tenant: tenant.clone(),
+        read_only: args.read_only,
+        allow_send: false,
+        desktop_port: config::DEFAULT_DESKTOP_PORT,
+        desktop_account: Default::default(),
+        desktop_client: Default::default(),
+        browser_auto_start: false,
+    };
+    // Explicit/offline init keeps its contract. Guided setup saves only after a live read.
+    let saved = if guided {
+        None
+    } else {
+        Some(config::save(profile_name, profile.clone())?)
+    };
     let mut signed_in = false;
     if !args.no_login {
-        let (_, profile) = config::load(Some(profile_name))?;
+        let resolved = if guided {
+            profile.clone()
+        } else {
+            config::load(Some(profile_name))?.1
+        };
         auth::login(
             profile_name,
-            &profile,
+            &resolved,
             args.device_code,
             args.channel_history,
             &out,
         )
         .await?;
+        if guided {
+            out.note("Checking chat access…");
+            let access = auth::access_token(profile_name, &resolved).await?;
+            graph::GraphClient::new(access).chats(1, None).await
+                .map_err(|error| error.with_hint("Sign-in completed, but chat access could not be verified. No connection settings were saved. Check your organisation's Teams access, or run `teams init` and choose Teams Desktop or a browser."))?;
+        }
         signed_in = true;
     }
+    let path = match saved {
+        Some(path) => path,
+        None => config::save(profile_name, profile)?,
+    };
     #[derive(Serialize)]
     struct InitResult<'a> {
         profile: &'a str,
@@ -924,7 +991,14 @@ async fn tui_command(
                 .await
                 .map(|_| ())
         } else {
-            init(&profile_name, default_init_args()?, false, auth_output).await
+            init(
+                &profile_name,
+                default_init_args()?,
+                false,
+                auth_output,
+                false,
+            )
+            .await
         };
         if let Err(error) = result {
             reason_override = Some(format!(

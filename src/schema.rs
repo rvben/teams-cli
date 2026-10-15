@@ -270,6 +270,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     nullable_field("endpoint_available", "boolean"),
                     nullable_field("connection", "object"),
                     field("session_verified", "boolean"),
+                    nullable_field("send_capability_verified", "boolean"),
                     nullable_field("teams_restarted", "boolean"),
                     nullable_field("browser_started", "boolean"),
                     nullable_field("chat_list_empty", "boolean"),

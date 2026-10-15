@@ -45,6 +45,43 @@ fn failure(code: &str) -> AppError {
     AppError::Desktop(message.into())
 }
 
+/// Read installation and interop facts only; never runs the lifecycle script.
+pub async fn preflight() -> Result<(), AppError> {
+    super::local_prerequisites()?;
+    #[cfg(target_os = "macos")]
+    {
+        let system = PathBuf::from("/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams");
+        let user = dirs::home_dir()
+            .map(|home| home.join("Applications/Microsoft Teams.app/Contents/MacOS/MSTeams"));
+        if system.is_file() || user.is_some_and(|path| path.is_file()) {
+            return Ok(());
+        }
+        Err(AppError::Desktop(
+            "Teams Desktop is not installed. Install Microsoft Teams, then run `teams init` again."
+                .into(),
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut command = Command::new(powershell_path()?);
+        command.args(["-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; $p=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\\WindowsApps\\ms-teams.exe'; if(Test-Path -LiteralPath $p){exit 0}else{exit 2}"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        let status = tokio::time::timeout(Duration::from_secs(5), command.status()).await
+            .map_err(|_| AppError::Desktop("Checking Teams Desktop timed out. Check Windows executable interop and retry `teams init`.".into()))??;
+        if !status.success() {
+            return Err(failure("launcher_missing"));
+        }
+        #[cfg(not(windows))]
+        if let super::install::HelperState::Override(path) = super::install::state()?
+            && !path.is_file()
+        {
+            return Err(AppError::Desktop("TEAMS_DESKTOP_HELPER does not exist; fix or unset the override and retry `teams init`.".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Includes metadata only. An available endpoint does not establish sign-in.
 pub async fn manage(client: &DesktopClient, action: Action) -> Result<Value, AppError> {
     manage_visible(client, action, false).await

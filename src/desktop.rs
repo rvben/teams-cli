@@ -233,6 +233,7 @@ impl DesktopClient {
         account: DesktopAccount,
         kind: DesktopClientKind,
     ) -> Result<Self, AppError> {
+        kind.validate_account(account)?;
         let mut client = Self::with_account(port, account)?;
         if kind.is_browser() && !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Err(AppError::Unsupported(
@@ -242,9 +243,6 @@ impl DesktopClient {
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if kind == DesktopClientKind::BrowserCore {
-            if account != DesktopAccount::Personal {
-                return Err(AppError::Unsupported("browser-core currently requires --desktop-account personal; work/school core startup is not validated".into()));
-            }
             client.browser =
                 tokio::sync::Mutex::new(session::Session::new(browser::BrowserSystem {
                     core: true,

@@ -316,6 +316,48 @@ pub async fn ensure() -> Result<(PathBuf, PathBuf), AppError> {
     ensure_with_progress(false).await
 }
 
+/// Check executables or download availability without changing the installation or launching Teams.
+/// `true` means setup will need to download its matching browser pair after consent.
+pub async fn preflight() -> Result<bool, AppError> {
+    if let Some(pair) = overrides()? {
+        validate_pair(&pair, None)?;
+        return Ok(false);
+    }
+    let base = root()?;
+    if base.try_exists()? {
+        validate_directory(&base)?;
+        if base.join("installed.json").try_exists()? {
+            validate_pair(&installed()?, None)?;
+            return Ok(false);
+        }
+    }
+    let platform = platform()?;
+    let client = reqwest::Client::builder()
+        .user_agent("teams-cli-browser-installer")
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(network)?;
+    let mut metadata = client
+        .get(METADATA)
+        .send()
+        .await
+        .map_err(network)?
+        .error_for_status()
+        .map_err(network)?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = metadata.chunk().await.map_err(network)? {
+        if bytes.len() + chunk.len() > 1024 * 1024 {
+            return Err(failed("browser version metadata is too large"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let metadata: Value =
+        serde_json::from_slice(&bytes).map_err(|_| failed("invalid browser version metadata"))?;
+    selection(&metadata, platform)?;
+    Ok(true)
+}
+
 pub async fn ensure_with_progress(quiet: bool) -> Result<(PathBuf, PathBuf), AppError> {
     if let Some(pair) = overrides()? {
         validate_pair(&pair, None)?;

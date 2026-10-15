@@ -50,6 +50,12 @@ pub enum DesktopClientKind {
 }
 
 impl DesktopClientKind {
+    pub fn validate_account(self, account: DesktopAccount) -> Result<(), AppError> {
+        if self == Self::BrowserCore && account != DesktopAccount::Personal {
+            return Err(AppError::Unsupported("The lightweight browser supports personal accounts only. For work/school, use --desktop-client browser --desktop-account work-school.".into()));
+        }
+        Ok(())
+    }
     pub fn default_port(self) -> u16 {
         if self == Self::BrowserCore {
             9223

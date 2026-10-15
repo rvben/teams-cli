@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, Write},
     os::unix::{ffi::OsStringExt, fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -77,7 +77,7 @@ pub fn executable() -> Result<PathBuf, AppError> {
             ));
         }
         return std::fs::canonicalize(path)
-            .map_err(|_| failed("TEAMS_DESKTOP_BROWSER does not exist"));
+            .map_err(|_| failed("TEAMS_DESKTOP_BROWSER does not exist; fix or unset this override, then retry setup"));
     }
     let candidates = if cfg!(target_os = "macos") {
         vec![
@@ -109,6 +109,10 @@ pub fn prerequisites_for(core: bool) -> Result<(), AppError> {
     } else {
         executable()?;
     }
+    verification_prerequisites()
+}
+
+fn verification_prerequisites() -> Result<(), AppError> {
     #[cfg(target_os = "macos")]
     if !Path::new("/usr/sbin/lsof").is_file() {
         return Err(failed("lsof is required to verify the browser listener"));
@@ -122,6 +126,31 @@ pub fn prerequisites_for(core: bool) -> Result<(), AppError> {
     Ok(())
 }
 
+fn display_prerequisites() -> Result<(), AppError> {
+    #[cfg(target_os = "linux")]
+    if !["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    {
+        return Err(failed(
+            "Browser sign-in needs a display. Enable WSLg on WSL2, or run from a Linux desktop session.",
+        ));
+    }
+    Ok(())
+}
+
+/// Local prerequisites and (only if needed) public download metadata. No profile is created.
+pub async fn preflight(core: bool) -> Result<bool, AppError> {
+    display_prerequisites()?;
+    verification_prerequisites()?;
+    if core {
+        super::browser_install::preflight().await
+    } else {
+        browser_version(&executable()?)?;
+        Ok(false)
+    }
+}
+
 fn session_executable(core: bool, visible: bool) -> Result<PathBuf, AppError> {
     if core {
         let (chrome, shell) = super::browser_install::installed()?;
@@ -132,18 +161,51 @@ fn session_executable(core: bool, visible: bool) -> Result<PathBuf, AppError> {
 }
 
 pub(super) fn browser_version(path: &Path) -> Result<String, AppError> {
-    let output = Command::new(path).arg("--version").output()?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .take(400)
-            .collect::<String>();
+    browser_version_with_timeout(path, Duration::from_secs(5))
+}
+
+fn browser_version_with_timeout(path: &Path, timeout: Duration) -> Result<String, AppError> {
+    // Files avoid pipe backpressure; a broken executable must not stall setup.
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(error) => error.into(),
+                    _ => failed(
+                        "Checking the browser version timed out. Check its executable or unset the browser overrides, then retry setup.",
+                    ),
+                });
+            }
+        }
+    };
+    if !status.success() {
+        stderr.rewind()?;
+        let mut detail = Vec::new();
+        stderr.take(400).read_to_end(&mut detail)?;
         return Err(failed(&format!(
             "The browser could not start: {}. On Linux, install the Chrome system libraries named in this error and retry setup.",
-            detail.trim()
+            String::from_utf8_lossy(&detail).trim()
         )));
     }
-    String::from_utf8_lossy(&output.stdout)
+    stdout.rewind()?;
+    let mut version = Vec::new();
+    stdout.take(4096).read_to_end(&mut version)?;
+    String::from_utf8_lossy(&version)
         .split_whitespace()
         .find(|s| s.split('.').count() == 4 && s.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
         .map(str::to_owned)
@@ -560,12 +622,7 @@ pub async fn login_with_progress(
     core: bool,
     quiet: bool,
 ) -> Result<Value, AppError> {
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return Err(failed(
-            "Visible sign-in needs a display. On WSL2, enable WSLg; on Linux, run from a desktop session.",
-        ));
-    }
+    display_prerequisites()?;
     if core {
         super::browser_install::ensure_with_progress(quiet).await?;
     }
@@ -1394,6 +1451,32 @@ mod tests {
         let mut renderer = headless;
         renderer.push("--type=renderer".into());
         assert!(!arguments_match(&renderer, &profile(dir), 9333));
+    }
+
+    #[test]
+    fn a_hung_browser_version_check_times_out_and_reaps_its_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let browser = dir.path().join("browser");
+        std::fs::write(
+            &browser,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"${0}.pid\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+        let error = browser_version_with_timeout(&browser, Duration::from_millis(100)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid: i32 = std::fs::read_to_string(dir.path().join("browser.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]

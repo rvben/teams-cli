@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Guided setup checks local browser/display support, Teams installation and Windows interop, and matching lightweight browser downloads before allowing a connection choice. Unavailable options explain their requirements; supported alternatives are selected automatically.
+- Guided Graph setup verifies chat access before saving connection settings. Desktop/browser sending opt-in now requires a send-interface probe; guided setup offers an explicit read-only alternative if it fails, without sending a test message.
+- Reject personal-only lightweight browser/work-school combinations before saving even with `--no-login`.
+
 ### Added
 
 - Guided `teams init` asks for Work/school or Personal, chooses a separate browser port, offers explicit send permission, and opens the inbox after verified sign-in.
