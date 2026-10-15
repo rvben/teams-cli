@@ -438,17 +438,34 @@ impl LoginSession for BrowserLogin {
         if !self.quiet {
             eprintln!("Checking that Teams stays signed in without its window (up to a minute).");
         }
-        let system = BrowserSystem { core: self.core };
-        let deadline = tokio::time::Instant::now() + period;
-        while tokio::time::Instant::now() < deadline {
-            let (metadata, _) = system.verify(self.port).await?;
-            if metadata.signed_out() {
-                return Ok(false);
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        if !watch_sign_in(&BrowserSystem { core: self.core }, self.port, period).await? {
+            return Ok(false);
         }
+        self.wait_read(Duration::from_secs(60)).await?;
         Ok(true)
     }
+}
+
+async fn watch_sign_in(
+    system: &impl Verifier,
+    port: u16,
+    period: Duration,
+) -> Result<bool, AppError> {
+    let deadline = tokio::time::Instant::now() + period;
+    while tokio::time::Instant::now() < deadline {
+        let (metadata, _) = system.verify(port).await?;
+        if !metadata.endpoint_available() {
+            return Err(failed(&format!(
+                "The dedicated browser became unavailable while checking sign-in. {}",
+                metadata.detail()
+            )));
+        }
+        if metadata.signed_out() {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Ok(true)
 }
 
 fn login_read_ready(reply: &Value) -> Result<bool, AppError> {
@@ -519,6 +536,11 @@ pub async fn login_with_progress(
         );
     }
     let mut value = manage(port, account, Action::Status, false, core).await?;
+    if value["endpoint_available"] != true {
+        return Err(failed(
+            "The dedicated browser closed or changed after sign-in; retry the sign-in command.",
+        ));
+    }
     value["session_verified"] = json!(true);
     Ok(value)
 }
@@ -1141,6 +1163,21 @@ mod tests {
                 "read-visible"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn sign_in_watch_refuses_a_closed_or_unsafe_browser() {
+        use super::super::owner::tests::FakeSystem;
+        for listeners in [vec![], vec![(30, false)]] {
+            let system = FakeSystem {
+                listeners,
+                ..FakeSystem::teams()
+            };
+            let error = watch_sign_in(&system, 9224, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("became unavailable"));
+        }
     }
 
     #[tokio::test]

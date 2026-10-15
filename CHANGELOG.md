@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **desktop**: recognise the dedicated browser on Linux and WSL when Chrome rewrites its process title, so setup no longer stops with "did not open its debugging endpoint"; recovery hints now name the browser mode and port in use.
 - **desktop**: keep the work/school browser visible when the organisation's sign-in (such as AD FS with Windows sign-in) does not let Teams stay signed in headless, instead of reporting success and then losing the session; reads now say when Teams was sent back to sign-in, and setup reports whether the browser runs headless or visible.
 - **desktop**: stop a verified dedicated browser that hangs after closing its debugging port, so disconnect and recover no longer leave it running.
+- **desktop**: refuse sign-in success when the browser closes or loses verified ownership during the sign-in check, and verify reads again after observing work-account sign-in.
 
 ## [0.2.0](https://github.com/rvben/teams-cli/compare/v0.1.13...v0.2.0) - 2026-10-14
 

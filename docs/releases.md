@@ -23,7 +23,7 @@ do not bump again. Its tag starts the release workflow.
 
 Cargo and Python package versions are kept synchronized as one release unit.
 
-## Release 0.3.0
+## Release 0.2.1
 
 The version is prepared. Do not bump it again. This release adds `people search`
 and `chats create`; opening a conversation does not send a message. Personal
@@ -36,14 +36,19 @@ The Windows helper uses protocol 4 and must match the CLI version and build.
 Validate the Windows helper and WSL client together. Conversation requests and
 sends with an uncertain outcome must never be automatically retried.
 
-Teams Companion 0.1.1 downloads CLI 0.3.0. Publish and verify the CLI archives and
+Teams Companion 0.1.1 downloads CLI 0.2.1. Publish and verify the CLI archives and
 checksums before distributing the extension so its built-in download works.
 Older stable CLIs from 0.1.11 retain reading and replies; New Message offers an
 update when the required commands are missing. Vership prepares the extension's
 version, while its VSIX package check validates the installable artifact.
 Vership does not publish or verify a VS Code Marketplace target.
 
-Before publication, distinguish existing-chat reuse from first-contact coverage.
+Personal-account search, existing-chat reuse and one-shot send/readback passed
+on Windows and WSL; macOS reads and recipient search also passed. First-contact
+creation and work/school New Message runtime coverage remain unverified. Keep
+these limits separate from the earlier work-account read/send reports.
+
+Distinguish existing-chat reuse from first-contact coverage.
 For an approved, discoverable recipient with no existing conversation, resolve
 their exact identity, create the chat once, send one labelled message and verify
 its exact ID and body. A second successful create must return the same chat ID.
@@ -54,7 +59,7 @@ separately from successful runtime tests.
 After approved publication workflows finish, verify every CLI target:
 
 ```sh
-vership verify 0.3.0 --targets tag,release,crates,pypi
+vership verify 0.2.1 --targets tag,release,crates,pypi
 ```
 
 ## Release 0.2.0
