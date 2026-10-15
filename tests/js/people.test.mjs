@@ -24,6 +24,8 @@ test('unrelated recent contacts cannot crowd a verified live email match out of 
  const r=await f.run({op:'search',personal:true,query:'person@example.test',limit:1});
  assert.deepEqual(Array.from(r.items,x=>x.id),['8:live:exact']);assert.equal(r.truncated,false);
  assert.deepEqual(Array.from(f.calls[1][1].variables.emails),['person@example.test']);
+ assert.equal('searchQuery' in f.calls[1][1].variables,false);
+ assert.equal(f.calls[1][1].fetchPolicy,'no-cache');
  assert.equal(f.calls.filter(c=>c[0]==='mutate').length,0);
 });
 test('cached suggestions must match every search term and live metadata takes precedence',async()=>{

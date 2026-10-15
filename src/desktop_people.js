@@ -198,9 +198,13 @@ async (p, select) => {
               phones: [],
               callerInfo: "newChat",
               shouldFilterBlockedContacts: true,
-              searchQuery: p.query,
+              // A nonempty searchQuery overrides emails in Teams' resolver.
+              // Exact email lookup and name search need distinct call shapes.
+              ...(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.query)
+                ? {}
+                : { searchQuery: p.query }),
             },
-            fetchPolicy: "network-only",
+            fetchPolicy: "no-cache",
           });
           if (!Array.isArray(found.data?.instantScdSearch))
             return { error: "layout" };
