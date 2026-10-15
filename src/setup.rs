@@ -8,12 +8,13 @@ use crate::config::{BackendKind, DesktopAccount, DesktopClientKind, Profile};
 use crate::error::AppError;
 
 mod capabilities;
-pub use capabilities::{Availability, Capabilities};
+pub use capabilities::{Availability, Capabilities, graph_device_code_needed};
 
 pub struct Plan {
     pub name: String,
     pub args: InitArgs,
     pub browser_confirmed: bool,
+    pub forget_pending: Option<crate::config::PendingBrowserSetup>,
 }
 
 pub fn offered(args: &InitArgs) -> bool {
@@ -152,6 +153,13 @@ fn profile_name(
     } else {
         "personal"
     };
+    if !profiles.contains_key(base)
+        && let Some((name, _)) = profiles
+            .iter()
+            .find(|(_, profile)| compatible(profile, backend, kind, account))
+    {
+        return name.clone();
+    }
     for number in 1.. {
         let name = if number == 1 {
             base.into()
@@ -162,6 +170,24 @@ fn profile_name(
             .get(&name)
             .is_none_or(|profile| compatible(profile, backend, kind, account))
         {
+            return name;
+        }
+    }
+    unreachable!()
+}
+
+fn fresh_name(
+    base: &str,
+    profiles: &BTreeMap<String, Profile>,
+    pending: &[crate::config::PendingBrowserSetup],
+) -> String {
+    for number in 1.. {
+        let name = if number == 1 {
+            base.into()
+        } else {
+            format!("{base}-{number}")
+        };
+        if !profiles.contains_key(&name) && !pending.iter().any(|record| record.name == name) {
             return name;
         }
     }
@@ -201,7 +227,8 @@ pub fn run(
         output,
         "\nTeams\n\nConnect your account. Enter q at any prompt to cancel."
     )?;
-    let graph_blocked = args.allow_send.then_some("--allow-send applies to Teams Desktop and browser connections. Run `teams init` without this flag to use Microsoft Graph.");
+    let graph_blocked = args.allow_send.then_some("--allow-send applies to Teams Desktop and browser connections. Run `teams init` without this flag to use Microsoft Graph.")
+        .or_else(|| capabilities.graph.reason());
     let work_blocked = if capabilities.preferred(false).is_none() {
         graph_blocked
     } else {
@@ -314,17 +341,165 @@ pub fn run(
                 DesktopClientKind::Native => "Teams Desktop",
             }
         )?;
+        if account == DesktopAccount::Personal
+            && kind != DesktopClientKind::BrowserCore
+            && let Some(reason) = capabilities.core.reason()
+        {
+            writeln!(output, "Lightweight browser unavailable: {reason}")?;
+        }
         if matches!(
             capabilities.availability(kind),
             Availability::Ready { download: true }
         ) {
             writeln!(
                 output,
-                "A matching browser pair will download from Google after you confirm."
+                "A matching browser pair will download from Google after you confirm.\nAllow a few GiB of free space for installation and saved browser data."
             )?;
         }
     }
-    let name = profile_name(requested, profiles, backend, kind, account);
+    let base = if backend == BackendKind::Graph {
+        "graph"
+    } else if account == DesktopAccount::WorkSchool {
+        "work"
+    } else {
+        "personal"
+    };
+    let mut name = profile_name(requested, profiles, backend, kind, account);
+    if profiles
+        .get(&name)
+        .is_some_and(|profile| compatible(profile, backend, kind, account))
+    {
+        if requested.is_some() {
+            if !confirm(
+                input,
+                output,
+                &format!(
+                    "{} '{}'",
+                    if backend == BackendKind::Graph {
+                        "Sign in again and update"
+                    } else {
+                        "Update connection using the saved sign-in for"
+                    },
+                    name.escape_default(),
+                ),
+            )? {
+                return Ok(None);
+            }
+        } else {
+            let update = if backend == BackendKind::Graph {
+                format!("Sign in again to update '{}'", name.escape_default())
+            } else {
+                format!("Update '{}' using its saved sign-in", name.escape_default())
+            };
+            let new = if backend == BackendKind::Desktop && kind == DesktopClientKind::Native {
+                "Create a separate profile for Teams Desktop"
+            } else {
+                "Connect another account"
+            };
+            let Some(action) = menu(
+                input,
+                output,
+                "Connection",
+                &[("1", new, None), ("2", &update, None)],
+            )?
+            else {
+                return Ok(None);
+            };
+            if action == "1" {
+                name = fresh_name(base, profiles, &capabilities.pending);
+            }
+        }
+    }
+    let mut pending_port = None;
+    let mut forget_pending = None;
+    if backend == BackendKind::Desktop && kind.is_browser() && !profiles.contains_key(&name) {
+        let matches: Vec<_> = capabilities
+            .pending
+            .iter()
+            .filter(|record| {
+                requested.is_none_or(|_| record.name == name)
+                    && !profiles.contains_key(&record.name)
+                    && record.account == account
+                    && record.client == kind
+            })
+            .collect();
+        if requested.is_some() && matches.len() > 1 {
+            return Err(AppError::Desktop("More than one unfinished setup matches this connection. Use `teams init --profile NEW_NAME` for a separate sign-in; existing browsers were preserved.".into()));
+        }
+        let pending = if matches.len() > 1 {
+            let mut choices: Vec<_> = matches
+                .iter()
+                .enumerate()
+                .map(|(i, record)| {
+                    (
+                        (i + 1).to_string(),
+                        format!(
+                            "Continue unfinished '{}' (port {})",
+                            record.name.escape_default(),
+                            record.port
+                        ),
+                    )
+                })
+                .collect();
+            choices.push((
+                (choices.len() + 1).to_string(),
+                "Start a new sign-in".into(),
+            ));
+            let items: Vec<_> = choices
+                .iter()
+                .map(|(key, label)| (key.as_str(), label.as_str(), None))
+                .collect();
+            let Some(selected) = menu(input, output, "Saved sign-ins", &items)? else {
+                return Ok(None);
+            };
+            matches.get(selected.parse::<usize>().unwrap() - 1).copied()
+        } else {
+            matches.first().copied()
+        };
+        if let Some(pending) = pending {
+            name = pending.name.clone();
+            writeln!(
+                output,
+                "\nUnfinished connection: '{}'",
+                name.escape_default()
+            )?;
+            let Some(action) = menu(
+                input,
+                output,
+                "Unfinished setup",
+                &[
+                    ("1", "Resume saved sign-in", None),
+                    (
+                        "2",
+                        "Connect another account",
+                        requested.map(
+                            |_| "Use `teams init --profile NEW_NAME` for a separate connection.",
+                        ),
+                    ),
+                    ("3", "Forget this unfinished setup and start again", None),
+                ],
+            )?
+            else {
+                return Ok(None);
+            };
+            if action == "1" {
+                pending_port = Some(pending.port);
+            } else if action == "3" {
+                writeln!(
+                    output,
+                    "Only the unfinished-setup record will be removed after you confirm browser startup. Its browser data and saved sign-in will be kept."
+                )?;
+                if !confirm(input, output, "Forget this unfinished setup")? {
+                    return Ok(None);
+                }
+                forget_pending = Some(pending.clone());
+            } else if requested.is_some() {
+                return Ok(None);
+            } else {
+                name = fresh_name(base, profiles, &capabilities.pending);
+            }
+        }
+    }
     let existing = profiles.get(&name);
     if existing.is_some_and(|profile| !compatible(profile, backend, kind, account))
         && !confirm(
@@ -339,12 +514,20 @@ pub fn run(
         return Ok(None);
     }
     args.backend = Some(backend);
+    if backend == BackendKind::Graph
+        && let Some(existing) = existing.filter(|profile| profile.backend == BackendKind::Graph)
+    {
+        args.client_id = Some(existing.client_id.clone());
+        args.tenant = Some(existing.tenant.clone());
+    }
     if backend == BackendKind::Desktop {
         args.desktop_client = Some(kind);
         args.desktop_account = Some(account);
         args.desktop_port = Some(
             if let Some(profile) = existing.filter(|p| compatible(p, backend, kind, account)) {
                 profile.desktop_port
+            } else if let Some(port) = pending_port {
+                port
             } else if kind.is_browser() {
                 let preferred = if account == DesktopAccount::WorkSchool {
                     9224
@@ -360,7 +543,11 @@ pub fn run(
                     };
                     if !profiles.values().any(|profile| {
                         profile.backend == BackendKind::Desktop && profile.desktop_port == port
-                    }) && available(port)?
+                    }) && !capabilities
+                        .pending
+                        .iter()
+                        .any(|record| record.port == port)
+                        && available(port)?
                     {
                         break port;
                     }
@@ -401,6 +588,7 @@ pub fn run(
         name,
         args,
         browser_confirmed,
+        forget_pending,
     }))
 }
 
@@ -421,6 +609,8 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
+            graph: Availability::Ready { download: false },
+            pending: Vec::new(),
             browser: Availability::Ready { download: false },
             core: Availability::Ready { download: false },
             native: Availability::Ready { download: false },
@@ -508,7 +698,7 @@ mod tests {
             &capabilities(),
             None,
             &profiles,
-            &mut "2\n1\nyes\n".as_bytes(),
+            &mut "2\n2\n1\nyes\n".as_bytes(),
             &mut vec![],
             |_| panic!("must reuse existing browser profile"),
         )
@@ -522,7 +712,7 @@ mod tests {
             &capabilities(),
             None,
             &profiles,
-            &mut "2\ny\n".as_bytes(),
+            &mut "2\n2\ny\n".as_bytes(),
             &mut vec![],
             |_| Ok(true),
         )
@@ -631,6 +821,8 @@ mod tests {
     #[test]
     fn headless_linux_excludes_personal_and_native_and_offers_graph_device_code() {
         let caps = Capabilities {
+            graph: Availability::Ready { download: false },
+            pending: Vec::new(),
             browser: Availability::Blocked("Enable a graphical display.".into()),
             core: Availability::Blocked("Enable a graphical display.".into()),
             native: Availability::Blocked("Teams Desktop needs Windows interop.".into()),
@@ -712,6 +904,33 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_graph_environment_cannot_be_selected_but_desktop_still_works() {
+        let mut caps = capabilities();
+        caps.graph =
+            Availability::Blocked("Unset TEAMS_ACCESS_TOKEN before guided Graph setup.".into());
+        let mut output = vec![];
+        let plan = run(
+            args(&[]),
+            &caps,
+            None,
+            &BTreeMap::new(),
+            &mut "3\n1\n2\n1\n2\n".as_bytes(),
+            &mut output,
+            |_| panic!("native has no browser port"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.args.backend, Some(BackendKind::Desktop));
+        assert_eq!(plan.args.desktop_client, Some(DesktopClientKind::Native));
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains("  1  Microsoft Graph"));
+        assert!(text.contains(
+            "Microsoft Graph — work/school, including teams and channels is unavailable"
+        ));
+        assert!(text.contains("Unset TEAMS_ACCESS_TOKEN"));
+    }
+
+    #[test]
     fn lightweight_download_is_disclosed_before_consent() {
         let mut caps = capabilities();
         caps.core = Availability::Ready { download: true };
@@ -731,6 +950,211 @@ mod tests {
         );
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("download from Google after you confirm"));
+    }
+
+    #[test]
+    fn existing_connections_require_a_choice_and_graph_updates_preserve_registration() {
+        let mut graph = profile(DesktopClientKind::Native, DesktopAccount::Auto, 9222);
+        graph.backend = BackendKind::Graph;
+        graph.client_id = "custom-application".into();
+        graph.tenant = "custom-tenant".into();
+        let profiles = BTreeMap::from([("graph".into(), graph)]);
+        let fresh = run(
+            args(&[]),
+            &capabilities(),
+            None,
+            &profiles,
+            &mut "3\n1\n1\n2\n".as_bytes(),
+            &mut vec![],
+            |_| panic!(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fresh.name, "graph-2");
+        let update = run(
+            args(&[]),
+            &capabilities(),
+            Some("graph"),
+            &profiles,
+            &mut "3\n1\ny\n2\n".as_bytes(),
+            &mut vec![],
+            |_| panic!(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(update.args.client_id.as_deref(), Some("custom-application"));
+        assert_eq!(update.args.tenant.as_deref(), Some("custom-tenant"));
+        assert!(
+            run(
+                args(&[]),
+                &capabilities(),
+                Some("graph"),
+                &profiles,
+                &mut "3\n1\nn\n".as_bytes(),
+                &mut vec![],
+                |_| panic!()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unfinished_browser_setup_can_resume_its_exact_port_or_keep_a_separate_account() {
+        let mut caps = capabilities();
+        caps.pending.push(crate::config::PendingBrowserSetup {
+            name: "work".into(),
+            port: 19311,
+            account: DesktopAccount::WorkSchool,
+            client: DesktopClientKind::Browser,
+        });
+        let resumed = run(
+            args(&[]),
+            &caps,
+            None,
+            &BTreeMap::new(),
+            &mut "1\n1\n2\ny\n".as_bytes(),
+            &mut vec![],
+            |_| panic!("reuse the exact saved port"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.args.desktop_port, Some(19311));
+        let separate = run(
+            args(&[]),
+            &caps,
+            None,
+            &BTreeMap::new(),
+            &mut "1\n2\n2\ny\n".as_bytes(),
+            &mut vec![],
+            |_| Ok(true),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(separate.name, "work-2");
+        assert_ne!(separate.args.desktop_port, Some(19311));
+        assert!(separate.forget_pending.is_none());
+        let forgotten = run(
+            args(&[]),
+            &caps,
+            None,
+            &BTreeMap::new(),
+            &mut "1\n3\ny\n2\ny\n".as_bytes(),
+            &mut vec![],
+            |_| Ok(true),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(forgotten.name, "work");
+        assert_eq!(forgotten.forget_pending.as_ref(), caps.pending.first());
+        assert_ne!(forgotten.args.desktop_port, Some(19311));
+        assert!(
+            run(
+                args(&[]),
+                &caps,
+                None,
+                &BTreeMap::new(),
+                &mut "1\n3\ny\n2\nn\n".as_bytes(),
+                &mut vec![],
+                |_| Ok(true),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn existing_nondefault_names_are_reachable_and_new_names_skip_pending_accounts() {
+        let existing = profile(
+            DesktopClientKind::Browser,
+            DesktopAccount::WorkSchool,
+            19312,
+        );
+        let profiles = BTreeMap::from([("work-2".into(), existing)]);
+        let mut caps = capabilities();
+        caps.pending.push(crate::config::PendingBrowserSetup {
+            name: "work".into(),
+            port: 19311,
+            account: DesktopAccount::WorkSchool,
+            client: DesktopClientKind::Browser,
+        });
+        let update = run(
+            args(&[]),
+            &caps,
+            None,
+            &profiles,
+            &mut "1\n2\n2\ny\n".as_bytes(),
+            &mut vec![],
+            |_| panic!(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(update.name, "work-2");
+        assert_eq!(update.args.desktop_port, Some(19312));
+        let new = run(
+            args(&[]),
+            &caps,
+            None,
+            &profiles,
+            &mut "1\n1\n2\n2\ny\n".as_bytes(),
+            &mut vec![],
+            |_| Ok(true),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(new.name, "work-3");
+        assert!(![19311, 19312].contains(&new.args.desktop_port.unwrap()));
+    }
+
+    #[test]
+    fn connecting_another_account_offers_all_matching_unfinished_sign_ins() {
+        let profiles = BTreeMap::from([(
+            "work".into(),
+            profile(
+                DesktopClientKind::Browser,
+                DesktopAccount::WorkSchool,
+                19310,
+            ),
+        )]);
+        let mut caps = capabilities();
+        for (name, port) in [("work-2", 19311), ("work-3", 19312)] {
+            caps.pending.push(crate::config::PendingBrowserSetup {
+                name: name.into(),
+                port,
+                account: DesktopAccount::WorkSchool,
+                client: DesktopClientKind::Browser,
+            });
+        }
+        let mut output = vec![];
+        let resumed = run(
+            args(&[]),
+            &caps,
+            None,
+            &profiles,
+            &mut "1\n1\n2\n1\n2\ny\n".as_bytes(),
+            &mut output,
+            |_| panic!("resume the saved port"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.name, "work-3");
+        assert_eq!(resumed.args.desktop_port, Some(19312));
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("Continue unfinished 'work-2' (port 19311)"));
+        assert!(text.contains("Continue unfinished 'work-3' (port 19312)"));
+        let new = run(
+            args(&[]),
+            &caps,
+            None,
+            &profiles,
+            &mut "1\n1\n3\n2\ny\n".as_bytes(),
+            &mut vec![],
+            |_| Ok(true),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(new.name, "work-4");
+        assert!(![19310, 19311, 19312].contains(&new.args.desktop_port.unwrap()));
     }
 
     #[test]

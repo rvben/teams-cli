@@ -168,15 +168,73 @@ pub async fn login(
     channel_history: bool,
     out: &Output,
 ) -> Result<TokenBundle, AppError> {
-    profile.require_graph()?;
-    let scopes = scopes(channel_history);
-    let bundle = if device_code {
-        device_login(profile, scopes, out).await?
-    } else {
-        browser_login(profile, scopes, out).await?
-    };
+    let bundle = sign_in(profile, device_code, channel_history, out).await?;
     store(profile_name, &bundle)?;
     Ok(bundle)
+}
+
+/// Complete Microsoft sign-in without replacing a saved credential yet.
+/// Guided setup verifies this exact token before committing the new connection.
+pub async fn sign_in(
+    profile: &Profile,
+    device_code: bool,
+    channel_history: bool,
+    out: &Output,
+) -> Result<TokenBundle, AppError> {
+    profile.require_graph()?;
+    let scopes = scopes(channel_history);
+    if device_code {
+        device_login(profile, scopes, out).await
+    } else {
+        browser_login(profile, scopes, out).await
+    }
+}
+
+/// Save a verified sign-in with its config; restore the previous credential if config fails.
+pub fn save_verified_login<T>(
+    profile_name: &str,
+    bundle: &TokenBundle,
+    save_config: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    commit_login(&entry(profile_name)?, bundle, save_config)
+}
+
+fn commit_login<T>(
+    credential: &keyring::Entry,
+    bundle: &TokenBundle,
+    save_config: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let previous = match credential.get_password() {
+        Ok(previous) => Some(previous),
+        Err(keyring::Error::NoEntry) => None,
+        Err(error) => {
+            return Err(AppError::Unexpected(format!(
+                "Could not preserve the previous sign-in: {error}. No connection settings were saved."
+            )));
+        }
+    };
+    let encoded = serde_json::to_string(bundle).map_err(|e| AppError::Unexpected(e.to_string()))?;
+    credential.set_password(&encoded).map_err(|e| {
+        AppError::Unexpected(format!(
+            "Could not save the verified sign-in: {e}. No connection settings were saved."
+        ))
+    })?;
+    match save_config() {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let restored = match previous {
+                Some(previous) => credential.set_password(&previous),
+                None => match credential.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                    Err(error) => Err(error),
+                },
+            };
+            match restored {
+                Ok(()) => Err(error.with_hint("Connection settings could not be saved; your previous sign-in was preserved.")),
+                Err(_) => Err(error.with_hint("Connection settings could not be saved, and the credential store could not restore your previous sign-in. Retry setup to reconnect this profile.")),
+            }
+        }
+    }
 }
 
 fn scopes(channel_history: bool) -> &'static str {
@@ -393,6 +451,70 @@ async fn oauth_response_error(response: reqwest::Response) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{BASE_SCOPES, CHANNEL_HISTORY_SCOPE, scopes};
+
+    fn bundle() -> super::TokenBundle {
+        super::TokenBundle {
+            access_token: "new-synthetic-access".into(),
+            refresh_token: Some("new-synthetic-refresh".into()),
+            expires_at: u64::MAX,
+            scope: Some(BASE_SCOPES.into()),
+        }
+    }
+
+    #[test]
+    fn failed_config_save_restores_the_previous_protected_credential() {
+        let credential =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        credential
+            .set_password("previous-protected-credential")
+            .unwrap();
+        let error = super::commit_login(&credential, &bundle(), || {
+            assert!(
+                credential
+                    .get_password()
+                    .unwrap()
+                    .contains("new-synthetic-access")
+            );
+            Err::<(), _>(crate::error::AppError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("previous sign-in was preserved"));
+        assert_eq!(
+            credential.get_password().unwrap(),
+            "previous-protected-credential"
+        );
+    }
+
+    #[test]
+    fn failed_config_save_removes_a_new_credential_and_success_keeps_it() {
+        let credential =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        assert!(
+            super::commit_login(&credential, &bundle(), || {
+                Err::<(), _>(crate::error::AppError::Unexpected(
+                    "config write failed".into(),
+                ))
+            })
+            .is_err()
+        );
+        assert!(matches!(
+            credential.get_password(),
+            Err(keyring::Error::NoEntry)
+        ));
+        assert_eq!(
+            super::commit_login(&credential, &bundle(), || Ok("saved-config")).unwrap(),
+            "saved-config"
+        );
+        let saved: super::TokenBundle =
+            serde_json::from_str(&credential.get_password().unwrap()).unwrap();
+        assert_eq!(saved.access_token, "new-synthetic-access");
+        assert_eq!(
+            saved.refresh_token.as_deref(),
+            Some("new-synthetic-refresh")
+        );
+    }
 
     #[test]
     fn default_login_is_least_privilege() {

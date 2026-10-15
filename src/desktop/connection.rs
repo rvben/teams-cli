@@ -27,7 +27,7 @@ fn failure(code: &str) -> AppError {
             "The user-wide WebView2 setting already has remote-debugging flags, which open the port in every WebView2 app; run `teams desktop clear-flags` first"
         }
         "launcher_missing" => {
-            "The ms-teams.exe app execution alias is missing; turn it on under Settings > Apps > Advanced app settings > App execution aliases, then retry"
+            "Install Microsoft Teams, or enable its ms-teams.exe alias under Settings > Apps > Advanced app settings > App execution aliases, then retry"
         }
         "settings_changed" => {
             "Debugging settings changed outside this CLI and were preserved; restore the prior settings manually before retrying recovery"

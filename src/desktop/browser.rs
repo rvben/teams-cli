@@ -41,7 +41,7 @@ fn failed(message: &str) -> AppError {
     AppError::Desktop(message.into())
 }
 
-fn directory(port: u16) -> Result<PathBuf, AppError> {
+pub(super) fn data_directory() -> Result<PathBuf, AppError> {
     let base = match std::env::var_os("TEAMS_DESKTOP_BROWSER_DATA_DIR") {
         Some(path) => {
             let path = PathBuf::from(path);
@@ -56,7 +56,11 @@ fn directory(port: u16) -> Result<PathBuf, AppError> {
             .ok_or_else(|| failed("could not locate the browser profile directory"))?
             .join("teams-cli/browser"),
     };
-    Ok(base.join(port.to_string()))
+    Ok(base)
+}
+
+fn directory(port: u16) -> Result<PathBuf, AppError> {
+    Ok(data_directory()?.join(port.to_string()))
 }
 
 /// Avoid assigning a new account a port with an older browser's saved sign-in.
@@ -143,6 +147,10 @@ fn display_prerequisites() -> Result<(), AppError> {
 pub async fn preflight(core: bool) -> Result<bool, AppError> {
     display_prerequisites()?;
     verification_prerequisites()?;
+    let base = data_directory()?;
+    if base.try_exists()? {
+        validate_directory(&base)?;
+    }
     if core {
         super::browser_install::preflight().await
     } else {
@@ -420,12 +428,22 @@ trait LoginSession {
 /// Returns whether the browser was left visible.
 async fn login_flow(session: &mut impl LoginSession) -> Result<bool, AppError> {
     session.connect(true).await?;
-    session.wait_read(Duration::from_secs(300)).await.map_err(|error| error.with_hint(
-        "The visible browser and its profile were preserved. Finish signing in and retry the sign-in command."))?;
+    session
+        .wait_read(Duration::from_secs(300))
+        .await
+        .map_err(|error| {
+            error.with_hint(
+        "The visible browser and its profile were preserved; sign-in has not completed there yet.")
+        })?;
     session.disconnect().await?;
     session.connect(false).await?;
-    session.wait_read(Duration::from_secs(60)).await.map_err(|error| error.with_hint(
-        "The headless browser and saved profile were preserved. Retry the sign-in command to open the visible window again."))?;
+    session
+        .wait_read(Duration::from_secs(60))
+        .await
+        .map_err(|error| {
+            error.with_hint(
+        "The headless browser and saved profile were preserved; headless chat access is not ready.")
+        })?;
     if session.stays_signed_in(Duration::from_secs(60)).await? {
         return Ok(false);
     }
@@ -435,24 +453,22 @@ async fn login_flow(session: &mut impl LoginSession) -> Result<bool, AppError> {
     session.disconnect().await?;
     session.connect(true).await?;
     session.wait_read(Duration::from_secs(300)).await.map_err(|error| error.with_hint(
-        "Your organisation's sign-in needs the visible browser; finish signing in there and retry the sign-in command."))?;
+        "Your organisation's sign-in needs the visible browser; sign-in has not completed there yet."))?;
     Ok(true)
 }
 
-async fn resume_flow(
-    session: &mut impl LoginSession,
-    visible: bool,
-    already_running: bool,
-) -> Result<bool, AppError> {
+async fn resume_flow(session: &mut impl LoginSession, visible: bool) -> Result<bool, AppError> {
     session.connect(visible).await?;
     session.wait_read(Duration::from_secs(60)).await?;
-    if visible || already_running || session.stays_signed_in(Duration::from_secs(60)).await? {
-        return Ok(visible);
+    Ok(visible)
+}
+
+async fn check_resumed_session(session: &mut impl LoginSession) -> Result<(), AppError> {
+    if session.stays_signed_in(Duration::from_secs(60)).await? {
+        Ok(())
+    } else {
+        Err(AppError::Auth("Teams needs its browser window to stay signed in. Reopen sign-in to continue; your saved session is preserved.".into()))
     }
-    session.disconnect().await?;
-    session.connect(true).await?;
-    session.wait_read(Duration::from_secs(300)).await?;
-    Ok(true)
 }
 
 /// Reuse an opted-in inbox's saved session without forcing a visible login or mode switch.
@@ -461,7 +477,7 @@ pub async fn resume(
     account: DesktopAccount,
     core: bool,
     quiet: bool,
-) -> Result<bool, AppError> {
+) -> Result<(bool, Option<super::ConnectionWatch>), AppError> {
     let status = manage(port, account, Action::Status, false, core).await?;
     let already_running = status["endpoint_available"] == true;
     let visible = status["management"]["visible"].as_bool().unwrap_or(false);
@@ -472,7 +488,7 @@ pub async fn resume(
         quiet,
         resume_only: true,
     };
-    let result = resume_flow(&mut session, visible, already_running).await;
+    let result = resume_flow(&mut session, visible).await;
     if let Err(error) = result {
         // Only a fresh, verified sign-in redirect is classified as expired auth.
         // Ownership failures and unknown cache layouts must never trigger a login restart.
@@ -484,7 +500,19 @@ pub async fn resume(
         }
         return Err(error);
     }
-    result
+    let visible = result?;
+    let watch = if !visible && !already_running && account != DesktopAccount::Personal {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            session.quiet = true;
+            let result = check_resumed_session(&mut session).await;
+            let _ = sender.send(result);
+        });
+        Some(super::ConnectionWatch { receiver, task })
+    } else {
+        None
+    };
+    Ok((visible, watch))
 }
 
 struct BrowserLogin {
@@ -622,6 +650,16 @@ pub async fn login_with_progress(
     core: bool,
     quiet: bool,
 ) -> Result<Value, AppError> {
+    login_with_recovery(port, account, core, quiet, true).await
+}
+
+pub(super) async fn login_with_recovery(
+    port: u16,
+    account: DesktopAccount,
+    core: bool,
+    quiet: bool,
+    recovery: bool,
+) -> Result<Value, AppError> {
     display_prerequisites()?;
     if core {
         super::browser_install::ensure_with_progress(quiet).await?;
@@ -651,7 +689,9 @@ pub async fn login_with_progress(
         quiet,
         resume_only: false,
     })
-    .await.map_err(|error| error.with_hint(&format!("Retry sign-in: `teams desktop login --desktop-client {} --port {port}`. To close this dedicated browser: `teams desktop disconnect --desktop-client {} --port {port}`.", if core { "browser-core" } else { "browser" }, if core { "browser-core" } else { "browser" })))?;
+    .await.map_err(|error| if recovery {
+        error.with_hint(&format!("Retry sign-in: `teams desktop login --desktop-client {} --port {port}`. To close this dedicated browser: `teams desktop disconnect --desktop-client {} --port {port}`.", if core { "browser-core" } else { "browser" }, if core { "browser-core" } else { "browser" }))
+    } else { error })?;
     if visible && !quiet {
         eprintln!(
             "Your organisation's sign-in does not allow Teams to stay signed in without its window, so the browser stays visible. Minimise it, but keep it open."
@@ -1251,10 +1291,7 @@ mod tests {
     async fn resume_preserves_visible_sessions_and_skips_repeated_work_sign_in_checks() {
         for visible in [false, true] {
             let mut session = FakeLogin::default();
-            assert_eq!(
-                resume_flow(&mut session, visible, true).await.unwrap(),
-                visible
-            );
+            assert_eq!(resume_flow(&mut session, visible).await.unwrap(), visible);
             assert_eq!(
                 session.events,
                 [
@@ -1266,29 +1303,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resumed_work_browser_falls_back_to_visible_only_after_verified_sign_in_loss() {
+    async fn cold_resume_opens_a_verified_inbox_without_blocking_on_the_background_watch() {
         let mut session = FakeLogin {
             signs_out_headless: true,
             ..Default::default()
         };
-        assert!(resume_flow(&mut session, false, false).await.unwrap());
-        assert_eq!(
-            session.events,
-            [
-                "headless",
-                "read-headless",
-                "watch-headless",
-                "close",
-                "visible",
-                "read-visible"
-            ]
-        );
+        assert!(!resume_flow(&mut session, false).await.unwrap());
+        assert_eq!(session.events, ["headless", "read-headless"]);
         let mut refused = FakeLogin {
             fail_headless: true,
             ..Default::default()
         };
-        assert!(resume_flow(&mut refused, false, false).await.is_err());
+        assert!(resume_flow(&mut refused, false).await.is_err());
         assert_eq!(refused.events, ["headless", "read-headless"]);
+    }
+
+    #[tokio::test]
+    async fn the_background_watch_reports_sign_in_loss_without_restarting_the_browser() {
+        let mut session = FakeLogin {
+            signs_out_headless: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            check_resumed_session(&mut session).await,
+            Err(AppError::Auth(_))
+        ));
+        assert_eq!(session.events, ["watch-headless"]);
     }
 
     #[tokio::test]
@@ -1368,7 +1408,11 @@ mod tests {
             ..Default::default()
         };
         let error = login_flow(&mut session).await.unwrap_err();
-        assert!(error.to_string().contains("Retry the sign-in command"));
+        assert!(
+            error
+                .to_string()
+                .contains("headless browser and saved profile were preserved")
+        );
         assert_eq!(session.events.last(), Some(&"read-headless"));
     }
 

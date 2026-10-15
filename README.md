@@ -60,6 +60,9 @@ setup prefers the lightweight browser. Missing display support, missing executab
 invalid browser overrides and unavailable matching downloads are checked before
 selection. Personal can use a full browser or Teams Desktop when lightweight mode
 is unavailable. Work/school can use Teams Desktop or Microsoft Graph when needed.
+When no lightweight runtime is installed, these checks query public Chrome for
+Testing version metadata at `googlechromelabs.github.io`; no browser download or
+Teams sign-in happens before consent.
 On a Linux terminal without a display, Graph uses device-code sign-in on another device.
 You explicitly approve reopening a dedicated browser
 when you start the inbox. The saved sign-in is reused, and expired work/school
@@ -74,6 +77,24 @@ send interface without sending a message. If that fails, you can explicitly cont
 read-only; setup never silently downgrades your choice. A successful probe establishes
 that the interface is available, while delivery and organisation policies are checked
 when you actually send. Teams build compatibility and sign-in still need live validation.
+
+Running setup again asks whether to connect another account or update an existing
+connection. Updates preserve Graph application/tenant settings and previously granted
+channel-history access. Failed Graph verification preserves the previous credential;
+if saving settings fails, the credential change is rolled back. Browser setup can resume
+an unfinished sign-in on the same port, or start a separate account without touching it.
+Recovery errors include the exact command to close that browser.
+You can forget an unfinished setup after confirmation; its browser data and saved
+sign-in remain on disk, and the old browser's close command is shown. Reusing that
+forgotten browser data requires explicit setup with its original `--desktop-port`.
+Setup offers unfinished connections under other names when you connect another account.
+
+Cold work-browser startup opens the inbox once chats are readable and checks sign-in
+renewal in the background. A sign-out pauses sending and offers sign-in in the inbox.
+Other startup-check failures keep chats readable and pause sending until you reopen
+the inbox to check again. Drafts stay in memory through the sign-in detour.
+Guided Graph setup disables conflicting token or permission environment overrides;
+explicit flags keep their automation behavior.
 
 **Other connection options** keeps Microsoft Graph and the running Teams Desktop
 available. Microsoft Graph includes a maintained Entra public-client registration,

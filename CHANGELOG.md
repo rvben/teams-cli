@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Guided setup offers separate accounts or explicit connection updates, preserves Graph registration and channel-history access, resumes interrupted browser sign-in on the original port, and verifies fresh Graph credentials before saving them with rollback on config failure.
+- Cold work-browser inbox startup checks sign-in renewal in the background; failures pause sending and offer sign-in while preserving drafts. First-run `teams tui` uses guided setup, including headless Graph recovery and environment-override checks.
 - Guided setup checks local browser/display support, Teams installation and Windows interop, and matching lightweight browser downloads before allowing a connection choice. Unavailable options explain their requirements; supported alternatives are selected automatically.
 - Guided Graph setup verifies chat access before saving connection settings. Desktop/browser sending opt-in now requires a send-interface probe; guided setup offers an explicit read-only alternative if it fails, without sending a test message.
 - Reject personal-only lightweight browser/work-school combinations before saving even with `--no-login`.

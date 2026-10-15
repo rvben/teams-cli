@@ -28,6 +28,8 @@ pub mod browser;
 mod browser_core;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod browser_install;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod browser_setup;
 use crate::{error::AppError, graph::Page};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,30 @@ const MAX_METADATA: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
 /// Teams' own limit for one chat message.
 pub const MAX_BODY: usize = 28_000;
+
+/// A read-only startup check owned by the inbox; dropping it cancels the task.
+pub struct ConnectionWatch {
+    pub(crate) receiver: std::sync::mpsc::Receiver<Result<(), AppError>>,
+    pub(crate) task: tokio::task::JoinHandle<()>,
+}
+
+impl ConnectionWatch {
+    pub(crate) fn result(&self) -> Option<Result<(), AppError>> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(AppError::Desktop(
+                "The Teams startup check stopped unexpectedly. Reopen the inbox to retry; your browser and sign-in were preserved.".into(),
+            ))),
+        }
+    }
+}
+
+impl Drop for ConnectionWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 pub fn messaging_unsupported() -> AppError {
     AppError::Unsupported("the experimental desktop backend reads chats and chat messages and sends plain-text chat messages only (macOS/Windows/WSL); teams, channels and identity need a Graph profile".into())
@@ -355,21 +381,31 @@ impl DesktopClient {
     }
 
     pub async fn login_with_progress(&self, quiet: bool) -> Result<Value, AppError> {
+        self.login_with_recovery(quiet, true).await
+    }
+
+    /// Guided setup supplies its own profile-aware recovery instructions.
+    pub async fn login_for_setup(&self, quiet: bool) -> Result<Value, AppError> {
+        self.login_with_recovery(quiet, false).await
+    }
+
+    async fn login_with_recovery(&self, quiet: bool, recovery: bool) -> Result<Value, AppError> {
         if !self.kind.is_browser() {
             return Err(AppError::InvalidInput(
                 "desktop login requires --desktop-client browser".into(),
             ));
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        return browser::login_with_progress(
+        return browser::login_with_recovery(
             self.port,
             self.account,
             self.kind == DesktopClientKind::BrowserCore,
             quiet,
+            recovery,
         )
         .await;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let _ = quiet;
+        let _ = (quiet, recovery);
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Err(AppError::Unsupported(
             "browser login requires macOS or Linux (including WSL2)".into(),

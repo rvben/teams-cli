@@ -130,6 +130,21 @@ fn require_terminal(hint: &str) -> Result<(), AppError> {
 
 /// Opens the chat reader and returns how the person left it.
 pub fn run(source: Source) -> Result<TuiExit, AppError> {
+    run_with_watch(source, None, &mut InboxState::default())
+}
+
+/// Drafts stay in memory while the CLI steps out of the inbox to reauthenticate.
+#[derive(Default)]
+pub struct InboxState {
+    drafts: HashMap<String, String>,
+    pending_sends: HashMap<String, String>,
+}
+
+pub fn run_with_watch(
+    source: Source,
+    mut watch: Option<crate::desktop::ConnectionWatch>,
+    saved: &mut InboxState,
+) -> Result<TuiExit, AppError> {
     require_terminal("use `teams tui --demo --snapshot` for an inspectable frame")?;
     let color = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
     let mut app = App::new(
@@ -137,11 +152,22 @@ pub fn run(source: Source) -> Result<TuiExit, AppError> {
         Theme { color },
         Zoned::now().with_time_zone(TimeZone::system()),
     );
+    app.drafts = std::mem::take(&mut saved.drafts);
+    app.pending_sends = std::mem::take(&mut saved.pending_sends);
     app.start();
     let _guard = TerminalGuard::enter(true)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     loop {
         app.tick();
+        if let Some(result) = watch
+            .as_ref()
+            .and_then(crate::desktop::ConnectionWatch::result)
+        {
+            if let Err(error) = result {
+                app.startup_failed(&error);
+            }
+            watch = None;
+        }
         terminal.draw(|frame| app.draw(frame))?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -160,8 +186,14 @@ pub fn run(source: Source) -> Result<TuiExit, AppError> {
         };
         match action {
             Action::None => {}
-            Action::Quit => return Ok(TuiExit::Quit),
-            Action::Authenticate => return Ok(TuiExit::Authenticate),
+            Action::Quit => {
+                app.preserve_drafts(saved);
+                return Ok(TuiExit::Quit);
+            }
+            Action::Authenticate => {
+                app.preserve_drafts(saved);
+                return Ok(TuiExit::Authenticate);
+            }
         }
     }
 }
@@ -358,6 +390,8 @@ struct App {
     rows: Vec<ChatRow>,
     chat_cursor: Option<String>,
     chats_load: Load,
+    startup_auth_error: Option<String>,
+    sending_paused: bool,
     debugging_restart: Option<DebuggingRestart>,
     flag_cleanup: Option<FlagCleanup>,
     loading_more: bool,
@@ -395,6 +429,39 @@ struct App {
 }
 
 impl App {
+    fn preserve_drafts(&mut self, saved: &mut InboxState) {
+        if let Some(compose) = self.compose.take() {
+            self.drafts.insert(compose.chat, compose.text);
+        }
+        saved.drafts = std::mem::take(&mut self.drafts);
+        saved.pending_sends = std::mem::take(&mut self.pending_sends);
+    }
+
+    fn startup_failed(&mut self, error: &AppError) {
+        self.sending_paused |= self.can_send();
+        if let Source::Live { can_send, .. } = &mut self.source {
+            *can_send = false;
+        }
+        if matches!(error, AppError::Auth(_)) {
+            if let Some(compose) = self.compose.take() {
+                self.drafts.insert(compose.chat, compose.text);
+            }
+            self.overlay = None;
+            self.debugging_restart = None;
+            self.flag_cleanup = None;
+            self.startup_auth_error = Some(error.to_string());
+            self.chats_load = Load::failed(error);
+            self.notice = Notice::new(Tone::Error, error.to_string());
+        } else {
+            let message = if self.sending_paused {
+                format!("{error} Sending is paused; reopen the inbox to check it again.")
+            } else {
+                error.to_string()
+            };
+            self.notice = Notice::new(Tone::Error, message);
+        }
+    }
+
     fn new(source: Source, theme: Theme, now: Zoned) -> Self {
         Self {
             theme,
@@ -407,6 +474,8 @@ impl App {
             rows: Vec::new(),
             chat_cursor: None,
             chats_load: Load::Loading,
+            startup_auth_error: None,
+            sending_paused: false,
             debugging_restart: None,
             flag_cleanup: None,
             loading_more: false,
@@ -1009,6 +1078,17 @@ impl App {
         while let Ok(outcome) = self.outcomes.1.try_recv() {
             self.apply(outcome);
         }
+        if let Some(message) = &self.startup_auth_error {
+            self.chats_load = Load::Failed {
+                message: message.clone(),
+                auth: true,
+            };
+            self.notice = Notice::new(
+                Tone::Error,
+                "Sign-in is needed. Reply drafts are kept while you reconnect.",
+            );
+            return;
+        }
         if self
             .selected_at
             .is_some_and(|at| at.elapsed() >= DWELL || self.focus == Focus::Thread)
@@ -1091,7 +1171,11 @@ impl App {
         if !self.can_send() {
             self.notice = Notice::new(
                 Tone::Error,
-                "This profile is read-only; sending needs a profile created with `teams init --backend desktop --allow-send`.",
+                if self.sending_paused {
+                    "Sending is paused after a startup check failed. Reopen the inbox to check the connection again; your profile's send permission is unchanged."
+                } else {
+                    "This profile is read-only; sending needs a profile created with `teams init --backend desktop --allow-send`."
+                },
             );
             return;
         }
@@ -1217,6 +1301,13 @@ impl App {
     }
 
     fn send(&mut self) {
+        if !self.can_send() {
+            self.notice = Notice::new(
+                Tone::Error,
+                "Sending is paused; reconnect Teams before sending this draft",
+            );
+            return;
+        }
         let Some(compose) = self.compose.as_mut() else {
             return;
         };
@@ -1327,6 +1418,13 @@ impl App {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        if self.startup_auth_error.is_some() {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('a') => Action::Authenticate,
+                KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+                _ => Action::None,
+            };
         }
         if let Some(restart) = self.debugging_restart {
             match (restart, key.code) {
@@ -1670,6 +1768,8 @@ impl App {
         // Right: the send mode always shows, with a one-column margin like the left.
         let mut right = if self.can_send() {
             vec![Span::styled("✎ can send", theme.badge_send())]
+        } else if self.sending_paused {
+            vec![Span::styled("sending paused", theme.error())]
         } else {
             vec![Span::styled("read-only", theme.muted())]
         };
@@ -3272,6 +3372,83 @@ mod tests {
             press(&mut app, KeyCode::Enter),
             Action::Authenticate
         ));
+    }
+
+    #[test]
+    fn background_sign_in_loss_preserves_the_draft_and_disables_sending() {
+        let mut app = live_app(true, "synthetic-work");
+        app.compose = Some(Compose {
+            chat: "synthetic-chat".into(),
+            text: "Keep this draft".into(),
+            cursor: 15,
+            stage: Stage::Editing,
+        });
+        app.startup_failed(&AppError::Auth("Teams needs its browser window".into()));
+        assert!(!app.can_send());
+        assert!(app.sign_in_needed());
+        assert!(app.compose.is_none());
+        assert_eq!(app.drafts["synthetic-chat"], "Keep this draft");
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('a')),
+            Action::Authenticate
+        ));
+        assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::Quit));
+        app.send();
+        assert!(app.pending_sends.is_empty());
+        assert_eq!(app.drafts["synthetic-chat"], "Keep this draft");
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&app.now)),
+        });
+        app.tick();
+        assert!(app.sign_in_needed());
+        assert!(!app.notice.text.contains("Enter opens a chat"));
+        let mut saved = InboxState::default();
+        app.preserve_drafts(&mut saved);
+        assert_eq!(saved.drafts["synthetic-chat"], "Keep this draft");
+    }
+
+    #[test]
+    fn a_non_auth_startup_failure_keeps_chats_readable_and_refresh_can_succeed() {
+        let mut app = live_app(true, "synthetic-work");
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&app.now)),
+        });
+        app.startup_failed(&AppError::Desktop("Temporary verification failure".into()));
+        assert!(matches!(app.chats_load, Load::Ready));
+        assert!(!app.can_send());
+        assert!(app.notice.text.contains("Sending is paused"));
+        app.chats_load = Load::Loading;
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&app.now)),
+        });
+        app.tick();
+        assert!(matches!(app.chats_load, Load::Ready));
+        assert!(!app.sign_in_needed());
+        assert!(!app.can_send());
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.notice.text.contains("Sending is paused"));
+        assert!(!app.notice.text.contains("profile is read-only"));
+        assert!(frame_text(&mut app).contains("sending paused"));
+    }
+
+    #[test]
+    fn a_read_only_profile_does_not_claim_sending_was_paused() {
+        let mut app = live_app(false, "synthetic-profile");
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&app.now)),
+        });
+        app.startup_failed(&AppError::Desktop("Temporary verification failure".into()));
+        assert_eq!(app.notice.text, "Temporary verification failure");
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.notice.text.contains("profile is read-only"));
+        assert!(!app.notice.text.contains("Sending is paused"));
+        let text = frame_text(&mut app);
+        assert!(text.lines().next().unwrap().contains("read-only"));
+        assert!(!text.contains("sending paused"));
     }
 
     fn frame_text(app: &mut App) -> String {

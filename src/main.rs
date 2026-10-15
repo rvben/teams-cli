@@ -358,7 +358,7 @@ async fn guided_init(
     args: InitArgs,
     out: Output,
 ) -> Result<(), AppError> {
-    out.note("Checking connection options…");
+    out.note("Checking this computer and available browser downloads…");
     let capabilities = setup::Capabilities::detect().await;
     let plan = setup::run(
         args,
@@ -373,6 +373,13 @@ async fn guided_init(
         out.note("Setup cancelled. Your connection settings were not changed.");
         return Ok(());
     };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(pending) = &plan.forget_pending {
+        desktop::browser_setup::finish(pending.port)?;
+        out.note(format!("Forgot the unfinished setup. Its sign-in data was kept. To close its browser: `teams desktop disconnect --desktop-client {} --port {}`.", pending.client.as_str(), pending.port));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = &plan.forget_pending;
     init(&plan.name, plan.args, plan.browser_confirmed, out, true).await?;
     tui_command(
         Some(&plan.name),
@@ -409,7 +416,11 @@ async fn verify_setup_sending(
             profile.read_only = true;
             return Ok(());
         }
-        return Err(error.with_hint("No profile was saved. Run `teams init` and choose Read only to use the readable chat history."));
+        return Err(error.with_hint(if guided {
+            "Choose Read only during setup to use the readable chat history."
+        } else {
+            "No profile was saved. Re-run the same init command without --allow-send to use read-only access."
+        }));
     }
     Ok(())
 }
@@ -490,15 +501,34 @@ async fn init(
         let client = DesktopClient::from_profile(&profile)?;
         if profile.desktop_client.is_browser() {
             confirm_browser_connection(yes)?;
-            let login = client
-                .login_with_progress(out.quiet)
-                .await
-                .map_err(|error| error.with_hint("No profile was saved."))?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if guided {
+                desktop::browser_setup::begin(profile_name, &profile)?;
+            }
+            let verified = async {
+                let login = if guided {
+                    client.login_for_setup(out.quiet).await?
+                } else {
+                    client.login_with_progress(out.quiet).await?
+                };
+                let chats = client.chats(1, None).await?;
+                verify_setup_sending(&client, &mut profile, guided, out).await?;
+                let connection = client.probe().await?;
+                let path = config::save(profile_name, profile.clone())?;
+                Ok::<_, AppError>((login, chats, connection, path))
+            }
+            .await;
+            let (login, chats, connection, path) = verified.map_err(|error| {
+                let retry = if guided {
+                    format!("Retry `teams init --profile {}` and confirm the connection; your saved sign-in will be reused.", shell_word(profile_name))
+                } else { "Retry the same init command.".into() };
+                error.with_hint(&format!("No connection settings were saved. {retry} To close any browser left running for this setup: `teams desktop disconnect --desktop-client {} --port {port}`.", profile.desktop_client.as_str()))
+            })?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if guided && let Err(error) = desktop::browser_setup::finish(port) {
+                out.note(format!("You're connected, but the unfinished-setup marker could not be removed: {error}"));
+            }
             let mode = browser_mode(&login);
-            let chats = client.chats(1, None).await?;
-            verify_setup_sending(&client, &mut profile, guided, out).await?;
-            let connection = client.probe().await?;
-            let path = config::save(profile_name, profile.clone())?;
             let value = output(
                 &path,
                 &profile,
@@ -594,7 +624,7 @@ async fn init(
         ));
     }
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
-    if interactive && !out.json() {
+    if interactive && !out.json() && !guided {
         eprintln!("\n  teams\n  Microsoft Teams, without leaving your flow.\n");
         if args.device_code {
             eprintln!("  Use the Microsoft sign-in code on another device.");
@@ -634,6 +664,11 @@ async fn init(
         desktop_client: Default::default(),
         browser_auto_start: false,
     };
+    let channel_history = args.channel_history
+        || (guided
+            && config::connection_profile(Some(profile_name))?
+                .is_some_and(|existing| existing.backend == BackendKind::Graph)
+            && auth::channel_history_granted(profile_name) == Some(true));
     // Explicit/offline init keeps its contract. Guided setup saves only after a live read.
     let saved = if guided {
         None
@@ -641,31 +676,47 @@ async fn init(
         Some(config::save(profile_name, profile.clone())?)
     };
     let mut signed_in = false;
+    let mut pending_login = None;
     if !args.no_login {
         let resolved = if guided {
             profile.clone()
         } else {
             config::load(Some(profile_name))?.1
         };
-        auth::login(
-            profile_name,
-            &resolved,
-            args.device_code,
-            args.channel_history,
-            &out,
-        )
-        .await?;
         if guided {
+            let bundle = auth::sign_in(&resolved, args.device_code, channel_history, &out).await?;
             out.note("Checking chat access…");
-            let access = auth::access_token(profile_name, &resolved).await?;
-            graph::GraphClient::new(access).chats(1, None).await
-                .map_err(|error| error.with_hint("Sign-in completed, but chat access could not be verified. No connection settings were saved. Check your organisation's Teams access, or run `teams init` and choose Teams Desktop or a browser."))?;
+            let check = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                graph::GraphClient::new(bundle.access_token.clone()).chats(1, None),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(AppError::Api(
+                    "The chat access check timed out after 30 seconds.".into(),
+                )),
+            };
+            check.map_err(|error| error.with_hint("Sign-in completed, but chat access could not be verified. No connection settings or saved credentials were changed. Check your organisation's Teams access, or run `teams init` and choose Teams Desktop or a browser."))?;
+            pending_login = Some(bundle);
+        } else {
+            auth::login(
+                profile_name,
+                &resolved,
+                args.device_code,
+                channel_history,
+                &out,
+            )
+            .await?;
         }
         signed_in = true;
     }
-    let path = match saved {
-        Some(path) => path,
-        None => config::save(profile_name, profile)?,
+    let path = match (saved, pending_login) {
+        (Some(path), _) => path,
+        (_, Some(bundle)) => auth::save_verified_login(profile_name, &bundle, || {
+            config::save(profile_name, profile)
+        })?,
+        _ => config::save(profile_name, profile)?,
     };
     #[derive(Serialize)]
     struct InitResult<'a> {
@@ -685,7 +736,7 @@ async fn init(
         signed_in,
         client_id: &client_id,
         tenant: &tenant,
-        channel_history_requested: args.channel_history,
+        channel_history_requested: channel_history,
         read_only: args.read_only,
     };
     out.value(&result, || {
@@ -938,7 +989,23 @@ async fn tui_command(
         tokio::task::block_in_place(|| tui::run(tui::Source::Demo))?;
         return Ok(());
     }
+    if config::connection_profile(profile_arg)?.is_none()
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+    {
+        return Box::pin(guided_init(
+            profile_arg,
+            default_init_args()?,
+            Output {
+                format: OutputFormat::Text,
+                quiet: false,
+            },
+        ))
+        .await;
+    }
     let profile_name = config::selected_profile_name(profile_arg)?;
+    let mut startup_watch = None;
     if let Some(profile) = config::connection_profile(profile_arg)?
         && profile.backend == BackendKind::Desktop
         && profile.desktop_client.is_browser()
@@ -947,9 +1014,9 @@ async fn tui_command(
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
     {
-        resume_browser(&profile_name, &profile).await?;
+        startup_watch = resume_browser(&profile_name, &profile).await?;
     }
-    let mut reason_override = None;
+    let mut inbox_state = tui::InboxState::default();
     loop {
         // `None` means the person already asked to sign in from inside the TUI.
         let connection_error = match client(profile_arg).await {
@@ -961,7 +1028,9 @@ async fn tui_command(
                     profile: profile_name.clone(),
                     can_send,
                 };
-                match tokio::task::block_in_place(|| tui::run(source))? {
+                match tokio::task::block_in_place(|| {
+                    tui::run_with_watch(source, startup_watch.take(), &mut inbox_state)
+                })? {
                     tui::TuiExit::Quit => return Ok(()),
                     tui::TuiExit::Authenticate => None,
                 }
@@ -971,9 +1040,7 @@ async fn tui_command(
         };
         let configured = config::configured_profile(profile_arg).is_some();
         if let Some(error) = connection_error {
-            let reason = reason_override
-                .take()
-                .unwrap_or_else(|| tui_connection_reason(&error));
+            let reason = tui_connection_reason(&error);
             if tui::request_authentication(&profile_name, configured, &reason)?
                 == tui::TuiExit::Quit
             {
@@ -981,35 +1048,71 @@ async fn tui_command(
             }
         }
 
-        let auth_output = Output {
-            format: OutputFormat::Text,
-            quiet: false,
-        };
-        let result = if configured {
-            let (_, profile) = config::load(profile_arg)?;
-            auth::login(&profile_name, &profile, false, false, &auth_output)
+        loop {
+            let auth_output = Output {
+                format: OutputFormat::Text,
+                quiet: false,
+            };
+            let result = if configured {
+                let (_, profile) = config::load(profile_arg)?;
+                if profile.backend == BackendKind::Desktop {
+                    let client = DesktopClient::from_profile(&profile)?;
+                    if profile.desktop_client.is_browser() {
+                        client.login_with_progress(false).await.map(|_| ())
+                    } else {
+                        if tui::request_authentication(
+                            &profile_name,
+                            true,
+                            "Finish signing in in Teams Desktop, then press Enter to check the connection.",
+                        )? == tui::TuiExit::Quit
+                        {
+                            return Ok(());
+                        }
+                        client.chats(1, None).await.map(|_| ())
+                    }
+                } else {
+                    auth::login(
+                        &profile_name,
+                        &profile,
+                        setup::graph_device_code_needed(),
+                        auth::channel_history_granted(&profile_name) == Some(true),
+                        &auth_output,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            } else {
+                init(
+                    &profile_name,
+                    default_init_args()?,
+                    false,
+                    auth_output,
+                    false,
+                )
                 .await
-                .map(|_| ())
-        } else {
-            init(
+            };
+            let Err(error) = result else {
+                break;
+            };
+            if tui::request_authentication(
                 &profile_name,
-                default_init_args()?,
-                false,
-                auth_output,
-                false,
-            )
-            .await
-        };
-        if let Err(error) = result {
-            reason_override = Some(format!(
-                "Sign-in did not complete: {} You can try again.",
-                concise_error(&error)
-            ));
+                configured,
+                &format!(
+                    "Sign-in did not complete: {} You can try again. Your reply drafts are kept while you retry.",
+                    concise_error(&error)
+                ),
+            )? == tui::TuiExit::Quit
+            {
+                return Ok(());
+            }
         }
     }
 }
 
-async fn resume_browser(profile_name: &str, profile: &Profile) -> Result<(), AppError> {
+async fn resume_browser(
+    profile_name: &str,
+    profile: &Profile,
+) -> Result<Option<desktop::ConnectionWatch>, AppError> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         eprintln!("Opening your Teams inbox…");
@@ -1021,9 +1124,9 @@ async fn resume_browser(profile_name: &str, profile: &Profile) -> Result<(), App
         )
         .await;
         match result {
-            Ok(visible) => {
+            Ok((visible, watch)) => {
                 if visible { eprintln!("Keep the Teams browser window open; you can minimise it."); }
-                Ok(())
+                Ok(watch)
             },
             Err(AppError::Auth(_)) => {
                 use std::io::Write;
@@ -1033,7 +1136,7 @@ async fn resume_browser(profile_name: &str, profile: &Profile) -> Result<(), App
                 if io::stdin().read_line(&mut answer)? > 0
                     && matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
                     DesktopClient::from_profile(profile)?.login_with_progress(false).await?;
-                    return Ok(());
+                    return Ok(None);
                 }
                 Err(AppError::Auth(format!("Sign-in paused. Run `teams --profile {profile_name}` when you're ready.")))
             },
@@ -1074,6 +1177,10 @@ fn tui_connection_reason(error: &AppError) -> String {
 
 fn concise_error(error: &AppError) -> String {
     error.to_string().trim_end_matches('.').to_string()
+}
+
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

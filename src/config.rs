@@ -106,6 +106,15 @@ impl DesktopAccount {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingBrowserSetup {
+    pub name: String,
+    pub port: u16,
+    pub account: DesktopAccount,
+    pub client: DesktopClientKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default)]

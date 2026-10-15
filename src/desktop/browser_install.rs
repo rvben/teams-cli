@@ -145,7 +145,7 @@ fn validate_pair(pair: &(PathBuf, PathBuf), expected: Option<&str>) -> Result<St
     let version = browser_version(&pair.0)?;
     if browser_version(&pair.1)? != version || expected.is_some_and(|e| e != version) {
         return Err(failed(
-            "visible browser and headless shell must have exactly matching versions",
+            "visible browser and headless shell must have exactly matching versions; fix or unset both browser overrides, then retry setup",
         ));
     }
     Ok(version)

@@ -25,6 +25,8 @@ impl Availability {
 
 #[derive(Clone, Debug)]
 pub struct Capabilities {
+    pub graph: Availability,
+    pub pending: Vec<crate::config::PendingBrowserSetup>,
     pub browser: Availability,
     pub core: Availability,
     pub native: Availability,
@@ -51,15 +53,27 @@ impl Capabilities {
                 desktop::connection::preflight().await,
             )
         };
-        Self {
+        #[allow(unused_mut)] // Only Unix has pending browser setup records.
+        let mut detected = Self {
+            graph: graph_availability(|key| std::env::var_os(key)),
+            pending: Vec::new(),
             browser: Availability::from_check(browser),
             core: Availability::from_check(core),
             native: Availability::from_check(native.map(|()| false)),
-            graph_device_code: cfg!(target_os = "linux")
-                && !["DISPLAY", "WAYLAND_DISPLAY"]
-                    .iter()
-                    .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty())),
+            graph_device_code: graph_device_code_needed(),
+        };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        match desktop::browser_setup::list() {
+            Ok(pending) => detected.pending = pending,
+            Err(error) => {
+                let reason = format!(
+                    "{error} Check the browser setup records before retrying; no saved sign-in was changed."
+                );
+                detected.browser = Availability::Blocked(reason.clone());
+                detected.core = Availability::Blocked(reason);
+            }
         }
+        detected
     }
 
     pub fn availability(&self, kind: DesktopClientKind) -> &Availability {
@@ -81,5 +95,84 @@ impl Capabilities {
             .iter()
             .copied()
             .find(|kind| self.availability(*kind).reason().is_none())
+    }
+}
+
+pub fn graph_device_code_needed() -> bool {
+    cfg!(target_os = "linux")
+        && !["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
+fn graph_availability(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Availability {
+    let blocked = if get("TEAMS_ACCESS_TOKEN").is_some() {
+        Some(
+            "TEAMS_ACCESS_TOKEN overrides browser sign-in. Unset it before guided Graph setup, or use explicit init flags for automation.",
+        )
+    } else if get("TEAMS_READ_ONLY").is_some_and(|value| {
+        matches!(
+            value
+                .to_str()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("false" | "0" | "no" | "off")
+        )
+    }) {
+        Some(
+            "TEAMS_READ_ONLY=false overrides Graph's saved read-only setting. Unset it before guided Graph setup, or use explicit init flags.",
+        )
+    } else if get("TEAMS_CLIENT_ID").is_some() {
+        Some(
+            "TEAMS_CLIENT_ID overrides saved Graph application settings. Unset it before guided setup, or use explicit init flags for a custom application.",
+        )
+    } else if get("TEAMS_TENANT").is_some() {
+        Some(
+            "TEAMS_TENANT overrides saved Graph tenant settings. Unset it before guided setup, or use explicit init flags for a custom tenant.",
+        )
+    } else {
+        None
+    };
+    match blocked {
+        Some(reason) => Availability::Blocked(reason.into()),
+        None => Availability::Ready { download: false },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guided_graph_excludes_overrides_that_could_verify_another_session_or_unlock_reads() {
+        for (key, value) in [
+            ("TEAMS_ACCESS_TOKEN", "synthetic-token"),
+            ("TEAMS_ACCESS_TOKEN", ""),
+            ("TEAMS_READ_ONLY", "false"),
+            ("TEAMS_READ_ONLY", " OFF "),
+            ("TEAMS_CLIENT_ID", " "),
+            ("TEAMS_CLIENT_ID", "synthetic-app"),
+            ("TEAMS_TENANT", ""),
+            ("TEAMS_TENANT", "synthetic-tenant"),
+        ] {
+            let availability = graph_availability(|name| (name == key).then(|| value.into()));
+            assert!(availability.reason().unwrap().contains(key));
+            if value.starts_with("synthetic-") {
+                assert!(!availability.reason().unwrap().contains(value));
+            }
+        }
+        for value in [None, Some("true")] {
+            assert!(
+                graph_availability(|name| {
+                    (name == "TEAMS_READ_ONLY")
+                        .then_some(value)
+                        .flatten()
+                        .map(Into::into)
+                })
+                .reason()
+                .is_none()
+            );
+        }
     }
 }
