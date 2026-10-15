@@ -445,8 +445,12 @@ async fn init(
             || args.device_code
             || args.channel_history
             || args.tenant.is_some()
+            || args.credential_store.is_some()
+            || args.pass_store_dir.is_some()
         {
-            return Err(AppError::InvalidInput("desktop profiles do not use OAuth client, tenant, device-code or channel-history options".into()));
+            return Err(AppError::InvalidInput(
+                "desktop profiles do not use OAuth or Graph credential-store options".into(),
+            ));
         }
         if args.allow_send && args.read_only {
             return Err(AppError::InvalidInput(
@@ -454,7 +458,15 @@ async fn init(
             ));
         }
         let read_only = !args.allow_send;
+        // Preserve the Graph store choice even while a profile uses Desktop,
+        // so switching the connection back cannot redirect its old credential.
+        let previous = config::connection_profile(Some(profile_name))?;
         let mut profile = Profile {
+            credential_store: previous
+                .as_ref()
+                .map(|profile| profile.credential_store)
+                .unwrap_or_default(),
+            pass_store_dir: previous.and_then(|profile| profile.pass_store_dir),
             backend: BackendKind::Desktop,
             client_id: String::new(),
             tenant: String::new(),
@@ -637,6 +649,62 @@ async fn init(
             "  For a personal account on macOS/Windows/WSL, use `teams init --backend desktop`.\n"
         );
     }
+    let existing = config::connection_profile(Some(profile_name))?;
+    let mut credential_store = args
+        .credential_store
+        .or_else(|| existing.as_ref().map(|profile| profile.credential_store))
+        .unwrap_or_default();
+    if existing.is_none()
+        && args.credential_store.is_none()
+        && args.pass_store_dir.is_none()
+        && interactive
+        && !out.json()
+        && !args.no_login
+        && auth::available_pass_directory().is_some()
+    {
+        let Some(selected) = setup::choose_credential_store(
+            auth::native_store_label(),
+            auth::native_store_error(profile_name).as_deref(),
+            &mut io::stdin().lock(),
+            &mut io::stderr().lock(),
+        )?
+        else {
+            return Ok(());
+        };
+        credential_store = selected;
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|profile| profile.credential_store != credential_store)
+    {
+        return Err(AppError::InvalidInput(
+            "This profile already uses another credential store. Use --profile NEW_NAME to create a separate profile; the existing sign-in was preserved".into(),
+        ));
+    }
+    let pass_store_dir = if credential_store == config::CredentialStore::Pass {
+        let saved = existing
+            .as_ref()
+            .and_then(|profile| profile.pass_store_dir.as_deref());
+        if existing.is_some() && saved.is_none() {
+            return Err(AppError::InvalidInput("This pass profile has no saved pass_store_dir; restore its original directory in the profile configuration".into()));
+        }
+        let directory = auth::prepare_pass_directory(args.pass_store_dir.as_deref().or(saved))?;
+        if let Some(saved) = saved
+            && std::fs::canonicalize(saved)? != directory
+        {
+            return Err(AppError::InvalidInput(
+                "This profile already uses another pass directory. Use --profile NEW_NAME to create a separate profile; the existing sign-in was preserved".into(),
+            ));
+        }
+        Some(directory)
+    } else {
+        if args.pass_store_dir.is_some() {
+            return Err(AppError::InvalidInput(
+                "--pass-store-dir requires --credential-store pass".into(),
+            ));
+        }
+        None
+    };
     let client_id = args
         .client_id
         .or_else(|| std::env::var("TEAMS_CLIENT_ID").ok())
@@ -654,6 +722,8 @@ async fn init(
         ));
     }
     let profile = Profile {
+        credential_store,
+        pass_store_dir: pass_store_dir.clone(),
         backend: BackendKind::Graph,
         client_id: client_id.clone(),
         tenant: tenant.clone(),
@@ -684,6 +754,7 @@ async fn init(
             config::load(Some(profile_name))?.1
         };
         if guided {
+            auth::check_store(profile_name, &resolved)?;
             let bundle = auth::sign_in(&resolved, args.device_code, channel_history, &out).await?;
             out.note("Checking chat access…");
             let check = match tokio::time::timeout(
@@ -713,13 +784,15 @@ async fn init(
     }
     let path = match (saved, pending_login) {
         (Some(path), _) => path,
-        (_, Some(bundle)) => auth::save_verified_login(profile_name, &bundle, || {
-            config::save(profile_name, profile)
+        (_, Some(bundle)) => auth::save_verified_login(profile_name, &profile, &bundle, || {
+            config::save(profile_name, profile.clone())
         })?,
         _ => config::save(profile_name, profile)?,
     };
     #[derive(Serialize)]
     struct InitResult<'a> {
+        credential_store: config::CredentialStore,
+        pass_store_dir: Option<std::path::PathBuf>,
         profile: &'a str,
         backend: &'a str,
         config_path: String,
@@ -730,6 +803,8 @@ async fn init(
         read_only: bool,
     }
     let result = InitResult {
+        credential_store,
+        pass_store_dir,
         profile: profile_name,
         backend: "graph",
         config_path: path.display().to_string(),
@@ -762,6 +837,8 @@ fn config_command(
             let value = serde_json::json!({
                 "profile": name,
                 "backend": profile.backend,
+                "credential_store": if profile.backend == BackendKind::Graph { Some(profile.credential_store) } else { None },
+                "pass_store_dir": if profile.backend == BackendKind::Graph { profile.pass_store_dir.as_ref() } else { None },
                 "desktop_port": if profile.backend == BackendKind::Desktop { Some(profile.desktop_port) } else { None },
                 "desktop_account": if profile.backend == BackendKind::Desktop { Some(profile.desktop_account) } else { None },
                 "desktop_client": if profile.backend == BackendKind::Desktop { Some(profile.desktop_client) } else { None },
@@ -780,7 +857,9 @@ fn config_command(
                     value["client_id"].as_str().unwrap_or_default(),
                     yes_no(value["read_only"].as_bool().unwrap_or(false)),
                     config::path().display(),
-                    if profile.backend == BackendKind::Desktop { format!("\nDesktop port: {}\nDesktop account: {}", profile.desktop_port, profile.desktop_account.as_str()) } else { String::new() },
+                    if profile.backend == BackendKind::Desktop { format!("\nDesktop port: {}\nDesktop account: {}", profile.desktop_port, profile.desktop_account.as_str()) } else {
+                        format!("\nCredential store: {}{}", if profile.credential_store == config::CredentialStore::Pass { "pass" } else { auth::native_store_label() }, profile.pass_store_dir.as_ref().map(|dir| format!(" ({})", dir.display())).unwrap_or_default())
+                    },
                 )
             })
         }
@@ -840,20 +919,31 @@ async fn auth_command(
                 .as_ref()
                 .map(|(n, _)| n.as_str())
                 .unwrap_or(profile_arg.unwrap_or("default"));
-            let signed_in = auth::has_token(name);
-            let scopes = auth::granted_scopes(name);
-            let channel_history = auth::channel_history_granted(name);
+            let (signed_in, credential_error) = match auth::credential_present(name) {
+                Ok(present) => (present, None),
+                Err(error) => (false, Some(error.to_string())),
+            };
+            let scopes = if signed_in {
+                auth::granted_scopes(name)
+            } else {
+                None
+            };
+            let channel_history = scopes.as_ref().map(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| scope.eq_ignore_ascii_case(auth::CHANNEL_HISTORY_SCOPE))
+            });
             let identity = if !offline && configured.is_some() && signed_in {
                 Some(client(Some(name)).await?.me().await?)
             } else {
                 None
             };
-            let value = serde_json::json!({"profile":name,"backend":"graph","configured":configured.is_some(),"signed_in":signed_in,"verified":identity.is_some(),"identity":identity,"config_path":config::path(),"read_only":configured.as_ref().is_some_and(|(_, profile)| profile.read_only),"granted_scopes":scopes,"channel_history":channel_history});
+            let value = serde_json::json!({"profile":name,"backend":"graph","configured":configured.is_some(),"credential_store":configured.as_ref().map(|(_, profile)| profile.credential_store),"credential_error":credential_error,"signed_in":if credential_error.is_some() { None } else { Some(signed_in) },"verified":identity.is_some(),"identity":identity,"config_path":config::path(),"read_only":configured.as_ref().is_some_and(|(_, profile)| profile.read_only),"granted_scopes":scopes,"channel_history":channel_history});
             out.value(&value, || {
                 format!(
                     "Profile: {name}\nConfigured: {}\nSigned in: {}\nRead only: {}\nChannel history: {}\nConfig: {}",
                     yes_no(configured.is_some()),
-                    yes_no(signed_in),
+                    if let Some(error) = credential_error.as_ref() { format!("unavailable ({error})") } else { yes_no(signed_in).into() },
                     yes_no(value["read_only"].as_bool().unwrap_or(false)),
                     optional_access(channel_history),
                     config::path().display()
@@ -903,7 +993,10 @@ fn profile_command(command: ProfileCommand, yes: bool, out: Output) -> Result<()
                     "profile removal requires --yes".into(),
                 ));
             }
-            if config::selected_backend(Some(&name))? == BackendKind::Graph {
+            if config::connection_profile(Some(&name))?.is_some_and(|profile| {
+                profile.backend == BackendKind::Graph
+                    || profile.credential_store == config::CredentialStore::Pass
+            }) {
                 auth::logout(&name)?;
             }
             if !config::remove_profile(&name)? {
@@ -1270,24 +1363,31 @@ async fn doctor(profile_arg: Option<&str>, offline: bool, out: Output) -> Result
             },
         });
     }
-    let signed_in = configured
+    let credential = configured
         .as_ref()
-        .is_some_and(|(name, _)| auth::has_token(name));
+        .map(|(name, _)| auth::credential_present(name))
+        .unwrap_or(Ok(false));
+    let signed_in = matches!(credential, Ok(true));
     checks.push(Check {
         name: "credential_store",
         status: if signed_in { "pass" } else { "fail" },
-        detail: if signed_in {
-            "credential is present".into()
-        } else {
-            "run `teams auth login`".into()
+        detail: match credential {
+            Ok(true) => "credential is present".into(),
+            Ok(false) => "run `teams auth login`".into(),
+            Err(error) => error.to_string(),
         },
     });
-    let channel_history = auth::channel_history_granted(
-        configured
-            .as_ref()
-            .map(|(name, _)| name.as_str())
-            .unwrap_or("default"),
-    );
+    let channel_history = if signed_in {
+        auth::channel_history_granted(
+            configured
+                .as_ref()
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("default"),
+        )
+    } else {
+        None
+    };
+
     checks.push(Check {
         name: "channel_history",
         status: if channel_history == Some(true) {

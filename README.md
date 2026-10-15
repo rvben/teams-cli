@@ -194,6 +194,51 @@ The custom app must be a public client with `http://localhost` registered for br
 
 For short-lived automation, `TEAMS_ACCESS_TOKEN` overrides the stored credential. Refresh credentials are never written to the config file.
 
+Under WSL, Graph credentials use Windows DPAPI encryption for the current Windows
+user through `powershell.exe`; no D-Bus or Linux Secret Service is required. Windows
+executable interop must be enabled. Encrypted files live under
+`%LOCALAPPDATA%\teams-cli\credentials` and are shared by WSL distributions using
+the same Windows account and profile name. Existing WSL Secret Service sign-ins
+require `teams auth login` again after upgrading; their old entries are not migrated
+or removed. Native Linux uses Secret Service by default.
+
+### Using pass for Graph credentials
+
+On Linux, WSL and macOS, interactive Graph setup offers `pass` when it is installed
+and the selected password store has a readable `.gpg-id`. The OS store is recommended
+when available; if it is unavailable, setup recommends the configured pass store.
+Existing profiles keep their saved credential store without prompting again.
+
+To select it explicitly, initialize your GPG password store first, then run:
+
+```console
+pass init GPG_KEY_ID
+teams --profile work-pass init --credential-store pass --device-code
+# To use a different existing store:
+teams --profile other-work init --credential-store pass --pass-store-dir /path/to/password-store --device-code
+```
+
+Before opening Microsoft sign-in for a new pass credential, the CLI checks encryption
+and decryption using synthetic data in a private temporary store. The check leaves
+no probe entries or Git commits in your password store. GPG may ask you to unlock
+your key; configure `gpg-agent` and a suitable pinentry for your terminal or desktop.
+Terminal pinentry may need `export GPG_TTY="$(tty)"`. Helper operations time out after
+60 seconds if unlocking or another operation stalls.
+
+Tokens are passed to `pass` through stdin, and stored under
+`teams-cli/<SHA-256 of profile name>`. The CLI saves `credential_store = "pass"` and
+the absolute `pass_store_dir` in the profile. Changing `PASSWORD_STORE_DIR` later
+will not redirect that profile's credentials. Sign-in, refresh, status and logout
+use the same saved store; failures report the store or GPG problem without falling
+back to another backend. Failed replacements restore the previous encrypted file.
+As usual, pass manages its own local Git history if enabled; logout removes the
+current entry, while older encrypted versions may remain in that history.
+
+Use a new profile name to change credential stores or pass directories. After
+verifying the new connection, sign out the old profile if you no longer need it.
+`--no-login` validates the pass installation and recipient configuration without
+unlocking a key or running the encryption/decryption check.
+
 ## Everyday commands
 
 ```console

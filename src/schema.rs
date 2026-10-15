@@ -262,6 +262,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     field("client_id", "string"),
                     field("tenant", "string"),
                     field("channel_history_requested", "boolean"),
+                    nullable_field("credential_store", "string"),
+                    nullable_field("pass_store_dir", "string"),
                     field("read_only", "boolean"),
                     nullable_field("desktop_port", "integer"),
                     nullable_field("desktop_account", "string"),
@@ -292,6 +294,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     "boolean",
                     "Save configuration without sign-in or contacting Teams"
                 ),
+                {"name":"--credential-store","type":"string","enum":["native","pass"],"description":"Graph only: OS credential store (Windows DPAPI under WSL) or an initialized GPG-encrypted pass store. Saved per profile; existing profiles keep their choice"},
+                arg("--pass-store-dir", "string", "Existing pass directory (Graph/pass only); resolved to an absolute path and saved per profile"),
                 arg("--device-code", "boolean", "Use device-code sign-in"),
                 arg(
                     "--channel-history",
@@ -308,7 +312,7 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         {
             let mut value = single(
                 "auth login",
-                "Sign in with delegated Microsoft OAuth and protect credentials in the OS store",
+                "Sign in with delegated Microsoft OAuth and protect credentials in the profile's saved credential store",
                 "idempotent",
                 vec![
                     field("profile", "string"),
@@ -347,6 +351,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                     field("configured", "boolean"),
                     field("backend", "string"),
                     nullable_field("signed_in", "boolean"),
+                    nullable_field("credential_store", "string"),
+                    nullable_field("credential_error", "string"),
                     field("verified", "boolean"),
                     nullable_field("identity", "object"),
                     field("config_path", "string"),
@@ -413,6 +419,8 @@ pub fn generate(command_filter: Option<&str>) -> Value {
                 nullable_field("desktop_account", "string"),
                 nullable_field("desktop_client", "string"),
                 field("browser_auto_start", "boolean"),
+                nullable_field("credential_store", "string"),
+                nullable_field("pass_store_dir", "string"),
                 field("client_id", "string"),
                 field("tenant", "string"),
                 field("read_only", "boolean"),

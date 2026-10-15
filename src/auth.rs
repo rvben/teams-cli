@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::config::Profile;
+use crate::config::{CredentialStore, Profile};
 use crate::error::AppError;
 use crate::output::Output;
 
@@ -16,6 +16,12 @@ pub const BASE_SCOPES: &str = "openid profile offline_access User.Read User.Read
 pub const CHANNEL_HISTORY_SCOPE: &str = "ChannelMessage.Read.All";
 pub const CHANNEL_HISTORY_SCOPES: &str = "openid profile offline_access User.Read User.ReadBasic.All Team.ReadBasic.All Channel.ReadBasic.All Chat.Read Chat.Create ChatMessage.Send ChannelMessage.Send ChannelMessage.Read.All";
 const SERVICE: &str = "teams-cli";
+
+mod pass;
+mod process;
+
+#[cfg(any(target_os = "linux", test))]
+mod wsl;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBundle {
@@ -47,18 +53,94 @@ fn now() -> u64 {
 }
 
 fn entry(profile_name: &str) -> Result<keyring::Entry, AppError> {
+    let profile = crate::config::connection_profile(Some(profile_name))?;
+    entry_for(profile_name, profile.as_ref())
+}
+
+fn entry_for(profile_name: &str, profile: Option<&Profile>) -> Result<keyring::Entry, AppError> {
+    if let Some(profile) = profile
+        && profile.credential_store == CredentialStore::Pass
+    {
+        let directory = profile.pass_store_dir.as_deref().ok_or_else(|| AppError::InvalidInput(
+            "This pass profile has no saved pass_store_dir; restore its original directory in the profile configuration. No other credential store was used".into(),
+        ))?;
+        return pass::entry(profile_name, directory);
+    }
+    #[cfg(target_os = "linux")]
+    if wsl::is_wsl() {
+        return Ok(wsl::entry(profile_name));
+    }
     keyring::Entry::new(SERVICE, profile_name)
         .map_err(|e| AppError::Unexpected(format!("credential store is unavailable: {e}")))
 }
 
+/// Inspect the selected store without treating a helper/decryption failure as logout.
+pub fn credential_present(profile_name: &str) -> Result<bool, AppError> {
+    if std::env::var("TEAMS_ACCESS_TOKEN").is_ok() {
+        return Ok(true);
+    }
+    match entry(profile_name)?.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(AppError::Unexpected(format!(
+            "Could not read the saved credential: {error}"
+        ))),
+    }
+}
+
 pub fn has_token(profile_name: &str) -> bool {
-    std::env::var("TEAMS_ACCESS_TOKEN").is_ok()
-        || entry(profile_name)
-            .and_then(|e| {
-                e.get_password()
-                    .map_err(|err| AppError::Unexpected(err.to_string()))
-            })
-            .is_ok()
+    credential_present(profile_name).unwrap_or(false)
+}
+
+pub fn available_pass_directory() -> Option<std::path::PathBuf> {
+    pass::available_directory()
+}
+
+pub fn prepare_pass_directory(
+    directory: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, AppError> {
+    pass::prepare(directory)
+}
+
+pub fn native_store_label() -> &'static str {
+    #[cfg(target_os = "linux")]
+    if wsl::is_wsl() {
+        return "Windows DPAPI";
+    }
+    if cfg!(target_os = "macos") {
+        "macOS Keychain"
+    } else if cfg!(windows) {
+        "Windows Credential Manager"
+    } else {
+        "Linux Secret Service"
+    }
+}
+
+/// Probe only the native store when offering a new-profile storage choice.
+pub fn native_store_error(profile_name: &str) -> Option<String> {
+    let result = entry_for(profile_name, None).and_then(|entry| match entry.get_password() {
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(AppError::Unexpected(error.to_string())),
+    });
+    result.err().map(|error| error.to_string())
+}
+
+/// Check storage before opening Microsoft sign-in. GPG may prompt for an existing entry.
+pub fn check_store(profile_name: &str, profile: &Profile) -> Result<(), AppError> {
+    match entry_for(profile_name, Some(profile))?.get_password() {
+        Err(keyring::Error::NoEntry) if profile.credential_store == CredentialStore::Pass => {
+            pass::probe(
+                profile
+                    .pass_store_dir
+                    .as_deref()
+                    .expect("validated pass directory"),
+            )
+        }
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(AppError::Unexpected(format!(
+            "Credential storage is unavailable: {error}. Sign-in was not started"
+        ))),
+    }
 }
 
 pub fn granted_scopes(profile_name: &str) -> Option<Vec<String>> {
@@ -83,19 +165,26 @@ pub fn channel_history_granted(profile_name: &str) -> Option<bool> {
     })
 }
 
-fn store(profile_name: &str, token: &TokenBundle) -> Result<(), AppError> {
+fn store(profile_name: &str, profile: &Profile, token: &TokenBundle) -> Result<(), AppError> {
     let encoded = serde_json::to_string(token).map_err(|e| AppError::Unexpected(e.to_string()))?;
-    entry(profile_name)?.set_password(&encoded).map_err(|e| {
-        AppError::Unexpected(format!(
-            "could not save credentials in the OS credential store: {e}"
-        ))
-    })
+    entry_for(profile_name, Some(profile))?
+        .set_password(&encoded)
+        .map_err(|e| {
+            AppError::Unexpected(format!(
+                "could not save credentials in the selected credential store: {e}"
+            ))
+        })
 }
 
 fn load(profile_name: &str) -> Result<TokenBundle, AppError> {
     let encoded = entry(profile_name)?
         .get_password()
-        .map_err(|_| AppError::Auth("not signed in; run `teams auth login`".into()))?;
+        .map_err(|error| match error {
+            keyring::Error::NoEntry => {
+                AppError::Auth("not signed in; run `teams auth login`".into())
+            }
+            error => AppError::Unexpected(format!("Could not read the saved credential: {error}")),
+        })?;
     serde_json::from_str(&encoded).map_err(|_| {
         AppError::Auth("stored credential is unreadable; run `teams auth login` again".into())
     })
@@ -157,7 +246,7 @@ pub async fn access_token(profile_name: &str, profile: &Profile) -> Result<Strin
         replacement.refresh_token = bundle.refresh_token.clone();
     }
     bundle = replacement;
-    store(profile_name, &bundle)?;
+    store(profile_name, profile, &bundle)?;
     Ok(bundle.access_token)
 }
 
@@ -168,8 +257,9 @@ pub async fn login(
     channel_history: bool,
     out: &Output,
 ) -> Result<TokenBundle, AppError> {
+    check_store(profile_name, profile)?;
     let bundle = sign_in(profile, device_code, channel_history, out).await?;
-    store(profile_name, &bundle)?;
+    store(profile_name, profile, &bundle)?;
     Ok(bundle)
 }
 
@@ -193,10 +283,15 @@ pub async fn sign_in(
 /// Save a verified sign-in with its config; restore the previous credential if config fails.
 pub fn save_verified_login<T>(
     profile_name: &str,
+    profile: &Profile,
     bundle: &TokenBundle,
     save_config: impl FnOnce() -> Result<T, AppError>,
 ) -> Result<T, AppError> {
-    commit_login(&entry(profile_name)?, bundle, save_config)
+    commit_login(
+        &entry_for(profile_name, Some(profile))?,
+        bundle,
+        save_config,
+    )
 }
 
 fn commit_login<T>(

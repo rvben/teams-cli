@@ -24,6 +24,16 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --locked --all-targets
+      - name: Verify pass and GPG credential encryption
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pass
+          bash tests/pass_credentials.sh
+      - name: Verify WSL credential encryption
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tests/wsl_credentials.test.ps1
 
   quality:
     name: Formatting and lints

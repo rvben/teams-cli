@@ -104,6 +104,12 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
+    /// Graph credential store (default: OS store; WSL uses Windows DPAPI)
+    #[arg(long, value_enum)]
+    pub credential_store: Option<crate::config::CredentialStore>,
+    /// Existing pass directory; defaults to PASSWORD_STORE_DIR or ~/.password-store and is saved
+    #[arg(long)]
+    pub pass_store_dir: Option<std::path::PathBuf>,
     /// Connection method (omitted: guided in a terminal, Graph in scripts)
     #[arg(long, value_enum)]
     pub backend: Option<crate::config::BackendKind>,

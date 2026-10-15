@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Guided `teams init` asks for Work/school or Personal, chooses a separate browser port, offers explicit send permission, and opens the inbox after verified sign-in.
+- Browser setup can opt in to reopening its saved session with `teams`; existing profiles, native Teams and scripted reads keep their connection behaviour. Explicit setup supports `--auto-start`.
+- Offer initialized `pass` stores during new Graph setup on Linux, WSL and macOS, with explicit `--credential-store pass` and `--pass-store-dir` options. Save the backend and absolute directory per profile, verify GPG encryption/decryption before sign-in, and preserve encrypted credentials on failed updates.
+
+### Fixed
+
+- Report credential-helper failures distinctly from missing sign-ins; bound helper operations and preserve the chosen backend across sign-in, refresh and logout.
+- Store WSL Graph credentials with Windows DPAPI through PowerShell, so callback and device-code sign-in, token refresh, and logout do not require D-Bus or Secret Service.
+
 ### Changed
 
 - Guided setup offers separate accounts or explicit connection updates, preserves Graph registration and channel-history access, resumes interrupted browser sign-in on the original port, and verifies fresh Graph credentials before saving them with rollback on config failure.
@@ -14,11 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Guided setup checks local browser/display support, Teams installation and Windows interop, and matching lightweight browser downloads before allowing a connection choice. Unavailable options explain their requirements; supported alternatives are selected automatically.
 - Guided Graph setup verifies chat access before saving connection settings. Desktop/browser sending opt-in now requires a send-interface probe; guided setup offers an explicit read-only alternative if it fails, without sending a test message.
 - Reject personal-only lightweight browser/work-school combinations before saving even with `--no-login`.
-
-### Added
-
-- Guided `teams init` asks for Work/school or Personal, chooses a separate browser port, offers explicit send permission, and opens the inbox after verified sign-in.
-- Browser setup can opt in to reopening its saved session with `teams`; existing profiles, native Teams and scripted reads keep their connection behaviour. Explicit setup supports `--auto-start`.
 
 ## [0.2.1](https://github.com/rvben/teams-cli/compare/v0.2.0...v0.2.1) - 2026-10-15
 

@@ -22,6 +22,8 @@ pub fn offered(args: &InitArgs) -> bool {
         && args.desktop_port.is_none()
         && args.desktop_account.is_none()
         && args.desktop_client.is_none()
+        && args.credential_store.is_none()
+        && args.pass_store_dir.is_none()
         && args.client_id.is_none()
         && args.tenant.is_none()
         && !args.no_login
@@ -65,6 +67,46 @@ fn confirm(
     Ok(
         choice(input, output, prompt, "n", &["y", "yes", "n", "no"])?
             .is_some_and(|answer| matches!(answer.as_str(), "y" | "yes")),
+    )
+}
+
+/// Offer an initialized pass store only for new Graph profiles. Existing choices
+/// are preserved by the caller, including when their helper is unavailable.
+pub fn choose_credential_store(
+    native_label: &str,
+    native_error: Option<&str>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<Option<crate::config::CredentialStore>, AppError> {
+    writeln!(output, "\nProtect your sign-in")?;
+    if let Some(reason) = native_error {
+        writeln!(
+            output,
+            "  {native_label} is unavailable: {reason}\n  2  pass — your GPG-encrypted password store (recommended)\n"
+        )?;
+    } else {
+        writeln!(
+            output,
+            "  1  {native_label} (recommended)\n  2  pass — your GPG-encrypted password store\n"
+        )?;
+    }
+    writeln!(
+        output,
+        "pass may ask you to unlock your GPG key during sign-in or later reads."
+    )?;
+    let (default, allowed): (&str, &[&str]) = if native_error.is_some() {
+        ("2", &["2"])
+    } else {
+        ("1", &["1", "2"])
+    };
+    Ok(
+        choice(input, output, "Credential store", default, allowed)?.map(|answer| {
+            if answer == "2" {
+                crate::config::CredentialStore::Pass
+            } else {
+                crate::config::CredentialStore::Native
+            }
+        }),
     )
 }
 
@@ -620,6 +662,8 @@ mod tests {
 
     fn profile(kind: DesktopClientKind, account: DesktopAccount, port: u16) -> Profile {
         Profile {
+            credential_store: Default::default(),
+            pass_store_dir: None,
             backend: BackendKind::Desktop,
             client_id: String::new(),
             tenant: String::new(),
@@ -630,6 +674,50 @@ mod tests {
             desktop_account: account,
             browser_auto_start: false,
         }
+    }
+
+    #[test]
+    fn credential_choice_defaults_to_native_and_cancel_never_selects_a_store() {
+        use crate::config::CredentialStore;
+        for (answer, expected) in [
+            ("\n", Some(CredentialStore::Native)),
+            ("2\n", Some(CredentialStore::Pass)),
+            ("q\n", None),
+            ("", None),
+        ] {
+            let mut output = Vec::new();
+            let selected = super::choose_credential_store(
+                "Windows DPAPI",
+                None,
+                &mut std::io::Cursor::new(answer),
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(selected, expected);
+            assert!(
+                String::from_utf8(output)
+                    .unwrap()
+                    .contains("unlock your GPG key")
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_native_storage_cannot_be_selected() {
+        let mut output = Vec::new();
+        let selected = super::choose_credential_store(
+            "Linux Secret Service",
+            Some("no D-Bus session"),
+            &mut std::io::Cursor::new("1\n\n"),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(selected, Some(crate::config::CredentialStore::Pass));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("no D-Bus session")
+        );
     }
 
     #[test]

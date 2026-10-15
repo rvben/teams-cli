@@ -115,8 +115,29 @@ pub struct PendingBrowserSetup {
     pub client: DesktopClientKind,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStore {
+    #[default]
+    Native,
+    Pass,
+}
+
+impl CredentialStore {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Pass => "pass",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(default)]
+    pub credential_store: CredentialStore,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_store_dir: Option<PathBuf>,
     #[serde(default)]
     pub backend: BackendKind,
     #[serde(default)]
@@ -295,6 +316,8 @@ pub fn load(requested: Option<&str>) -> Result<(String, Profile), AppError> {
         ));
     }
     let profile = Profile {
+        credential_store: stored.map(|p| p.credential_store).unwrap_or_default(),
+        pass_store_dir: stored.and_then(|p| p.pass_store_dir.clone()),
         backend,
         client_id,
         tenant,
