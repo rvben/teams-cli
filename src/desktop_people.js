@@ -153,11 +153,21 @@ async (p, select) => {
         });
         const c = r.data?.getCacheResults;
         if (!c) return { error: "layout" };
+        // Teams' MFU cache includes suggestions even for an exact email query.
+        // Keep only matching cached people so suggestions cannot crowd out
+        // the authoritative live lookup below.
+        const terms = p.query.trim().toLowerCase().split(/\s+/);
         users = [
           ...(c.peopleResults || []),
           ...(c.rawContactsResults || []),
           ...(c.mfuContactsResults || []),
-        ];
+        ].filter((u) => {
+          const text = [u.displayName, u.email, u.userPrincipalName]
+            .filter((value) => typeof value === "string")
+            .join(" ")
+            .toLowerCase();
+          return terms.every((term) => text.includes(term));
+        });
         {
           const exact = operationDoc(
             "query",
@@ -194,7 +204,7 @@ async (p, select) => {
           });
           if (!Array.isArray(found.data?.instantScdSearch))
             return { error: "layout" };
-          users.push(...found.data.instantScdSearch);
+          users.unshift(...found.data.instantScdSearch);
         }
       } else {
         const r = await client.query({

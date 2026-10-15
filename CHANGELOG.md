@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Windows desktop helpers use protocol 4. WSL requires the helper from the same CLI release.
 - Ambiguous conversation-creation outcomes remain unconfirmed and are never automatically retried.
+- Personal-account searches put verified live matches first and filter unrelated recent-contact suggestions before applying the result limit.
 
 ### Fixed
 
