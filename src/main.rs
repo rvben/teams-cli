@@ -1808,6 +1808,17 @@ async fn desktop_connection(
     out: Output,
 ) -> Result<(), AppError> {
     use desktop::connection::{self, Action};
+    if let DesktopCommand::Supervise { keep_alive } = &command {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        return desktop::browser::lifetime::supervise(*keep_alive).await;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = keep_alive;
+            return Err(AppError::Unsupported(
+                "browser supervision requires macOS or Linux".into(),
+            ));
+        }
+    }
     let login = matches!(&command, DesktopCommand::Login(_));
     let clear = matches!(&command, DesktopCommand::ClearFlags(_));
     let (action, args) = match command {
@@ -1816,6 +1827,7 @@ async fn desktop_connection(
         DesktopCommand::Disconnect(args) => (Action::Disconnect, args),
         DesktopCommand::Recover(args) => (Action::Recover, args),
         DesktopCommand::ClearFlags(args) => (Action::Status, args),
+        DesktopCommand::Supervise { .. } => unreachable!("handled above"),
     };
     let selected = config::connection_profile(profile)?;
     let kind = args.desktop_client.unwrap_or_else(|| {

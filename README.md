@@ -528,7 +528,22 @@ profile. Different ports use different browser profiles. Disconnect closes this
 browser and keeps its sign-in data. To switch between visible and headless operation,
 disconnect first. `desktop recover` closes a verified managed browser or clears a
 stale record when no listener remains. A verified browser that does not exit after
-closing its debugging port is stopped; unverifiable processes are left untouched.
+closing its debugging port is stopped. Verified helpers are recorded before shutdown
+and closed individually if they outlive it; unverifiable processes are left untouched.
+
+Standalone CLI browser sessions persist until `desktop disconnect`. Applications can
+instead use `desktop supervise`: keep its stdin pipe open, read its protocol-1 JSON
+handshake, and pass the returned `client` token as `TEAMS_DESKTOP_BROWSER_CLIENT` to
+CLI commands and sign-in terminals. Browsers those commands start close when their
+last application user exits, including after a parent-process crash, with a 15-second
+grace period so a reloaded application can reclaim its session. Existing
+persistent sessions are left running, and in-flight CLI commands finish before
+cleanup. The supervisor must run in its own process group, with its stdin pipe held
+only by the application. Sign-in data is retained. `--keep-alive` opts newly started
+sessions into persistent operation; `TEAMS_DESKTOP_BROWSER_KEEP_ALIVE=1` or `0` can
+override that policy for subsequent launches without restarting the supervisor.
+Explicit `desktop connect` outside supervision makes a shared session persistent.
+Only macOS and Linux support this integration protocol.
 
 The CLI checks that every listener is loopback-only and belongs to the recorded
 browser process, running as you with the expected executable, debugging port and

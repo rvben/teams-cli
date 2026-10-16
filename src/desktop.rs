@@ -278,6 +278,36 @@ impl DesktopClient {
         Ok(client)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn browser_lease(&self) -> Result<bool, AppError> {
+        self.prerequisites().map_err(|error| {
+            AppError::Desktop(format!(
+                "Browser prerequisites are not ready; no session access was attempted: {error}"
+            ))
+        })?;
+        let port = self.port;
+        tokio::task::spawn_blocking(move || browser::lifetime::attach(port))
+            .await
+            .map_err(|_| {
+                AppError::Desktop("browser lease could not be established: worker stopped".into())
+            })?
+            .map_err(|error| {
+                AppError::Desktop(format!("browser lease could not be established: {error}"))
+            })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn require_browser_lease(&self) -> Result<(), AppError> {
+        if self.browser_lease().await? {
+            Ok(())
+        } else {
+            Err(AppError::Desktop(format!(
+                "No endpoint on this port: connect the browser on port {} before retrying",
+                self.port
+            )))
+        }
+    }
+
     pub fn debugging_setup(&self) -> Option<DebuggingSetup> {
         if self.kind.is_browser() {
             let mut setup = DebuggingSetup::for_shell("bash", self.port);
@@ -346,6 +376,7 @@ impl DesktopClient {
     pub async fn probe(&self) -> Result<ConnectionMetadata, AppError> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
+            self.browser_lease().await?;
             return self.browser.lock().await.probe(self.port).await;
         }
         platform()?;
@@ -452,6 +483,7 @@ impl DesktopClient {
         request["account_type"] = json!(self.account);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
+            self.require_browser_lease().await?;
             return people_result(&self.browser.lock().await.people(&request).await?, create);
         }
         platform()?;
@@ -489,6 +521,7 @@ impl DesktopClient {
         request["account_type"] = json!(self.account);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
+            self.require_browser_lease().await?;
             let mut browser = self.browser.lock().await;
             return match read_page(&browser.read(&request).await?) {
                 Ok(page) => Ok(page),
@@ -542,6 +575,7 @@ impl DesktopClient {
         request["account_type"] = json!(self.account);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
+            self.require_browser_lease().await?;
             let reply = self.browser.lock().await.send(&request).await?;
             return self.send_result(&reply, chat, id);
         }
@@ -585,6 +619,7 @@ impl DesktopClient {
     pub async fn send_check(&self) -> Result<(), AppError> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.kind.is_browser() {
+            self.require_browser_lease().await?;
             let reply = self
                 .browser
                 .lock()

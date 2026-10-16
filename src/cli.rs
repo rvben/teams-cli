@@ -294,6 +294,12 @@ pub struct TuiArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DesktopCommand {
+    /// Supervise application-owned browsers until stdin closes (integration protocol)
+    Supervise {
+        /// Preserve newly started browsers after the application exits
+        #[arg(long)]
+        keep_alive: bool,
+    },
     /// Inspect endpoint metadata and managed-session recovery state
     Status(DesktopArgs),
     /// Open a debugging session (native Teams restart or dedicated browser launch)

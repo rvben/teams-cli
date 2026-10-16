@@ -157,7 +157,7 @@ fn command_errors(name: &str) -> &'static [&'static str] {
             "desktop_error",
         ],
         "messages status" => &["unsupported", "desktop_error"],
-        "desktop status" => &["desktop_error", "unsupported"],
+        "desktop status" | "desktop supervise" => &["desktop_error", "unsupported"],
         "desktop login" | "desktop connect" | "desktop disconnect" | "desktop recover" => {
             &["desktop_error", "unsupported", "confirmation_required"]
         }
@@ -219,6 +219,7 @@ fn example(name: &str) -> Value {
             ],
             None,
         ),
+        "desktop supervise" => (&["desktop", "supervise"], Some("")),
         "desktop status" => (&["desktop", "status", "--port", "9222"], None),
         "desktop login" => (
             &["desktop", "login", "--desktop-client", "browser", "--yes"],
@@ -732,6 +733,18 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         }
         commands.push(value);
     }
+    let mut supervise = single(
+        "desktop supervise",
+        "Application browser lifetime protocol: emits a client token, then closes only application-owned browsers when stdin closes and their last user exits; macOS/Linux only",
+        "idempotent",
+        vec![field("protocol", "integer"), field("client", "string")],
+    );
+    supervise["args"] = json!([arg(
+        "--keep-alive",
+        "boolean",
+        "Preserve newly started browsers after the application exits"
+    )]);
+    commands.push(supervise);
     for command in &mut commands {
         let name = command["name"].as_str().unwrap_or_default().to_string();
         let mut errors = vec!["invalid_input", "unexpected_error"];
@@ -743,10 +756,13 @@ pub fn generate(command_filter: Option<&str>) -> Value {
         }
         command["extensions"] = json!({"backends": match command["name"].as_str().unwrap_or_default() {
             "auth login" | "auth logout" | "whoami" | "list" | "channels list" => vec!["graph"],
-            "desktop status" | "desktop login" | "desktop connect" | "desktop disconnect" | "desktop recover" | "messages status" => vec!["desktop"],
+            "desktop status" | "desktop login" | "desktop connect" | "desktop disconnect" | "desktop recover" | "desktop supervise" | "messages status" => vec!["desktop"],
             _ => vec!["graph", "desktop"],
         }});
         match command["name"].as_str().unwrap_or_default() {
+            "desktop supervise" => {
+                command["extensions"]["stdin_lifetime"] = json!(true);
+            }
             "tui" => {
                 command["extensions"]["desktop"] = json!(
                     "macOS/Windows/WSL (browser client also on Linux); chats and chat messages from the Teams client's local cache; sending needs a profile created with --allow-send"

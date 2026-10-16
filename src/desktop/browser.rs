@@ -1,6 +1,7 @@
 //! A dedicated Chromium profile. Verification precedes every page connection; closing
 //! uses the verified browser's DevTools socket, never a signal to an arbitrary PID. Only
-//! the verified browser is signalled, when it does not exit after closing its endpoint.
+//! verified browser and its recorded helpers are signalled individually if they
+//! outlive shutdown. Process groups and unrelated applications are never signalled.
 use super::{ConnectionMetadata, ProbeStatus, cdp::Cdp, connection::Action, session::Verifier};
 use crate::{config::DesktopAccount, error::AppError};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,11 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
+
+#[path = "browser_children.rs"]
+mod children;
+#[path = "browser_lifetime.rs"]
+pub mod lifetime;
 
 pub struct BrowserSystem {
     pub core: bool,
@@ -35,6 +41,11 @@ struct State {
     #[serde(default)]
     core: bool,
     phase: String,
+    // Missing fields preserve the persistent behavior of older records.
+    #[serde(default)]
+    lifetime: lifetime::Lifetime,
+    #[serde(default)]
+    children: Vec<children::Child>,
 }
 
 fn failed(message: &str) -> AppError {
@@ -714,10 +725,20 @@ pub async fn manage(
     visible: bool,
     core: bool,
 ) -> Result<Value, AppError> {
+    manage_inner(port, account, action, visible, core, false).await
+}
+
+async fn manage_inner(
+    port: u16,
+    account: DesktopAccount,
+    action: Action,
+    visible: bool,
+    core: bool,
+    cleanup: bool,
+) -> Result<Value, AppError> {
     if core && matches!(action, Action::Connect) {
         super::browser_install::ensure().await?;
     }
-    prerequisites_for(core)?;
     let dir = directory(port)?;
     prepare_directory(&dir)?;
     prepare_directory(&profile(&dir))?;
@@ -728,10 +749,69 @@ pub async fn manage(
         .write(true)
         .mode(0o600)
         .open(dir.join("connection.lock"))?;
-    lock.try_lock()
-        .map_err(|_| failed("another browser connection command is running"))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if cleanup => {
+                return Ok(json!({"pending": true}));
+            }
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(failed(
+                    "another browser connection command is running; retry shortly",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
     let _guard = Guard(lock);
     let mut state = load(&dir, port)?;
+    if cleanup {
+        let Some(current) = state.as_mut() else {
+            return Ok(json!({}));
+        };
+        current.lifetime.prune()?;
+        if !current.lifetime.auto_close || !current.lifetime.clients.is_empty() {
+            return Ok(json!({}));
+        }
+        if !current.lifetime.users.is_empty() {
+            return Ok(json!({"pending": true}));
+        }
+        // Reloads and extension updates replace the client process. Give the new
+        // host time to attach before closing the shared browser.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| failed("could not establish the browser shutdown grace period"))?
+            .as_secs();
+        if current.lifetime.idle_since.is_none() {
+            current.lifetime.idle_since = Some(now);
+            save(&dir, current)?;
+        }
+        let idle = current.lifetime.idle_since.expect("saved idle time");
+        if now.saturating_sub(idle) < 15 {
+            return Ok(json!({"pending": true, "grace": true}));
+        }
+    } else if matches!(action, Action::Status | Action::Connect) {
+        let client = lifetime::current_client()?;
+        if let Some(current) = state.as_mut() {
+            let before =
+                serde_json::to_value(&*current).map_err(|_| failed("invalid browser state"))?;
+            current.lifetime.touch(client.as_ref())?;
+            // Explicitly connecting from a terminal requests a persistent session.
+            if matches!(action, Action::Connect) && client.is_none() {
+                current.lifetime.auto_close = false;
+            }
+            if serde_json::to_value(&*current).map_err(|_| failed("invalid browser state"))?
+                != before
+            {
+                save(&dir, current)?;
+            }
+        }
+    }
+    prerequisites_for(core)?;
     let system = BrowserSystem { core };
     let recover = format!(
         "teams desktop recover --desktop-client {} --port {port}",
@@ -748,13 +828,14 @@ pub async fn manage(
             if core {
                 validate_core(account)?;
             }
-            // A dead/reused owner with an empty port can be forgotten without
-            // touching a process. Unrecorded startups and occupied ports still refuse.
+            // Finish saved helpers before forgetting a dead/reused owner.
+            // Unrecorded startups and occupied ports still refuse.
             if state
                 .as_ref()
                 .is_some_and(|s| s.owner.is_some() && !owned(s, &dir))
                 && system::listeners(port)?.is_empty()
             {
+                children::finish(state.as_ref().expect("saved state")).await?;
                 std::fs::remove_file(dir.join("connection.json"))?;
                 state = None;
             }
@@ -783,6 +864,8 @@ pub async fn manage(
                     visible,
                     core,
                     phase: "starting".into(),
+                    lifetime: lifetime::Lifetime::for_launch()?,
+                    children: vec![],
                 };
                 save(&dir, &next)?;
                 let mut child = Command::new(session_executable(core, visible)?)
@@ -865,6 +948,19 @@ pub async fn manage(
                     save(&dir, current)?;
                 }
             }
+            if let Some(current) = state.as_mut()
+                && owned(current, &dir)
+            {
+                let captured = children::capture(current, &dir)?;
+                for child in captured {
+                    if !current.children.contains(&child) {
+                        current.children.push(child);
+                    }
+                }
+                // Persist before contacting Chrome, so a killed cleanup process can
+                // safely finish individual helpers after the browser parent exits.
+                save(&dir, current)?;
+            }
             if let Some(current) = state.as_ref() {
                 if owned(current, &dir) && system::listeners(port)?.is_empty() {
                     // It already released its endpoint, as after a close request it never
@@ -872,19 +968,35 @@ pub async fn manage(
                     stop(current, &dir).await?;
                 } else if owned(current, &dir) {
                     let (metadata, _) = system.verify(port).await?;
-                    if !metadata.endpoint_available() {
+                    if metadata.teams_owned != Some(true) || metadata.loopback_only != Some(true) {
                         return Err(failed(&format!(
                             "browser ownership could not be verified; close the dedicated browser manually, then run `{recover}`"
                         )));
                     }
-                    let (version, _) = super::read_metadata(port).await?;
-                    let id = browser_id(&version, port)?;
-                    if !owned(current, &dir) {
-                        return Err(failed("the browser process changed; it was left untouched"));
+                    // OS ownership remains authoritative when Chrome's HTTP/CDP
+                    // event loop is hung. Never send an unsafe control URL, but give
+                    // this exact verified process a bounded chance before PID fallback.
+                    let close = async {
+                        if !metadata.endpoint_available() {
+                            return Err(failed("the verified browser endpoint is unresponsive"));
+                        }
+                        let (version, _) = super::read_metadata(port).await?;
+                        let id = browser_id(&version, port)?;
+                        if !owned(current, &dir) {
+                            return Err(failed(
+                                "the browser process changed; it was left untouched",
+                            ));
+                        }
+                        Cdp::close_browser(port, &id).await
                     }
-                    Cdp::close_browser(port, &id).await?;
+                    .await;
                     if !exited(current, &dir, Duration::from_secs(10)).await {
                         stop(current, &dir).await?;
+                    }
+                    if close.is_err() && !system::listeners(port)?.is_empty() {
+                        return Err(failed(
+                            "browser shutdown could not be confirmed; its recovery record was preserved",
+                        ));
                     }
                 } else if current.owner.is_some() {
                     // A reused or changed PID is never contacted or signalled. Recover
@@ -901,6 +1013,7 @@ pub async fn manage(
                         "browser startup was interrupted before ownership was saved; close the dedicated browser manually, then recover",
                     ));
                 }
+                children::finish(current).await?;
                 std::fs::remove_file(dir.join("connection.json"))?;
                 state = None;
             } else if !system::listeners(port)?.is_empty() {
@@ -918,6 +1031,7 @@ pub async fn manage(
         "management":{"managed":state.is_some(),"port":state.as_ref().map(|s|s.port),
         "phase":state.as_ref().map(|s|s.phase.as_str()).unwrap_or("idle"),
         "visible":state.as_ref().map(|s|s.visible),"core_only":core,"settings_pending":false,
+        "auto_close":state.as_ref().is_some_and(|s|s.lifetime.auto_close),
         "needs_recovery":state.as_ref().is_some_and(|s|!matches!(s.phase.as_str(), "active" | "core_ready") || !live)}}),
     )
 }
@@ -1030,6 +1144,34 @@ mod system {
             Err(e) => return Err(e.into()),
         }
         Ok(sockets)
+    }
+    pub fn lease_process(pid: u32) -> Result<(Identity, Vec<OsString>), AppError> {
+        // Lease liveness requires only the kernel start time. Executable and uid
+        // restrictions would hide PID reuse by another user's/non-dumpable process.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        if stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| matches!(state, "Z" | "X"))
+        {
+            return Err(failed("lease owner has exited"));
+        }
+        Ok((
+            Identity {
+                pid,
+                started: start_time(&stat)?,
+                executable: PathBuf::new(),
+            },
+            vec![],
+        ))
+    }
+    pub fn zombie(pid: u32) -> Result<bool, AppError> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .ok_or_else(|| failed("invalid Linux process state"))?;
+        Ok(matches!(state, "Z" | "X"))
     }
     pub fn process(pid: u32) -> Result<(Identity, Vec<OsString>), AppError> {
         let dir = PathBuf::from(format!("/proc/{pid}"));
@@ -1159,6 +1301,45 @@ mod system {
                 })
                 .collect()
         })
+    }
+    pub fn lease_process(pid: u32) -> Result<(Identity, Vec<OsString>), AppError> {
+        // Force a stable representation across terminal/VS Code locales and zones.
+        // Browser ownership keeps its legacy representation for existing records.
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "uid=,stat=,lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(failed("macOS lease process inspection failed"));
+        }
+        let text = String::from_utf8(output.stdout)
+            .map_err(|_| failed("invalid lease process identity"))?;
+        let (_uid, rest) = text
+            .trim()
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| failed("invalid lease process identity"))?;
+        let (state, started) = rest
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| failed("invalid lease process state"))?;
+        if state.starts_with('Z') {
+            return Err(failed("lease owner has exited"));
+        }
+        Ok((
+            Identity {
+                pid,
+                started: started.trim().into(),
+                executable: PathBuf::new(),
+            },
+            vec![],
+        ))
+    }
+    pub fn zombie(pid: u32) -> Result<bool, AppError> {
+        Ok(run("/bin/ps", &["-p", &pid.to_string(), "-o", "stat="])?
+            .trim_start()
+            .starts_with('Z'))
     }
     pub fn process(pid: u32) -> Result<(Identity, Vec<OsString>), AppError> {
         let snapshot = run("/bin/ps", &["-p", &pid.to_string(), "-o", "uid=,lstart="])?;
@@ -1560,6 +1741,8 @@ mod tests {
             visible: true,
             core: false,
             phase: "starting".into(),
+            lifetime: lifetime::Lifetime::default(),
+            children: vec![],
         };
         save(dir.path(), &state).unwrap();
         assert!(load(dir.path(), 9222).is_err());
@@ -1620,6 +1803,8 @@ mod tests {
             visible: false,
             core: false,
             phase: "active".into(),
+            lifetime: lifetime::Lifetime::default(),
+            children: vec![],
         };
         assert!(owned(&state, &dir));
         let reaper = std::thread::spawn(move || child.wait());
