@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/rvben/teams-cli/compare/v0.2.2...v0.2.3) - 2026-10-16
+
 ### Fixed
 
 - Close extension-managed browser sessions after the last client exits, including crashes and editor reloads, while retaining saved sign-in and browsers started independently.
