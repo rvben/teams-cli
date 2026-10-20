@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/rvben/teams-cli/compare/v0.2.3...v0.2.4) - 2026-10-20
+
 ### Fixed
 
 - When Teams keeps caches for several accounts, guest organizations or display languages, the desktop backend now reads the one for the signed-in user, tenant and display language instead of refusing.
