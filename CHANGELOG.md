@@ -7,12 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Desktop chat messages missing from the current cache are filled in from caches the same user and tenant left under earlier display languages. Those caches no longer update, so messages edited or deleted since can appear as they were.
+
 ## [0.2.4](https://github.com/rvben/teams-cli/compare/v0.2.3...v0.2.4) - 2026-10-20
 
 ### Fixed
 
 - When Teams keeps caches for several accounts, guest organizations or display languages, the desktop backend now reads the one for the signed-in user, tenant and display language instead of refusing.
-- Desktop chat messages missing from the current cache are filled in from caches the same user and tenant left under earlier display languages. Those caches no longer update, so messages edited or deleted since can appear as they were.
 
 ### Changed
 
