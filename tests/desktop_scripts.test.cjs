@@ -29,7 +29,7 @@ function cursor(records) {
   return q;
 }
 
-function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = false, core = false } = {}) {
+function fixture({ ambiguous = false, foreignOnly = false, older = [], mutate, timeout = false, core = false } = {}) {
   const databases = new Map([
     [name('conversation-manager', 'account-a'), [conversation]],
     [name('replychain-manager', 'account-b'), [{ chat, messageMap: { b: { ...message, content: 'Wrong account' } } }]],
@@ -40,6 +40,7 @@ function fixture({ ambiguous = false, foreignOnly = false, mutate, timeout = fal
     databases.set(name('profiles', 'account-a'), [{ mri: '8:orgid:sender', displayName: 'Correct Name' }]);
   }
   if (ambiguous) databases.set(name('conversation-manager', 'account-b'), [conversation]);
+  for (const [locale, records] of older) databases.set(name('replychain-manager', 'account-a') + ':' + locale, records);
   const opened = [], mutations = [];
   let inspections = 0;
   const client = { mutate: options => {
@@ -225,6 +226,17 @@ for (const query of ['chats', 'messages']) {
   });
 }
 
+test('older caches of the same account only add messages the current cache lacks', async () => {
+  const earlier = { ...message, id: '1690000000000', originalArrivalTime: 1690000000000, content: 'Earlier' };
+  const f = fixture({ older: [
+    ['nl-nl', [{ chat, messageMap: { stale: { ...message, content: 'Stale' }, earlier } }]],
+    ['de-de', [{ chat: '19:other@thread.v2', messageMap: { other: { ...message, id: '1680000000000', content: 'Other chat' } } }]],
+  ] });
+  const result = await f.read();
+  assert.deepEqual([...result.items.map(item => item.body.content)], [message.content, 'Earlier']);
+  assert.ok(f.opened.every(database => !database.includes(':account-b')));
+});
+
 test('a missing account database never falls back to another account', async () => {
   const f = fixture({ foreignOnly: true });
   await assert.rejects(f.read(), /layout/);
@@ -251,10 +263,12 @@ test('the signed-in user, tenant and display language select among coexisting ca
     ...caches('home', 'me', 'en-us'), ...caches('home', 'me', 'nl-nl'),
     ...caches('guest', 'me-as-guest'), ...caches('home', 'colleague'),
   ];
-  for (const [tenant, user, locale] of [['home', 'me', 'nl-nl'], ['home', 'me', 'en-us'], ['guest', 'me-as-guest', 'en-us']]) {
+  for (const [tenant, user, locale, older] of [['home', 'me', 'nl-nl', ['en-us']], ['home', 'me', 'en-us', ['nl-nl']], ['guest', 'me-as-guest', 'en-us', []]]) {
     assert.deepEqual(selectWith(names, signedIn(tenant, user, locale)), {
       account: user, conversation: teams('conversation-manager', tenant, user, locale),
       replies: teams('replychain-manager', tenant, user, locale), profiles: teams('profiles', tenant, user, locale),
+      // Only the same user in the same tenant may fill in messages.
+      older: older.map(other => teams('replychain-manager', tenant, user, other)),
     });
   }
   // Only one cache for the signed-in account needs no display language.

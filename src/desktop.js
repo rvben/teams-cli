@@ -7,12 +7,15 @@ async (p, select) => {
     q.onsuccess = () => resolve(q.result);
     q.onerror = () => reject(q.error);
   });
-  const open = k => {
-    if (!cache[k]) throw Error('layout');
+  const openName = name => {
     // If the cache disappeared after enumeration, abort rather than create a database.
-    const q = indexedDB.open(cache[k]);
+    const q = indexedDB.open(name);
     q.onupgradeneeded = () => q.transaction.abort();
     return req(q);
+  };
+  const open = k => {
+    if (!cache[k]) throw Error('layout');
+    return openName(cache[k]);
   };
   // Missing cache timestamps can be -1. Keep sort keys valid for CLI cursors.
   const time = t => Number.isFinite(+t) && +t > 0 && +t <= 8640000000000000 ? Math.trunc(+t) : 0;
@@ -124,10 +127,24 @@ async (p, select) => {
       }
       return { me, items: chats.map(x => x.value), next: pg.next };
     }
+    // The current cache wins; older caches of the same account only add messages it lacks.
+    const messages = await chain(rdb, p.chat);
+    for (const name of cache.older || []) {
+      let db;
+      try {
+        db = await openName(name);
+        messages.push(...await chain(db, p.chat));
+      } catch (_) {
+        // Older caches are optional; one that vanished or changed layout is skipped.
+      } finally {
+        if (db) db.close();
+      }
+    }
     const rows = [], seen = new Set();
-    for (const m of await chain(rdb, p.chat)) {
-      if (system(m.messageType) || seen.has(m.id)) continue;
+    for (const m of messages) {
+      if (seen.has(m.id)) continue;
       seen.add(m.id);
+      if (system(m.messageType)) continue;
       rows.push({ t: time(m.originalArrivalTime), id: m.id, value: {
         id: m.id, createdDateTime: iso(m.originalArrivalTime),
         clientMessageId: typeof m.clientMessageId === 'string' ? m.clientMessageId : null,

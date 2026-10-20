@@ -1271,12 +1271,13 @@ mod tests {
                 .collect::<String>()
         });
         // Protocol 5 selects the signed-in cache and reports remaining ambiguity apart from surface selection.
+        // Older same-account caches are optional; a helper without them reads as before.
         assert_eq!(
             scripts,
             [
-                "32ca0293d2d5",
+                "3deaa430419a",
                 "baa0bc29c44b",
-                "025a8edc46b8",
+                "7d2b70751d6a",
                 "23b1a0e4b293"
             ]
         );

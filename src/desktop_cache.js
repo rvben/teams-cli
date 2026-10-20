@@ -29,7 +29,7 @@ all => {
   }
   if (conversations.length !== 1) return { error: 'layout' };
   const conversation = conversations[0].name;
-  const account = conversation.split(':')[4];
+  const [, , , tenant, account] = conversation.split(':');
   if (!account) return { error: 'layout' };
   const related = kind => {
     const sibling = conversation.replace(':conversation-manager:', ':' + kind + ':');
@@ -37,5 +37,12 @@ all => {
     const matches = candidates(kind).filter(db => db.name.split(':')[4] === account);
     return matches.length === 1 ? matches[0].name : null;
   };
-  return { account, conversation, replies: related('replychain-manager'), profiles: related('profiles') };
+  const replies = related('replychain-manager');
+  // Caches the same user and tenant left under earlier display languages. Teams stopped
+  // updating them, so they may only fill in messages the current cache lacks.
+  const older = candidates('replychain-manager').map(db => db.name).filter(name => {
+    const part = name.split(':');
+    return name !== replies && part[3] === tenant && part[4] === account;
+  }).sort();
+  return { account, conversation, replies, profiles: related('profiles'), older };
 }
