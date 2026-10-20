@@ -1690,9 +1690,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
         let started = std::time::Instant::now();
-        let error = browser_version_with_timeout(&browser, Duration::from_millis(100)).unwrap_err();
+        // Fresh executable inspection on macOS can exceed 100 ms before the
+        // script writes its PID. Allow startup while still bounding the hang.
+        let error = browser_version_with_timeout(&browser, Duration::from_secs(1)).unwrap_err();
         assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
         let pid: i32 = std::fs::read_to_string(dir.path().join("browser.pid"))
             .unwrap()
             .parse()
