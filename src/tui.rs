@@ -532,6 +532,16 @@ impl App {
         }
     }
 
+    /// Why a chat shows only its latest message, said for where messages come from.
+    fn missing_history_note(&self) -> &'static str {
+        match self.backend().as_deref() {
+            Some(TeamsBackend::Desktop(_)) => {
+                "No messages for this chat were found in the Teams cache on this PC. Latest message:"
+            }
+            _ => "Only the latest message is available.",
+        }
+    }
+
     fn can_send(&self) -> bool {
         match &self.source {
             Source::Live { can_send, .. } => *can_send,
@@ -2030,7 +2040,21 @@ impl App {
             }
             Load::Ready => {}
         }
-        let entries = render::conversation(&thread.items, &self.view(), self.viewer.as_deref());
+        let mut entries = render::conversation(&thread.items, &self.view(), self.viewer.as_deref());
+        // The chat list can carry a latest message whose history was never read.
+        let mut missing = false;
+        if entries.is_empty()
+            && thread.cursor.is_none()
+            && let Some(chat) = self.chats.iter().find(|chat| chat["id"] == id.as_str())
+            && chat["lastMessagePreview"].is_object()
+        {
+            entries = render::conversation(
+                std::slice::from_ref(&chat["lastMessagePreview"]),
+                &self.view(),
+                self.viewer.as_deref(),
+            );
+            missing = !entries.is_empty();
+        }
         let mut lines = Vec::new();
         if thread.loading_older {
             lines.push(
@@ -2050,7 +2074,12 @@ impl App {
                 .alignment(Alignment::Center),
             );
         }
-        if entries.is_empty() {
+        if missing {
+            lines.push(Line::raw(""));
+            for note in render::wrap(self.missing_history_note(), usize::from(body.width)) {
+                lines.push(Line::styled(note, theme.muted()).centered());
+            }
+        } else if entries.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::styled("No messages in this chat yet.", theme.muted()).centered());
         }
@@ -3704,6 +3733,66 @@ mod tests {
             can_send,
         };
         App::new(source, Theme { color: false }, now)
+    }
+
+    #[test]
+    fn a_chat_without_history_shows_its_latest_message_and_why() {
+        let empty = |app: &mut App| {
+            let id = app.selected_row().unwrap().id.clone();
+            app.threads.insert(
+                id,
+                Thread {
+                    items: Vec::new(),
+                    cursor: None,
+                    load: Load::Ready,
+                    loading_older: false,
+                    fetching: false,
+                },
+            );
+            frame_text(app)
+        };
+        let mut app = demo_app();
+        let text = empty(&mut app);
+        assert!(
+            text.contains("Only the latest message is available."),
+            "{text}"
+        );
+        assert!(text.contains("release candidate is green"), "{text}");
+        assert!(!text.contains("No messages in this chat yet."), "{text}");
+
+        let now = app.now.clone();
+        let mut app = live_app(false, "work");
+        app.source = Source::Live {
+            backend: Arc::new(TeamsBackend::Desktop(Box::new(
+                crate::desktop::DesktopClient::new(19224).unwrap(),
+            ))),
+            profile: "work".into(),
+            can_send: false,
+        };
+        app.apply(Outcome::Chats {
+            more: false,
+            result: Ok(demo_chats(&now)),
+        });
+        let text = empty(&mut app);
+        assert!(text.contains("were found in the Teams cache"), "{text}");
+        // The note wraps with the pane rather than being cut off.
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        app.focus = Focus::Thread;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let narrow = buffer_text(terminal.backend().buffer());
+        assert!(narrow.contains("Latest message:"), "{narrow}");
+        assert!(text.contains("release candidate is green"), "{text}");
+
+        // Older pages may still hold messages, so nothing is claimed missing.
+        let id = app.selected_row().unwrap().id.clone();
+        app.threads.get_mut(&id).unwrap().cursor = Some("older".into());
+        let text = frame_text(&mut app);
+        assert!(text.contains("No messages in this chat yet."), "{text}");
+
+        // Without a preview there is nothing to show.
+        app.chats[0]["lastMessagePreview"] = Value::Null;
+        let text = empty(&mut app);
+        assert!(text.contains("No messages in this chat yet."), "{text}");
     }
 
     #[test]

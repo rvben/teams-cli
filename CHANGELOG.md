@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Desktop chat messages missing from the current cache are filled in from caches the same user and tenant left under earlier display languages. Those caches no longer update, so messages edited or deleted since can appear as they were.
+- In the TUI, a chat whose messages are missing now shows its latest message from the chat list and why, instead of "No messages in this chat yet." With the desktop backend it says no messages for the chat were found in the Teams cache on this PC.
 
 ## [0.2.4](https://github.com/rvben/teams-cli/compare/v0.2.3...v0.2.4) - 2026-10-20
 
