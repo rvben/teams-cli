@@ -71,7 +71,11 @@ pub fn messaging_unsupported() -> AppError {
 }
 
 fn account_selection_error() -> AppError {
-    AppError::Desktop("Multiple Teams accounts are available; use `init --backend desktop --desktop-account personal` or `--desktop-account work-school` to select a surface. Multiple cached accounts within that surface are still unsupported".into())
+    AppError::Desktop("Both personal and work/school Teams are open; use `init --backend desktop --desktop-account personal` or `--desktop-account work-school` to select one".into())
+}
+
+fn cached_accounts_error() -> AppError {
+    AppError::Desktop("Teams holds cached data for more than one account, organization or display language, and Teams does not record which one is signed in. For a work/school account, Microsoft Graph works instead: `teams init --backend graph`".into())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -676,6 +680,7 @@ fn people_result(reply: &Value, create: bool) -> Result<Value, AppError> {
     if let Some(code) = value["error"].as_str() {
         return Err(match code {
             "account_ambiguous" => account_selection_error(),
+            "cache_ambiguous" => cached_accounts_error(),
             "permission_denied" => AppError::Permission("Teams policy does not allow a chat with this recipient".into()),
             "search_failed" => AppError::Desktop("Teams could not resolve this person. Check sign-in and try their full email address".into()),
             "layout" => AppError::Unsupported("This Teams version does not expose a supported recipient interface".into()),
@@ -784,6 +789,7 @@ fn send_error(code: &str) -> AppError {
     match code {
         "not_found" => AppError::NotFound("chat not found in the Teams desktop cache".into()),
         "account_ambiguous" => account_selection_error(),
+        "cache_ambiguous" => cached_accounts_error(),
         "unconfirmed" => AppError::Unconfirmed(
             "Teams did not confirm the message; it may still be delivered. Check the chat before sending again".into(),
         ),
@@ -894,6 +900,9 @@ fn read_page(reply: &Value) -> Result<Page, AppError> {
         if code == "account_ambiguous" {
             return Err(account_selection_error());
         }
+        if code == "cache_ambiguous" {
+            return Err(cached_accounts_error());
+        }
         return Err(AppError::Desktop(match (status, code) {
             (Some(status), _) => status.detail().into(),
             (None, "no_target") => {
@@ -927,6 +936,9 @@ fn read_page(reply: &Value) -> Result<Page, AppError> {
     }
     if value["error"] == "account_ambiguous" {
         return Err(account_selection_error());
+    }
+    if value["error"] == "cache_ambiguous" {
+        return Err(cached_accounts_error());
     }
     let items = value["items"].as_array().ok_or_else(invalid)?.clone();
     let next_cursor = match &value["next"] {
@@ -1219,7 +1231,7 @@ mod tests {
     /// the new one; otherwise just update the expectations.
     #[test]
     fn the_protocol_is_pinned() {
-        assert_eq!(helper::PROTOCOL, 4);
+        assert_eq!(helper::PROTOCOL, 5);
         let cursor = encode_cursor(&json!({"t": 1, "id": "m1"})).unwrap();
         assert_eq!(
             read_request(9222, Some(NOTES), 20, Some(&cursor)).unwrap(),
@@ -1258,14 +1270,14 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         });
-        // Protocol 4 adds recipient operations; existing sends retain their request shapes.
+        // Protocol 5 selects the signed-in cache and reports remaining ambiguity apart from surface selection.
         assert_eq!(
             scripts,
             [
                 "32ca0293d2d5",
                 "baa0bc29c44b",
-                "3e837cc21336",
-                "3d628a24b464"
+                "025a8edc46b8",
+                "23b1a0e4b293"
             ]
         );
     }
@@ -1300,7 +1312,11 @@ mod tests {
         ));
         assert!(matches!(
             people_result(&page_reply(json!({"error":"account_ambiguous"})), false),
-            Err(AppError::Desktop(_))
+            Err(AppError::Desktop(m)) if m.contains("--desktop-account")
+        ));
+        assert!(matches!(
+            people_result(&page_reply(json!({"error":"cache_ambiguous"})), false),
+            Err(AppError::Desktop(m)) if !m.contains("--desktop-account")
         ));
         for id in [
             "someone@example.invalid",
@@ -1469,6 +1485,7 @@ mod tests {
             Err(AppError::NotFound(_))
         ));
         let layout = json!({"result":{"exceptionDetails":{"exception":{"description":"Error: layout\n    at x"}}}});
+        // Mixed personal and work/school windows are resolved by choosing a surface.
         for ambiguous in [
             json!({"error": "account_ambiguous"}),
             reply(json!({"error": "account_ambiguous"})),
@@ -1479,6 +1496,20 @@ mod tests {
             assert!(
                 matches!(sent_message(&ambiguous, CHAT), Err(AppError::Desktop(m)) if m.contains("--desktop-account"))
             );
+        }
+        // Several caches within one surface are not, so no flag is suggested.
+        for ambiguous in [
+            json!({"error": "cache_ambiguous"}),
+            reply(json!({"error": "cache_ambiguous"})),
+        ] {
+            for result in [
+                read_page(&ambiguous).map(|_| ()),
+                sent_message(&ambiguous, CHAT).map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(AppError::Desktop(m)) if m.contains("cached") && !m.contains("--desktop-account"))
+                );
+            }
         }
         assert!(matches!(read_page(&layout), Err(AppError::Desktop(m)) if m.contains("layout")));
         for reply in [

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- When Teams keeps caches for several accounts, guest organizations or display languages, the desktop backend now reads the one for the signed-in user, tenant and display language instead of refusing.
+
+### Changed
+
+- Desktop errors now tell apart two cases: personal and work/school Teams both being open, which `--desktop-account` resolves, and one surface holding cached data for several accounts or organizations, which it does not.
+- Windows desktop helpers use protocol 5. WSL requires the helper from the same CLI release.
+
 ## [0.2.3](https://github.com/rvben/teams-cli/compare/v0.2.2...v0.2.3) - 2026-10-16
 
 ### Fixed

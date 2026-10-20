@@ -281,7 +281,7 @@ async (p, select) => {
   } finally {
     db?.close();
   }
-  if (own.length !== 1) return { error: own.length ? "account_ambiguous" : "layout" };
+  if (own.length !== 1) return { error: own.length ? "cache_ambiguous" : "layout" };
   if (own[0] === p.recipient) return {id:"48:notes",chatType:"oneOnOne",members:[{userId:own[0]}],source:"desktop"};
   const userIds = [...new Set([own[0], p.recipient])];
   const lookup = operationDoc(

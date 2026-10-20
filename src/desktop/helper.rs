@@ -10,7 +10,7 @@ use crate::error::AppError;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The commit this binary was built from (see `build.rs`), reported in `hello` for
 /// diagnosis and never compared; empty when unknown.

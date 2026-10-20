@@ -231,10 +231,50 @@ test('a missing account database never falls back to another account', async () 
   assert.ok(f.opened.every(database => database.endsWith(':account-a')));
 });
 
+function selectWith(names, storage = {}) {
+  const context = vm.createContext({ localStorage: { getItem: key => key in storage ? storage[key] : null } });
+  // Compare plain values: objects from another context have their own prototypes.
+  return JSON.parse(JSON.stringify(vm.runInContext(source('desktop_cache.js'), context)(names.map(name => ({ name })))));
+}
+
+const teams = (kind, tenant, user, locale = 'en-us') => `Teams:${kind}:react-web-client:${tenant}:${user}:${locale}`;
+const signedIn = (tenant, user, locale) => ({
+  'tmp.auth.v1.GLOBAL.PrimaryUserId.PrimaryUserId': JSON.stringify({ item: user }),
+  'tmp.react-web-client.cachedPrimaryUser': JSON.stringify({ tenantId: tenant, userId: user }),
+  ...(locale && { [`tmp.${tenant}.${user}.react-web-client.applicationLocaleCode`]: locale }),
+});
+const caches = (tenant, user, locale) => ['conversation-manager', 'replychain-manager', 'profiles']
+  .map(kind => teams(kind, tenant, user, locale));
+
+test('the signed-in user, tenant and display language select among coexisting caches', () => {
+  const names = [
+    ...caches('home', 'me', 'en-us'), ...caches('home', 'me', 'nl-nl'),
+    ...caches('guest', 'me-as-guest'), ...caches('home', 'colleague'),
+  ];
+  for (const [tenant, user, locale] of [['home', 'me', 'nl-nl'], ['home', 'me', 'en-us'], ['guest', 'me-as-guest', 'en-us']]) {
+    assert.deepEqual(selectWith(names, signedIn(tenant, user, locale)), {
+      account: user, conversation: teams('conversation-manager', tenant, user, locale),
+      replies: teams('replychain-manager', tenant, user, locale), profiles: teams('profiles', tenant, user, locale),
+    });
+  }
+  // Only one cache for the signed-in account needs no display language.
+  assert.equal(selectWith(names, signedIn('home', 'colleague')).conversation, teams('conversation-manager', 'home', 'colleague'));
+});
+
+test('caches are refused when Teams does not identify exactly one of them', () => {
+  const names = [...caches('home', 'me', 'en-us'), ...caches('home', 'me', 'nl-nl'), ...caches('home', 'colleague')];
+  const inconsistent = { ...signedIn('home', 'me', 'en-us'),
+    'tmp.react-web-client.cachedPrimaryUser': JSON.stringify({ tenantId: 'home', userId: 'colleague' }) };
+  for (const storage of [{}, signedIn('home', 'me'), signedIn('home', 'me', 'de-de'), signedIn('home', 'stranger', 'en-us'), inconsistent,
+    { 'tmp.auth.v1.GLOBAL.PrimaryUserId.PrimaryUserId': 'not json' }]) {
+    assert.deepEqual(selectWith(names, storage), { error: 'cache_ambiguous' });
+  }
+});
+
 test('ambiguous account caches are refused before reading or sending', async () => {
   const f = fixture({ ambiguous: true });
-  assert.equal((await f.read()).error, 'account_ambiguous');
-  assert.equal((await f.send()).error, 'account_ambiguous');
+  assert.equal((await f.read()).error, 'cache_ambiguous');
+  assert.equal((await f.send()).error, 'cache_ambiguous');
   assert.deepEqual(f.opened, []);
   assert.deepEqual(f.mutations, []);
 });
