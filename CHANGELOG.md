@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/rvben/teams-cli/compare/v0.2.4...v0.2.5) - 2026-10-21
+
 ### Fixed
 
 - Desktop chats whose messages Teams keeps in a secondary reply-chain store (`replychains-2`, ...) no longer look empty. All such stores are now read and merged, which also fills in member names for those 1:1 chats.

@@ -3187,7 +3187,7 @@ dependencies = [
 
 [[package]]
 name = "teams-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "assert_cmd",
  "base64 0.23.1",
