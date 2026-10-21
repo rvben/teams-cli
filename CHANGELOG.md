@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Desktop chats whose messages Teams keeps in a secondary reply-chain store (`replychains-2`, ...) no longer look empty. All such stores are now read and merged, which also fills in member names for those 1:1 chats.
 - Desktop chat messages missing from the current cache are filled in from caches the same user and tenant left under earlier display languages. Those caches no longer update, so messages edited or deleted since can appear as they were.
 - In the TUI, a chat whose messages are missing now shows its latest message from the chat list and why, instead of "No messages in this chat yet." With the desktop backend it says no messages for the chat were found in the Teams cache on this PC.
+- **deps**: update TLS certificate trust dependencies ([435b11c](https://github.com/rvben/teams-cli/commit/435b11c39113e165e843d73579bc28505ef05620))
 
 ## [0.2.4](https://github.com/rvben/teams-cli/compare/v0.2.3...v0.2.4) - 2026-10-20
 
