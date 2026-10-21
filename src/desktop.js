@@ -67,8 +67,16 @@ async (p, select) => {
     }
     return { names, me };
   };
-  const chain = async (db, id) => (await req(db.transaction('replychains').objectStore('replychains')
-    .getAll(IDBKeyRange.bound([id], [id, []])))).flatMap(rc => Object.values(rc.messageMap || {}));
+  // Teams can split reply chains across several stores (replychains, replychains-2, ...).
+  // Numeric order keeps the primary store's copy of a message found in more than one.
+  const chain = async (db, id) => {
+    const rank = n => +(n.split('-')[1] || 1);
+    const names = [...db.objectStoreNames].filter(n => /^replychains(-\d+)?$/.test(n)).sort((a, b) => rank(a) - rank(b));
+    if (!names.length) throw Error('layout');
+    const tx = db.transaction(names);
+    const lists = await Promise.all(names.map(n => req(tx.objectStore(n).getAll(IDBKeyRange.bound([id], [id, []])))));
+    return lists.flat().flatMap(rc => Object.values((rc && rc.messageMap) || {}));
+  };
 
   const cdb = await open('conversation');
   let pg;

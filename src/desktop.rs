@@ -1275,7 +1275,7 @@ mod tests {
         assert_eq!(
             scripts,
             [
-                "3deaa430419a",
+                "9c000776f04a",
                 "baa0bc29c44b",
                 "7d2b70751d6a",
                 "23b1a0e4b293"

@@ -29,7 +29,7 @@ function cursor(records) {
   return q;
 }
 
-function fixture({ ambiguous = false, foreignOnly = false, older = [], mutate, timeout = false, core = false } = {}) {
+function fixture({ ambiguous = false, foreignOnly = false, older = [], stores = {}, mutate, timeout = false, core = false } = {}) {
   const databases = new Map([
     [name('conversation-manager', 'account-a'), [conversation]],
     [name('replychain-manager', 'account-b'), [{ chat, messageMap: { b: { ...message, content: 'Wrong account' } } }]],
@@ -41,6 +41,8 @@ function fixture({ ambiguous = false, foreignOnly = false, older = [], mutate, t
   }
   if (ambiguous) databases.set(name('conversation-manager', 'account-b'), [conversation]);
   for (const [locale, records] of older) databases.set(name('replychain-manager', 'account-a') + ':' + locale, records);
+  // Extra object stores of the current account's reply-chain database, beside its default store.
+  const extra = new Map([[name('replychain-manager', 'account-a'), stores]]);
   const opened = [], mutations = [];
   let inspections = 0;
   const client = { mutate: options => {
@@ -56,11 +58,15 @@ function fixture({ ambiguous = false, foreignOnly = false, older = [], mutate, t
       open: database => {
         assert.ok(databases.has(database), `Unknown database: ${database}`);
         opened.push(database);
-        return request({ name: database, close() {}, transaction: () => ({ objectStore: () => ({
-          get: id => request(databases.get(database).find(record => (record.mri || record.id) === id)),
-          getAll: range => request(databases.get(database).filter(record => !range || record.chat === range.chat)),
-          openCursor: () => cursor(databases.get(database)),
-        }) }) });
+        const named = extra.get(database) || {};
+        const records = store => store in named ? named[store] : databases.get(database);
+        return request({ name: database, close() {},
+          objectStoreNames: database.includes(':replychain-manager:') ? ['replychains', ...Object.keys(named)] : [],
+          transaction: () => ({ objectStore: store => ({
+            get: id => request(records(store).find(record => (record.mri || record.id) === id)),
+            getAll: range => request(records(store).filter(record => !range || record.chat === range.chat)),
+            openCursor: () => cursor(records(store)),
+          }) }) });
       },
     },
     IDBKeyRange: { bound: a => ({ chat: a[0] }) },
@@ -235,6 +241,46 @@ test('older caches of the same account only add messages the current cache lacks
   const result = await f.read();
   assert.deepEqual([...result.items.map(item => item.body.content)], [message.content, 'Earlier']);
   assert.ok(f.opened.every(database => !database.includes(':account-b')));
+});
+
+test('messages filed only in a later reply-chain store are read', async () => {
+  const f = fixture({ stores: {
+    'replychains-2': [{ chat, messageMap: { a: message } }],
+    'unrelated': [{ chat, messageMap: { x: { ...message, id: '1710000000000', content: 'Unrelated store' } } }],
+  } });
+  f.databases.set(name('replychain-manager', 'account-a'), []);
+  const result = await f.read();
+  assert.deepEqual([...result.items.map(item => item.body.content)], [message.content]);
+});
+
+test('messages split across reply-chain stores are merged newest first without duplicates', async () => {
+  const earlier = { ...message, id: '1690000000000', originalArrivalTime: 1690000000000, content: 'Earlier' };
+  const later = { ...message, id: '1710000000000', originalArrivalTime: 1710000000000, content: 'Later' };
+  const f = fixture({ stores: { 'replychains-2': [{ chat, messageMap: { a: message, earlier, later } }] } });
+  const result = await f.read();
+  assert.deepEqual([...result.items.map(item => item.body.content)], ['Later', message.content, 'Earlier']);
+});
+
+test('reply-chain stores are read in numeric order, so the primary copy of a message wins', async () => {
+  const f = fixture({ stores: {
+    'replychains-10': [{ chat, messageMap: { a: { ...message, content: 'Tenth store' } } }],
+    'replychains-2': [{ chat, messageMap: { a: { ...message, content: 'Second store' } } }],
+  } });
+  assert.deepEqual([...(await f.read()).items.map(item => item.body.content)], [message.content]);
+  f.databases.set(name('replychain-manager', 'account-a'), []);
+  assert.deepEqual([...(await f.read()).items.map(item => item.body.content)], ['Second store']);
+});
+
+test('1:1 member names come from messages in a later reply-chain store', async () => {
+  const one = '19:account-a_peer@unq.gbl.spaces';
+  const f = fixture({ stores: { 'replychains-2': [{ chat: one, messageMap: {
+    p: { ...message, creator: '8:orgid:peer', imDisplayName: 'Peer Name' },
+  } }] } });
+  f.databases.set(name('conversation-manager', 'account-a'), [{ ...conversation, id: one, members: [] }]);
+  f.databases.set(name('replychain-manager', 'account-a'), []);
+  const result = await f.read({ query: 'chats', chat: '' });
+  assert.equal(result.me, 'account-a');
+  assert.equal(result.items[0].members.find(m => m.userId === 'peer').displayName, 'Peer Name');
 });
 
 test('a missing account database never falls back to another account', async () => {
