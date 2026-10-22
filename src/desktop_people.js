@@ -76,29 +76,6 @@ async (p, select) => {
     ],
   });
   if (p.op === "search") {
-    const query = operationDoc(
-      "query",
-      "TeamsCliSearchPeople",
-      [
-        ["searchQuery", "String"],
-        ["peoplePickerFilters", "PeoplePickerFiltersInput"],
-      ],
-      [
-        F(
-          "searchUsers",
-          [
-            "id",
-            "displayName",
-            "email",
-            "mri",
-            "userPrincipalName",
-            "type",
-            "userType",
-          ],
-          ["searchQuery", "peoplePickerFilters"],
-        ),
-      ],
-    );
     const filters = {
       name: "newChat",
       includeAADTenant: true,
@@ -211,13 +188,43 @@ async (p, select) => {
           users.unshift(...found.data.instantScdSearch);
         }
       } else {
+        // Work accounts search the directory the way Teams' people picker does.
+        // searchUsers answers empty there, and instantScdSearch is refused.
+        const query = operationDoc(
+          "query",
+          "TeamsCliSearchPeople",
+          [
+            ["searchQuery", "String"],
+            ["peoplePickerFilters", "PeoplePickerFiltersInput"],
+          ],
+          [
+            F(
+              "searchSuggestionsForPeoplePicker",
+              [F("peopleResults", fields)],
+              ["searchQuery", "peoplePickerFilters"],
+            ),
+          ],
+        );
         const r = await client.query({
           query,
-          variables: { searchQuery: p.query, peoplePickerFilters: filters },
-          fetchPolicy: "network-only",
+          variables: {
+            searchQuery: p.query,
+            peoplePickerFilters: {
+              ...filters,
+              includeFeatures: [
+                "AADTenant",
+                "Guest",
+                "B2BMembers",
+                "Federated",
+                "FederatedConsumer",
+              ],
+            },
+          },
+          fetchPolicy: "no-cache",
         });
-        users = r.data?.searchUsers;
-        if (!Array.isArray(users)) return { error: "layout" };
+        const sets = r.data?.searchSuggestionsForPeoplePicker;
+        if (!Array.isArray(sets)) return { error: "layout" };
+        users = sets.flatMap((set) => set?.peopleResults || []);
       }
       const seen = new Set(),
         items = [];

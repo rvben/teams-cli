@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `teams people search` finds work and school colleagues again with the desktop backend. It now uses the same directory search as the Teams people picker; the lookup it used before returned nothing, or failed with "Teams could not resolve this person" in a headless browser.
+
 ## [0.2.5](https://github.com/rvben/teams-cli/compare/v0.2.4...v0.2.5) - 2026-10-21
 
 ### Fixed
