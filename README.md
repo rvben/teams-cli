@@ -8,6 +8,16 @@ For humans, no arguments open guided onboarding on first use and the TUI afterwa
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install rvben/tap/teams-cli
+```
+
+Homebrew installs native binaries on macOS and builds from source on Linux.
+
+### Other installation methods
+
 ```console
 pipx install teams-cli
 # or
