@@ -132,14 +132,20 @@ fn parse_processes(text: &str) -> Result<HashMap<u32, Process>, AppError> {
         .map(|line| {
             let invalid = || AppError::Desktop("invalid process ancestry metadata".into());
             let mut rest = line.trim();
-            let mut number = || {
+            let mut field = || {
                 let (value, tail) = rest.split_once(char::is_whitespace).ok_or_else(invalid)?;
                 rest = tail.trim_start();
-                value.parse::<u32>().map_err(|_| invalid())
+                Ok::<_, AppError>(value)
             };
-            let pid = number()?;
-            let uid = number()?;
-            let parent = number()?;
+            let pid = field()?.parse::<u32>().map_err(|_| invalid())?;
+            let uid = field()?;
+            // macOS ps prints some uid_t values as signed integers (for
+            // example nobody as -2). Preserve their underlying 32-bit value.
+            let uid = uid
+                .parse::<u32>()
+                .or_else(|_| uid.parse::<i32>().map(|uid| uid as u32))
+                .map_err(|_| invalid())?;
+            let parent = field()?.parse::<u32>().map_err(|_| invalid())?;
             if rest.is_empty() {
                 return Err(invalid());
             }
@@ -183,6 +189,28 @@ fn teams_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_system_uids_do_not_break_listener_ownership_checks() {
+        let installed = [PathBuf::from("/Applications/Teams")];
+        let processes = parse_processes(
+            "1 0 0 /sbin/launchd\n2 -2 1 /system/service\n3 501 1 /Applications/Teams\n4 -2 3 /helper\n5 4294967294 1 /system/service\n",
+        )
+        .unwrap();
+        assert_eq!(processes[&2].uid, u32::MAX - 1);
+        assert_eq!(processes[&5].uid, processes[&2].uid);
+        assert!(teams_owner(&processes, 3, 501, &installed));
+        assert!(!teams_owner(&processes, 2, 501, &installed));
+        assert!(!teams_owner(&processes, 4, 501, &installed));
+        for malformed in [
+            "-2 501 1 /process",
+            "2 -2147483649 1 /process",
+            "2 4294967296 1 /process",
+            "2 501 -1 /process",
+        ] {
+            assert!(parse_processes(malformed).is_err());
+        }
+    }
 
     #[test]
     fn ownership_requires_the_installed_path_and_current_user_throughout_the_chain() {
