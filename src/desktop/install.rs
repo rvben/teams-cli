@@ -3,10 +3,11 @@
 use crate::error::AppError;
 use sha2::{Digest, Sha256};
 use std::{
-    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
+use tar_codec::{Archive as _, Member, MemberPayload as _, TarArchive};
+use tokio::io::AsyncReadExt as _;
 
 use super::helper::PROTOCOL;
 
@@ -133,7 +134,15 @@ async fn ensure_state(state: HelperState, version: &str) -> Result<PathBuf, AppE
             "{asset} does not match its published checksum; nothing was installed"
         )));
     }
-    install(&path, &extract(&archive)?)?;
+    // Member payloads borrow the decoder across awaits. Parse on a blocking
+    // worker so the downloader remains Send on Rust 1.90, and decompression
+    // does not occupy an async runtime worker.
+    let helper = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(extract(&archive))
+    })
+    .await
+    .map_err(|_| AppError::Desktop("could not read the helper archive".into()))??;
+    install(&path, &helper)?;
     Ok(path)
 }
 
@@ -192,30 +201,73 @@ fn checksum(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Only `teams.exe` is taken from the archive.
-fn extract(archive: &[u8]) -> Result<Vec<u8>, AppError> {
+/// Only one top-level `teams.exe` is accepted. Validate the entire archive
+/// before installing it, including entries after the executable and gzip CRC.
+async fn extract(archive: &[u8]) -> Result<Vec<u8>, AppError> {
     let invalid = || AppError::Desktop("the helper archive is not valid".into());
-    let mut entries = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-    for entry in entries.entries().map_err(|_| invalid())? {
-        let entry = entry.map_err(|_| invalid())?;
-        let is_helper = entry.header().entry_type().is_file()
-            && entry.path().ok().is_some_and(|p| {
-                p.components().filter(|c| c.as_os_str() != ".").count() == 1
-                    && p.file_name().is_some_and(|n| n == "teams.exe")
-            });
-        if is_helper {
-            let mut bytes = Vec::new();
-            entry
-                .take(MAX_ARCHIVE as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| invalid())?;
-            if bytes.len() > MAX_ARCHIVE || !bytes.starts_with(b"MZ") {
+    if archive.len() > MAX_ARCHIVE {
+        return Err(invalid());
+    }
+    let mut reader =
+        async_compression::tokio::bufread::GzipDecoder::new(archive).take(MAX_ARCHIVE as u64 + 1);
+    let mut helper = None;
+    {
+        let mut entries = TarArchive::new(&mut reader).members();
+        let mut chunk = Vec::new();
+        while let Some(entry) = entries.next().await.map_err(|_| invalid())? {
+            if let Member::File {
+                metadata,
+                size,
+                mut payload,
+                ..
+            } = entry
+            {
+                // Match the release layout without normalizing away traversal.
+                let is_helper = matches!(metadata.path.as_str(), "teams.exe" | "./teams.exe");
+                if is_helper {
+                    if helper.is_some() || size > MAX_ARCHIVE as u64 {
+                        return Err(invalid());
+                    }
+                    let mut bytes = Vec::new();
+                    while payload
+                        .next_chunk(&mut chunk, 64 * 1024)
+                        .await
+                        .map_err(|_| invalid())?
+                    {
+                        if bytes.len() + chunk.len() > MAX_ARCHIVE {
+                            return Err(invalid());
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if !bytes.starts_with(b"MZ") {
+                        return Err(invalid());
+                    }
+                    helper = Some(bytes);
+                } else {
+                    payload.skip().await.map_err(|_| invalid())?;
+                }
+            } else if !matches!(entry, Member::Directory { .. }) {
+                // Release packages contain only directories and regular files.
                 return Err(invalid());
             }
-            return Ok(bytes);
         }
     }
-    Err(invalid())
+    // The tar end marker can precede padding and the gzip trailer. Reading to
+    // EOF also makes the decompressed-size budget cover ignored archive data.
+    let mut padding = [0; 8192];
+    loop {
+        let read = reader.read(&mut padding).await.map_err(|_| invalid())?;
+        if read == 0 {
+            break;
+        }
+        if padding[..read].iter().any(|&byte| byte != 0) {
+            return Err(invalid());
+        }
+    }
+    if reader.limit() == 0 || !reader.get_ref().get_ref().is_empty() {
+        return Err(invalid());
+    }
+    helper.ok_or_else(invalid)
 }
 
 /// Writes atomically, marks it executable for WSL interop, and removes other versions.
@@ -248,6 +300,12 @@ fn install(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_downloader_can_be_sent_between_runtime_workers() {
+        fn assert_send(_: impl Send) {}
+        assert_send(ensure());
+    }
 
     #[tokio::test]
     async fn legacy_release_needs_a_built_helper_but_accepts_explicit_or_cached_builds() {
@@ -299,14 +357,145 @@ mod tests {
         assert_eq!(hex(&[0, 15, 255]), "000fff");
     }
 
-    #[test]
-    fn extracts_only_the_top_level_windows_executable() {
+    #[tokio::test]
+    async fn extracts_only_the_top_level_windows_executable() {
         let exe = b"MZ fixture";
         let bytes = archive(&[("./README.md", b"readme"), ("./teams.exe", exe)]);
-        assert_eq!(extract(&bytes).unwrap(), exe);
-        assert!(extract(&archive(&[("./nested/teams.exe", exe)])).is_err());
-        assert!(extract(&archive(&[("./teams.exe", b"#!/bin/sh")])).is_err());
-        assert!(extract(b"not an archive").is_err());
+        assert_eq!(extract(&bytes).await.unwrap(), exe);
+        assert!(
+            extract(&archive(&[("./nested/teams.exe", exe)]))
+                .await
+                .is_err()
+        );
+        assert!(
+            extract(&archive(&[("./teams.exe", b"#!/bin/sh")]))
+                .await
+                .is_err()
+        );
+        assert!(extract(b"not an archive").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn extracts_a_helper_across_multiple_payload_chunks() {
+        let mut exe = vec![0x5a; 3 * 64 * 1024 + 17];
+        exe[..2].copy_from_slice(b"MZ");
+        assert_eq!(
+            extract(&archive(&[("teams.exe", &exe)])).await.unwrap(),
+            exe
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepts_the_release_workflows_system_tar_packaging() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("package");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("teams.exe"), b"MZ release fixture").unwrap();
+        std::fs::write(package.join("README.md"), b"readme").unwrap();
+        let output = temp.path().join("helper.tar.gz");
+        // Match .github/workflows/release.yml, including the '.' root entry.
+        assert!(
+            std::process::Command::new("tar")
+                .arg("-C")
+                .arg(&package)
+                .arg("-czf")
+                .arg(&output)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            extract(&std::fs::read(output).unwrap()).await.unwrap(),
+            b"MZ release fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_helpers_and_damage_after_the_helper() {
+        let duplicate = archive(&[("teams.exe", b"MZ first"), ("./teams.exe", b"MZ second")]);
+        assert!(extract(&duplicate).await.is_err());
+
+        let mut damaged = archive(&[("teams.exe", b"MZ fixture")]);
+        let crc = damaged.len() - 8;
+        damaged[crc] ^= 1;
+        assert!(extract(&damaged).await.is_err(), "gzip CRC must be checked");
+        damaged.truncate(crc);
+        assert!(
+            extract(&damaged).await.is_err(),
+            "missing trailer must fail"
+        );
+
+        // A malformed second tar header must not be hidden by finding the
+        // executable first. Recompress so the gzip checksum remains valid.
+        use std::io::{Read as _, Write as _};
+        let valid = archive(&[("teams.exe", b"MZ fixture"), ("README.md", b"readme")]);
+        let mut raw = Vec::new();
+        flate2::read::GzDecoder::new(valid.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        raw[1024] ^= 1;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&raw).unwrap();
+        assert!(extract(&gz.finish().unwrap()).await.is_err());
+
+        let mut trailing = archive(&[("teams.exe", b"MZ fixture")]);
+        trailing.extend_from_slice(b"junk");
+        assert!(
+            extract(&trailing).await.is_err(),
+            "trailing compressed data must fail"
+        );
+
+        let mut concatenated = archive(&[("teams.exe", b"MZ first")]);
+        concatenated.extend_from_slice(&archive(&[("teams.exe", b"MZ second")]));
+        assert!(
+            extract(&concatenated).await.is_err(),
+            "multiple gzip streams must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_links_even_after_a_valid_helper() {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut file = tar::Header::new_gnu();
+        file.set_size(2);
+        file.set_mode(0o644);
+        builder
+            .append_data(&mut file, "teams.exe", &b"MZ"[..])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        builder
+            .append_link(&mut link, "other", "teams.exe")
+            .unwrap();
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+        assert!(extract(&bytes).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounds_decompressed_data_including_ignored_files_and_padding() {
+        // Compressed input is small, but ignored payloads still consume the
+        // same total budget as the helper itself.
+        let bytes = archive(&[("README.md", &vec![0; MAX_ARCHIVE]), ("teams.exe", b"MZ")]);
+        assert!(bytes.len() < MAX_ARCHIVE);
+        assert!(extract(&bytes).await.is_err());
+
+        use std::io::{Read as _, Write as _};
+        let valid = archive(&[("teams.exe", b"MZ")]);
+        let mut raw = Vec::new();
+        flate2::read::GzDecoder::new(valid.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        raw.resize(MAX_ARCHIVE + 1, 0);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&raw).unwrap();
+        assert!(extract(&gz.finish().unwrap()).await.is_err());
     }
 
     #[test]
