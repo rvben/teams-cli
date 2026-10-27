@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/rvben/teams-cli/compare/v0.2.5...v0.2.6) - 2026-10-27
+
 ### Fixed
 
 - `teams people search` finds work and school colleagues again with the desktop backend. It now uses the same directory search as the Teams people picker; the lookup it used before returned nothing, or failed with "Teams could not resolve this person" in a headless browser.
+- **desktop**: accept signed macOS system UIDs ([b7a1521](https://github.com/rvben/teams-cli/commit/b7a152189d2bc636cebe5ca67f24172dd702ae75))
+- **desktop**: validate helper archives with tar-codec ([b955dd8](https://github.com/rvben/teams-cli/commit/b955dd8ea93cb302d72107cd2701e2adc8380ab3))
 
 ## [0.2.5](https://github.com/rvben/teams-cli/compare/v0.2.4...v0.2.5) - 2026-10-21
 
