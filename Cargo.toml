@@ -46,7 +46,7 @@ toml = "1.1"
 url = "2"
 jiff = "0.2"
 unicode-width = "0.2"
-zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.2.2", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
